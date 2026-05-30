@@ -17,6 +17,7 @@ fallback forwarding for non-Trojan traffic.
 - TCP and UDP traffic relay.
 - Fallback forwarding for non-Trojan traffic.
 - Configurable timeouts and buffer sizes.
+- Nginx asynchronous resolver support for domain targets when `resolver` is configured.
 
 ## Build
 
@@ -41,6 +42,9 @@ stream {
         listen 443 ssl;
         server_name example.com;
 
+        resolver 1.1.1.1 8.8.8.8 valid=60s;
+        resolver_timeout 5s;
+
         ssl_certificate     /path/to/fullchain.pem;
         ssl_certificate_key /path/to/private.key;
 
@@ -62,5 +66,7 @@ http {
 }
 ```
 
-The stream server must terminate TLS. `ssl_preread` alone is not enough because
-the Trojan password header is inside the TLS application data.
+- The stream server must terminate TLS. `ssl_preread` alone is not enough
+  because the Trojan password header is inside the TLS application data.
+
+- Without `resolver`, domain targets use system DNS.

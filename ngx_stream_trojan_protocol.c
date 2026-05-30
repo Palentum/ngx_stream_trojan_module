@@ -436,3 +436,10 @@ ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uin
     *written = pos;
     return 0;
 }
+
+
+int
+ngx_stream_trojan_use_nginx_resolver(uint8_t addr_type, int resolver_configured)
+{
+    return addr_type == NGX_STREAM_TROJAN_ADDR_DOMAIN && resolver_configured;
+}

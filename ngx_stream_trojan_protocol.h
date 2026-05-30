@@ -42,5 +42,6 @@ int ngx_stream_trojan_addr_to_text(const ngx_stream_trojan_addr_t *addr, char *o
 int ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len, ngx_stream_trojan_udp_frame_t *frame);
 int ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uint8_t *payload,
     uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written);
+int ngx_stream_trojan_use_nginx_resolver(uint8_t addr_type, int resolver_configured);
 
 #endif
