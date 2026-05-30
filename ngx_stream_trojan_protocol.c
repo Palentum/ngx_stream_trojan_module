@@ -4,6 +4,13 @@
 #include <string.h>
 
 static const uint8_t ngx_stream_trojan_hex[] = "0123456789abcdef";
+static const uint8_t ngx_stream_trojan_503_response[] =
+    "HTTP/1.1 503 Service Unavailable\r\n"
+    "Content-Type: text/plain\r\n"
+    "Content-Length: 19\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "Service Unavailable";
 
 #define NGX_STREAM_TROJAN_SHA224_DIGEST_LEN 28
 #define NGX_STREAM_TROJAN_SHA256_BLOCK_LEN 64
@@ -442,4 +449,15 @@ int
 ngx_stream_trojan_use_nginx_resolver(uint8_t addr_type, int resolver_configured)
 {
     return addr_type == NGX_STREAM_TROJAN_ADDR_DOMAIN && resolver_configured;
+}
+
+
+const uint8_t *
+ngx_stream_trojan_default_fallback_response(size_t *len)
+{
+    if (len != NULL) {
+        *len = sizeof(ngx_stream_trojan_503_response) - 1;
+    }
+
+    return ngx_stream_trojan_503_response;
 }

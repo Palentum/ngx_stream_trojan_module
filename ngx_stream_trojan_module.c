@@ -32,6 +32,7 @@ typedef struct ngx_stream_trojan_ctx_s ngx_stream_trojan_ctx_t;
 typedef enum {
     ngx_stream_trojan_state_prefix = 0,
     ngx_stream_trojan_state_request,
+    ngx_stream_trojan_state_default_fallback,
     ngx_stream_trojan_state_resolving,
     ngx_stream_trojan_state_connecting,
     ngx_stream_trojan_state_proxy,
@@ -83,6 +84,7 @@ struct ngx_stream_trojan_ctx_s {
     ngx_buf_t                  *client_buffer;
     ngx_buf_t                  *upstream_buffer;
     ngx_buf_t                  *pending_to_upstream;
+    ngx_buf_t                  *pending_to_client;
 
     ngx_connection_t           *udp4;
 #if (NGX_HAVE_INET6)
@@ -105,6 +107,12 @@ static void ngx_stream_trojan_process_prefix(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_process_request(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_start_fallback(ngx_stream_trojan_ctx_t *ctx,
     u_char *data, size_t len);
+static void ngx_stream_trojan_start_default_fallback(
+    ngx_stream_trojan_ctx_t *ctx);
+static void ngx_stream_trojan_default_fallback_write_handler(
+    ngx_event_t *ev);
+static ngx_int_t ngx_stream_trojan_flush_default_fallback(
+    ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_start_udp(ngx_stream_trojan_ctx_t *ctx);
 static ngx_int_t ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
@@ -301,6 +309,10 @@ ngx_stream_trojan_read_client(ngx_event_t *ev)
 
     case ngx_stream_trojan_state_request:
         ngx_stream_trojan_process_request(ctx);
+        break;
+
+    case ngx_stream_trojan_state_default_fallback:
+        ngx_stream_trojan_default_fallback_write_handler(c->write);
         break;
 
     case ngx_stream_trojan_state_resolving:
@@ -552,7 +564,7 @@ ngx_stream_trojan_start_fallback(ngx_stream_trojan_ctx_t *ctx, u_char *data,
     size_t len)
 {
     if (ctx->conf->fallback == NULL) {
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_FORBIDDEN);
+        ngx_stream_trojan_start_default_fallback(ctx);
         return;
     }
 
@@ -563,6 +575,95 @@ ngx_stream_trojan_start_fallback(ngx_stream_trojan_ctx_t *ctx, u_char *data,
 
     ctx->peer_kind = ngx_stream_trojan_peer_fallback;
     ngx_stream_trojan_connect(ctx, ctx->conf->fallback);
+}
+
+
+static void
+ngx_stream_trojan_start_default_fallback(ngx_stream_trojan_ctx_t *ctx)
+{
+    size_t         len;
+    const u_char  *response;
+    ngx_connection_t *c;
+
+    c = ctx->session->connection;
+    response = ngx_stream_trojan_default_fallback_response(&len);
+
+    ctx->pending_to_client = ngx_stream_trojan_create_temp_buf(c->pool, len);
+    if (ctx->pending_to_client == NULL) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_memcpy(ctx->pending_to_client->last, response, len);
+    ctx->pending_to_client->last += len;
+
+    ctx->state = ngx_stream_trojan_state_default_fallback;
+    c->write->handler = ngx_stream_trojan_default_fallback_write_handler;
+    c->read->handler = ngx_stream_trojan_default_fallback_write_handler;
+
+    ngx_stream_trojan_default_fallback_write_handler(c->write);
+}
+
+
+static void
+ngx_stream_trojan_default_fallback_write_handler(ngx_event_t *ev)
+{
+    ngx_connection_t         *c;
+    ngx_stream_session_t     *s;
+    ngx_stream_trojan_ctx_t  *ctx;
+
+    c = ev->data;
+    s = c->data;
+    ctx = ngx_stream_get_module_ctx(s, ngx_stream_trojan_module);
+
+    if (ctx == NULL || ev->timedout) {
+        ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    switch (ngx_stream_trojan_flush_default_fallback(ctx)) {
+    case NGX_OK:
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+        return;
+
+    case NGX_AGAIN:
+        return;
+
+    default:
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        return;
+    }
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_flush_default_fallback(ngx_stream_trojan_ctx_t *ctx)
+{
+    ssize_t            n;
+    ngx_connection_t  *c;
+    ngx_buf_t         *b;
+
+    c = ctx->session->connection;
+    b = ctx->pending_to_client;
+
+    while (b != NULL && b->pos < b->last) {
+        n = c->send(c, b->pos, b->last - b->pos);
+
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+                return NGX_ERROR;
+            }
+            return NGX_AGAIN;
+        }
+
+        if (n == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+
+        b->pos += n;
+    }
+
+    return NGX_OK;
 }
 
 

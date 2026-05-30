@@ -18,6 +18,7 @@ fallback forwarding for non-Trojan traffic.
 - Fallback forwarding for non-Trojan traffic.
 - Configurable timeouts and buffer sizes.
 - Nginx asynchronous resolver support for domain targets when `resolver` is configured.
+- Default HTTP 503 response when `trojan_fallback` is not configured.
 
 ## Build
 
