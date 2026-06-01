@@ -5,6 +5,7 @@
 #include <netdb.h>
 
 #include "ngx_stream_trojan_protocol.h"
+#include "ngx_stream_trojan_ip_prefer.h"
 #include "ngx_stream_trojan_relay.h"
 #include "ngx_stream_trojan_socks5_protocol.h"
 
@@ -44,6 +45,8 @@ typedef struct {
 
 typedef struct {
     ngx_uint_t   type;
+    ngx_uint_t   ip_prefer;
+    ngx_uint_t   ip_prefer_set;
     ngx_addr_t  *socks5_server;
     ngx_str_t    socks5_username;
     ngx_str_t    socks5_password;
@@ -88,6 +91,7 @@ typedef enum {
 typedef struct {
     ngx_stream_trojan_ctx_t        *ctx;
     ngx_stream_trojan_resolve_e     type;
+    ngx_uint_t                      ip_prefer;
     uint16_t                        port;
     uint16_t                        payload_len;
     u_char                         *payload;
@@ -206,10 +210,19 @@ static ngx_int_t ngx_stream_trojan_addr_to_ngx_addr(ngx_pool_t *pool,
     ngx_stream_trojan_addr_t *addr, ngx_addr_t *out);
 static ngx_int_t ngx_stream_trojan_resolve_addr(ngx_pool_t *pool,
     ngx_log_t *log, ngx_stream_trojan_addr_t *addr, ngx_addr_t *out);
+static ngx_int_t ngx_stream_trojan_resolve_addr_prefer(ngx_pool_t *pool,
+    ngx_log_t *log, ngx_stream_trojan_addr_t *addr, ngx_uint_t ip_prefer,
+    ngx_addr_t *out);
 static ngx_uint_t ngx_stream_trojan_resolver_configured(
     ngx_stream_session_t *s);
+static ngx_resolver_addr_t *ngx_stream_trojan_resolver_pick_addr(
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, ngx_uint_t ip_prefer);
 static ngx_int_t ngx_stream_trojan_resolver_addr_to_ngx_addr(ngx_pool_t *pool,
     ngx_resolver_addr_t *resolved, uint16_t port, ngx_addr_t *out);
+static ngx_uint_t ngx_stream_trojan_current_ip_prefer(
+    ngx_stream_trojan_ctx_t *ctx);
+static ngx_int_t ngx_stream_trojan_parse_ip_prefer(ngx_str_t *value,
+    ngx_uint_t *prefer);
 static ngx_int_t ngx_stream_trojan_sockaddr_to_addr(struct sockaddr *sa,
     socklen_t socklen, ngx_stream_trojan_addr_t *addr);
 static ngx_connection_t *ngx_stream_trojan_create_udp_connection(
@@ -219,7 +232,7 @@ static ngx_int_t ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
 static ngx_int_t ngx_stream_trojan_send_udp_resolved(
     ngx_stream_trojan_ctx_t *ctx, ngx_resolver_addr_t *addrs,
     ngx_uint_t naddrs, uint16_t port, const u_char *payload,
-    uint16_t payload_len);
+    uint16_t payload_len, ngx_uint_t ip_prefer);
 static ngx_int_t ngx_stream_trojan_send_udp_sockaddr(
     ngx_stream_trojan_ctx_t *ctx, struct sockaddr *sa, socklen_t socklen,
     const u_char *payload, uint16_t payload_len);
@@ -805,9 +818,11 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
         return;
     }
 
-    if (ngx_stream_trojan_resolve_addr(ctx->session->connection->pool,
-                                       ctx->session->connection->log,
-                                       &ctx->target, &addr)
+    if (ngx_stream_trojan_resolve_addr_prefer(ctx->session->connection->pool,
+                                              ctx->session->connection->log,
+                                              &ctx->target,
+                                              ngx_stream_trojan_current_ip_prefer(ctx),
+                                              &addr)
         != NGX_OK)
     {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -898,6 +913,7 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
 
     data->ctx = ctx;
     data->type = type;
+    data->ip_prefer = ngx_stream_trojan_current_ip_prefer(ctx);
     data->port = addr->port;
     data->payload_len = payload_len;
 
@@ -965,7 +981,9 @@ ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx)
     if (data->type == ngx_stream_trojan_resolve_tcp) {
         if (rctx->naddrs == 0
             || ngx_stream_trojan_resolver_addr_to_ngx_addr(
-                   ctx->session->connection->pool, &rctx->addrs[0],
+                   ctx->session->connection->pool,
+                   ngx_stream_trojan_resolver_pick_addr(
+                       rctx->addrs, rctx->naddrs, data->ip_prefer),
                    data->port, &addr)
                != NGX_OK)
         {
@@ -981,7 +999,8 @@ ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx)
 
     if (ngx_stream_trojan_send_udp_resolved(ctx, rctx->addrs, rctx->naddrs,
                                             data->port, data->payload,
-                                            data->payload_len)
+                                            data->payload_len,
+                                            data->ip_prefer)
         != NGX_OK)
     {
         ngx_resolve_name_done(rctx);
@@ -1627,6 +1646,41 @@ ngx_stream_trojan_outbound_type(ngx_stream_trojan_ctx_t *ctx)
 }
 
 
+static ngx_int_t
+ngx_stream_trojan_parse_ip_prefer(ngx_str_t *value, ngx_uint_t *prefer)
+{
+    if (value->len == 4 && ngx_strncmp(value->data, "auto", 4) == 0) {
+        *prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
+        return NGX_OK;
+    }
+
+    if (value->len == 4 && ngx_strncmp(value->data, "ipv4", 4) == 0) {
+        *prefer = NGX_STREAM_TROJAN_IP_PREFER_IPV4;
+        return NGX_OK;
+    }
+
+    if (value->len == 4 && ngx_strncmp(value->data, "ipv6", 4) == 0) {
+        *prefer = NGX_STREAM_TROJAN_IP_PREFER_IPV6;
+        return NGX_OK;
+    }
+
+    return NGX_ERROR;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_current_ip_prefer(ngx_stream_trojan_ctx_t *ctx)
+{
+    if (ctx->outbound == NULL
+        || ctx->outbound->type != ngx_stream_trojan_outbound_direct)
+    {
+        return NGX_STREAM_TROJAN_IP_PREFER_AUTO;
+    }
+
+    return ctx->outbound->ip_prefer;
+}
+
+
 static void
 ngx_stream_trojan_peer_handler(ngx_event_t *ev)
 {
@@ -1962,11 +2016,20 @@ static ngx_int_t
 ngx_stream_trojan_resolve_addr(ngx_pool_t *pool, ngx_log_t *log,
     ngx_stream_trojan_addr_t *addr, ngx_addr_t *out)
 {
+    return ngx_stream_trojan_resolve_addr_prefer(
+        pool, log, addr, NGX_STREAM_TROJAN_IP_PREFER_AUTO, out);
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_resolve_addr_prefer(ngx_pool_t *pool, ngx_log_t *log,
+    ngx_stream_trojan_addr_t *addr, ngx_uint_t ip_prefer, ngx_addr_t *out)
+{
     char                  host[256];
     char                  service[6];
     int                   rc;
     struct addrinfo       hints;
-    struct addrinfo      *res, *rp;
+    struct addrinfo      *res, *rp, *selected;
     struct sockaddr      *sa;
     socklen_t             socklen;
 
@@ -1995,29 +2058,53 @@ ngx_stream_trojan_resolve_addr(ngx_pool_t *pool, ngx_log_t *log,
         return NGX_ERROR;
     }
 
+    selected = NULL;
+
     for (rp = res; rp != NULL; rp = rp->ai_next) {
         if (rp->ai_family == AF_INET || rp->ai_family == AF_INET6) {
-            socklen = rp->ai_addrlen;
-            sa = ngx_pnalloc(pool, socklen);
-            if (sa == NULL) {
-                freeaddrinfo(res);
-                return NGX_ERROR;
+            if (selected == NULL) {
+                selected = rp;
             }
 
-            ngx_memcpy(sa, rp->ai_addr, socklen);
-            out->sockaddr = sa;
-            out->socklen = socklen;
-            out->name.data = ngx_pnalloc(pool, NGX_SOCKADDR_STRLEN);
-            if (out->name.data == NULL) {
-                freeaddrinfo(res);
-                return NGX_ERROR;
+            if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV4
+                && rp->ai_family == AF_INET)
+            {
+                selected = rp;
+                break;
             }
-            out->name.len = ngx_sock_ntop(out->sockaddr, out->socklen,
-                                          out->name.data,
-                                          NGX_SOCKADDR_STRLEN, 1);
-            freeaddrinfo(res);
-            return NGX_OK;
+
+#if (NGX_HAVE_INET6)
+            if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV6
+                && rp->ai_family == AF_INET6)
+            {
+                selected = rp;
+                break;
+            }
+#endif
         }
+    }
+
+    if (selected != NULL) {
+        socklen = selected->ai_addrlen;
+        sa = ngx_pnalloc(pool, socklen);
+        if (sa == NULL) {
+            freeaddrinfo(res);
+            return NGX_ERROR;
+        }
+
+        ngx_memcpy(sa, selected->ai_addr, socklen);
+        out->sockaddr = sa;
+        out->socklen = socklen;
+        out->name.data = ngx_pnalloc(pool, NGX_SOCKADDR_STRLEN);
+        if (out->name.data == NULL) {
+            freeaddrinfo(res);
+            return NGX_ERROR;
+        }
+        out->name.len = ngx_sock_ntop(out->sockaddr, out->socklen,
+                                      out->name.data,
+                                      NGX_SOCKADDR_STRLEN, 1);
+        freeaddrinfo(res);
+        return NGX_OK;
     }
 
     freeaddrinfo(res);
@@ -2036,11 +2123,47 @@ ngx_stream_trojan_resolver_configured(ngx_stream_session_t *s)
 }
 
 
+static ngx_resolver_addr_t *
+ngx_stream_trojan_resolver_pick_addr(ngx_resolver_addr_t *addrs,
+    ngx_uint_t naddrs, ngx_uint_t ip_prefer)
+{
+    ngx_uint_t i;
+
+    if (addrs == NULL || naddrs == 0) {
+        return NULL;
+    }
+
+    if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV4) {
+        for (i = 0; i < naddrs; i++) {
+            if (addrs[i].sockaddr->sa_family == AF_INET) {
+                return &addrs[i];
+            }
+        }
+    }
+
+#if (NGX_HAVE_INET6)
+    if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV6) {
+        for (i = 0; i < naddrs; i++) {
+            if (addrs[i].sockaddr->sa_family == AF_INET6) {
+                return &addrs[i];
+            }
+        }
+    }
+#endif
+
+    return &addrs[0];
+}
+
+
 static ngx_int_t
 ngx_stream_trojan_resolver_addr_to_ngx_addr(ngx_pool_t *pool,
     ngx_resolver_addr_t *resolved, uint16_t port, ngx_addr_t *out)
 {
     struct sockaddr  *sa;
+
+    if (resolved == NULL) {
+        return NGX_ERROR;
+    }
 
     ngx_memzero(out, sizeof(ngx_addr_t));
 
@@ -2251,7 +2374,40 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
             return NGX_ERROR;
         }
 
-        for (rp = res; rp != NULL; rp = rp->ai_next) {
+        rp = NULL;
+
+        if (ngx_stream_trojan_current_ip_prefer(ctx)
+            == NGX_STREAM_TROJAN_IP_PREFER_IPV4)
+        {
+            for (rp = res; rp != NULL; rp = rp->ai_next) {
+                if (rp->ai_family == AF_INET) {
+                    break;
+                }
+            }
+        }
+
+#if (NGX_HAVE_INET6)
+        if (rp == NULL
+            && ngx_stream_trojan_current_ip_prefer(ctx)
+               == NGX_STREAM_TROJAN_IP_PREFER_IPV6)
+        {
+            for (rp = res; rp != NULL; rp = rp->ai_next) {
+                if (rp->ai_family == AF_INET6) {
+                    break;
+                }
+            }
+        }
+#endif
+
+        if (rp == NULL) {
+            for (rp = res; rp != NULL; rp = rp->ai_next) {
+                if (rp->ai_family == AF_INET || rp->ai_family == AF_INET6) {
+                    break;
+                }
+            }
+        }
+
+        if (rp != NULL) {
             if (rp->ai_family == AF_INET) {
                 sa = rp->ai_addr;
                 socklen = rp->ai_addrlen;
@@ -2332,25 +2488,26 @@ ngx_stream_trojan_send_socks5_udp_frame(ngx_stream_trojan_ctx_t *ctx,
 static ngx_int_t
 ngx_stream_trojan_send_udp_resolved(ngx_stream_trojan_ctx_t *ctx,
     ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, uint16_t port,
-    const u_char *payload, uint16_t payload_len)
+    const u_char *payload, uint16_t payload_len, ngx_uint_t ip_prefer)
 {
-    ngx_uint_t       i;
-    struct sockaddr *sa;
+    ngx_resolver_addr_t  *resolved;
+    struct sockaddr      *sa;
 
-    for (i = 0; i < naddrs; i++) {
-        sa = ngx_pnalloc(ctx->session->connection->pool, addrs[i].socklen);
-        if (sa == NULL) {
-            return NGX_ERROR;
-        }
-
-        ngx_memcpy(sa, addrs[i].sockaddr, addrs[i].socklen);
-        ngx_inet_set_port(sa, port);
-
-        return ngx_stream_trojan_send_udp_sockaddr(ctx, sa, addrs[i].socklen,
-                                                   payload, payload_len);
+    resolved = ngx_stream_trojan_resolver_pick_addr(addrs, naddrs, ip_prefer);
+    if (resolved == NULL) {
+        return NGX_ERROR;
     }
 
-    return NGX_ERROR;
+    sa = ngx_pnalloc(ctx->session->connection->pool, resolved->socklen);
+    if (sa == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(sa, resolved->sockaddr, resolved->socklen);
+    ngx_inet_set_port(sa, port);
+
+    return ngx_stream_trojan_send_udp_sockaddr(ctx, sa, resolved->socklen,
+                                               payload, payload_len);
 }
 
 
@@ -2938,6 +3095,7 @@ ngx_stream_trojan_outbounds(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     ngx_memzero(outbound, sizeof(*outbound));
     outbound->type = ngx_stream_trojan_outbound_socks5;
+    outbound->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
 
     save = *cf;
     cf->handler = ngx_stream_trojan_outbounds_block;
@@ -3003,6 +3161,7 @@ ngx_stream_trojan_outbound_direct_directive(ngx_conf_t *cf, ngx_command_t *cmd,
 
     ngx_memzero(outbound, sizeof(*outbound));
     outbound->type = ngx_stream_trojan_outbound_direct;
+    outbound->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
 
     save = *cf;
     cf->handler = ngx_stream_trojan_outbounds_block;
@@ -3042,6 +3201,7 @@ ngx_stream_trojan_outbound_socks5_directive(ngx_conf_t *cf,
 
     ngx_memzero(outbound, sizeof(*outbound));
     outbound->type = ngx_stream_trojan_outbound_socks5;
+    outbound->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
 
     save = *cf;
     cf->handler = ngx_stream_trojan_outbounds_block;
@@ -3173,6 +3333,30 @@ ngx_stream_trojan_outbounds_block(ngx_conf_t *cf, ngx_command_t *cmd,
         }
 
         outbound->socks5_password = value[1];
+        return NGX_CONF_OK;
+    }
+
+    if (cf->args->nelts == 2 && ngx_strcmp(value[0].data, "ip_prefer") == 0) {
+        if (outbound->type != ngx_stream_trojan_outbound_direct) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "ip_prefer is only allowed in outbounds_direct");
+            return NGX_CONF_ERROR;
+        }
+
+        if (outbound->ip_prefer_set) {
+            return "duplicate ip_prefer";
+        }
+
+        if (ngx_stream_trojan_parse_ip_prefer(&value[1],
+                                              &outbound->ip_prefer)
+            != NGX_OK)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid ip_prefer value \"%V\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+
+        outbound->ip_prefer_set = 1;
         return NGX_CONF_OK;
     }
 
