@@ -5,6 +5,10 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 #include <ngx_event_connect.h>
+#if (NGX_SSL)
+#include <ngx_event_openssl.h>
+#endif
+
 
 #define NGX_STREAM_TROJAN_DOH_MAX_QUERY_SIZE     512
 #define NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE  4096
@@ -39,7 +43,8 @@ size_t ngx_stream_trojan_doh_build_query(u_char *buf, size_t buf_len,
 /*
  * Parse DNS wire-format response, extract A/AAAA records.
  * Allocates resolved addresses from pool.
- * Returns NGX_OK on success, NGX_ERROR on error.
+ * Returns NGX_OK on success, NGX_DECLINED when the response is valid but
+ * contains no A/AAAA answer, NGX_ERROR on malformed/error response.
  */
 ngx_int_t ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
     uint16_t expected_id, ngx_resolver_addr_t **addrs_p,
@@ -59,13 +64,19 @@ ngx_int_t ngx_stream_trojan_doh_parse_url(ngx_str_t *url,
 typedef void (*ngx_stream_trojan_doh_handler_pt)(void *ctx, ngx_int_t status,
     ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
 
+typedef struct ngx_stream_trojan_doh_ctx_s ngx_stream_trojan_doh_ctx_t;
+
 /*
  * Initiate an async DoH resolution.
  * doh_conf->addrs must contain pre-resolved server addresses.
+ * On success, *ctxp receives a cancellable request handle.
  * Returns NGX_OK on success, NGX_ERROR on immediate failure.
  */
 ngx_int_t ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     u_char *name, size_t name_len, uint16_t qtype,
-    ngx_log_t *log, void *data, ngx_stream_trojan_doh_handler_pt handler);
+    ngx_log_t *log, void *data, ngx_stream_trojan_doh_handler_pt handler,
+    ngx_stream_trojan_doh_ctx_t **ctxp);
+
+void ngx_stream_trojan_doh_cancel(ngx_stream_trojan_doh_ctx_t *doh);
 
 #endif /* _NGX_STREAM_TROJAN_DOH_H_INCLUDED_ */

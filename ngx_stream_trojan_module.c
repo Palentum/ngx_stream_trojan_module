@@ -92,6 +92,10 @@ typedef struct {
     ngx_stream_trojan_ctx_t        *ctx;
     ngx_stream_trojan_resolve_e     type;
     ngx_uint_t                      ip_prefer;
+    u_char                         *name;
+    size_t                          name_len;
+    uint16_t                        qtype;
+    uint16_t                        fallback_qtype;
     uint16_t                        port;
     uint16_t                        payload_len;
     u_char                         *payload;
@@ -137,6 +141,7 @@ struct ngx_stream_trojan_ctx_s {
     ngx_connection_t           *socks5_udp;
     ngx_addr_t                  socks5_udp_relay;
     ngx_resolver_ctx_t         *resolver_ctx;
+    ngx_stream_trojan_doh_ctx_t *doh_ctx;
     u_char                     *udp_in;
     size_t                      udp_in_len;
     u_char                     *udp_out;
@@ -178,6 +183,8 @@ static void ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx);
 static void ngx_stream_trojan_resolve_complete(
     ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_resolve_data_t *data,
     ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
+static ngx_int_t ngx_stream_trojan_start_doh_resolver(
+    ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_resolve_data_t *data);
 static void ngx_stream_trojan_doh_resolve_handler(void *cb_data,
     ngx_int_t status, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
 static void ngx_stream_trojan_connect(ngx_stream_trojan_ctx_t *ctx,
@@ -802,12 +809,52 @@ ngx_stream_trojan_flush_default_fallback(ngx_stream_trojan_ctx_t *ctx)
 
 
 static uint16_t
-ngx_stream_trojan_doh_query_type(ngx_uint_t ip_prefer)
+ngx_stream_trojan_doh_first_qtype(ngx_uint_t ip_prefer)
 {
+#if (NGX_HAVE_INET6)
     if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV6) {
         return 28; /* AAAA */
     }
-    return 1; /* default: A (IPv4) */
+#else
+    (void) ip_prefer;
+#endif
+
+    return 1; /* A */
+}
+
+
+static uint16_t
+ngx_stream_trojan_doh_fallback_qtype(ngx_uint_t ip_prefer)
+{
+#if (NGX_HAVE_INET6)
+    if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV6) {
+        return 1; /* A */
+    }
+
+    return 28; /* AAAA */
+#else
+    (void) ip_prefer;
+    return 0;
+#endif
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_start_doh_resolver(ngx_stream_trojan_ctx_t *ctx,
+    ngx_stream_trojan_resolve_data_t *data)
+{
+    if (ctx->conf->doh_conf == NULL
+        || data->name == NULL || data->name_len == 0)
+    {
+        return NGX_ERROR;
+    }
+
+    ctx->state = ngx_stream_trojan_state_resolving;
+
+    return ngx_stream_trojan_doh_resolve(ctx->conf->doh_conf,
+        data->name, data->name_len, data->qtype,
+        ctx->session->connection->log, data,
+        ngx_stream_trojan_doh_resolve_handler, &ctx->doh_ctx);
 }
 
 
@@ -839,22 +886,28 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
             return;
         }
 
+        data->name = ngx_pnalloc(ctx->session->connection->pool,
+                                 ctx->target.host_len);
+        if (data->name == NULL) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+        ngx_memcpy(data->name, ctx->target.host, ctx->target.host_len);
+
         data->ctx = ctx;
         data->type = ngx_stream_trojan_resolve_tcp;
         data->ip_prefer = ngx_stream_trojan_current_ip_prefer(ctx);
+        data->name_len = ctx->target.host_len;
+        data->qtype = ngx_stream_trojan_doh_first_qtype(data->ip_prefer);
+        data->fallback_qtype =
+            ngx_stream_trojan_doh_fallback_qtype(data->ip_prefer);
         data->port = ctx->target.port;
         data->payload_len = 0;
         data->payload = NULL;
 
-        ctx->state = ngx_stream_trojan_state_resolving;
         ctx->peer_kind = ngx_stream_trojan_peer_tcp;
 
-        if (ngx_stream_trojan_doh_resolve(conf->doh_conf,
-                ctx->target.host, ctx->target.host_len,
-                ngx_stream_trojan_doh_query_type(data->ip_prefer),
-                ctx->session->connection->log,
-                data, ngx_stream_trojan_doh_resolve_handler)
-            != NGX_OK)
+        if (ngx_stream_trojan_start_doh_resolver(ctx, data) != NGX_OK)
         {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
         }
@@ -1100,7 +1153,16 @@ ngx_stream_trojan_doh_resolve_handler(void *cb_data, ngx_int_t status,
         return;
     }
 
-    if (status != NGX_OK) {
+    if (status != NGX_OK || naddrs == 0) {
+        if (status == NGX_DECLINED && data->fallback_qtype != 0) {
+            data->qtype = data->fallback_qtype;
+            data->fallback_qtype = 0;
+
+            if (ngx_stream_trojan_start_doh_resolver(ctx, data) == NGX_OK) {
+                return;
+            }
+        }
+
         ngx_log_error(NGX_LOG_ERR, ctx->session->connection->log, 0,
                       "DoH: resolution failed");
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -2444,9 +2506,20 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
                 return NGX_ERROR;
             }
 
+            udata->name = ngx_pnalloc(ctx->session->connection->pool,
+                                      frame->addr.host_len);
+            if (udata->name == NULL) {
+                return NGX_ERROR;
+            }
+            ngx_memcpy(udata->name, frame->addr.host, frame->addr.host_len);
+
             udata->ctx = ctx;
             udata->type = ngx_stream_trojan_resolve_udp;
             udata->ip_prefer = ngx_stream_trojan_current_ip_prefer(ctx);
+            udata->name_len = frame->addr.host_len;
+            udata->qtype = ngx_stream_trojan_doh_first_qtype(udata->ip_prefer);
+            udata->fallback_qtype =
+                ngx_stream_trojan_doh_fallback_qtype(udata->ip_prefer);
             udata->port = frame->addr.port;
 
             if (frame->payload_len) {
@@ -2467,12 +2540,7 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
                 ctx->udp_in_len -= frame->wire_len;
             }
 
-            if (ngx_stream_trojan_doh_resolve(ctx->conf->doh_conf,
-                    frame->addr.host, frame->addr.host_len,
-                    ngx_stream_trojan_doh_query_type(udata->ip_prefer),
-                    ctx->session->connection->log,
-                    udata, ngx_stream_trojan_doh_resolve_handler)
-                != NGX_OK)
+            if (ngx_stream_trojan_start_doh_resolver(ctx, udata) != NGX_OK)
             {
                 return NGX_ERROR;
             }
@@ -3022,6 +3090,11 @@ ngx_stream_trojan_finalize(ngx_stream_trojan_ctx_t *ctx, ngx_uint_t rc)
     if (ctx->resolver_ctx) {
         ngx_resolve_name_done(ctx->resolver_ctx);
         ctx->resolver_ctx = NULL;
+    }
+
+    if (ctx->doh_ctx) {
+        ngx_stream_trojan_doh_cancel(ctx->doh_ctx);
+        ctx->doh_ctx = NULL;
     }
 
     if (ctx->upstream) {
