@@ -161,7 +161,7 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
     uint16_t              rtype, rdlength;
     ngx_uint_t            i, n;
     ngx_resolver_addr_t  *addrs;
-    struct sockaddr       sa_buf;
+    struct sockaddr_storage  sa_buf;
     socklen_t             socklen;
 
     *addrs_p = NULL;
@@ -243,7 +243,8 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
         if ((size_t) (end - p) < rdlength) return NGX_ERROR;
 
         if (ngx_stream_trojan_doh_extract_rdata(rtype, p, rdlength,
-                                                 &sa_buf, &socklen)
+                                                (struct sockaddr *) &sa_buf,
+                                                &socklen)
             == NGX_OK)
         {
             addrs[n].sockaddr = ngx_palloc(pool, socklen);
