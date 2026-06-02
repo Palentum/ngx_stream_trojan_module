@@ -244,8 +244,6 @@ struct ngx_stream_trojan_ctx_s {
     ngx_stream_trojan_mux_cool_frame_t mux_cool_frame;
     u_char                      mux_sing_handshake[5];
     size_t                      mux_sing_handshake_len;
-    size_t                      mux_sing_padding_len;
-    size_t                      mux_sing_padding_read;
     ngx_uint_t                  mux_sing_handshake_done;
 };
 
@@ -2754,7 +2752,6 @@ static ngx_int_t
 ngx_stream_trojan_mux_sing_read_handshake(ngx_stream_trojan_ctx_t *ctx)
 {
     ssize_t            n;
-    size_t             to_read;
     ngx_connection_t  *c;
 
     c = ctx->session->connection;
@@ -2803,50 +2800,8 @@ ngx_stream_trojan_mux_sing_read_handshake(ngx_stream_trojan_ctx_t *ctx)
         ctx->mux_sing_handshake_len += (size_t) n;
     }
 
-    if (!ctx->mux_sing_handshake[2]) {
-        ctx->mux_sing_handshake_done = 1;
-        return NGX_OK;
-    }
-
-    while (ctx->mux_sing_handshake_len < 5) {
-        n = c->recv(c,
-                    ctx->mux_sing_handshake + ctx->mux_sing_handshake_len,
-                    5 - ctx->mux_sing_handshake_len);
-
-        if (n == NGX_AGAIN) {
-            return NGX_AGAIN;
-        }
-
-        if (n == 0 || n == NGX_ERROR) {
-            return NGX_DONE;
-        }
-
-        ctx->mux_sing_handshake_len += (size_t) n;
-    }
-
-    if (ctx->mux_sing_padding_len == 0) {
-        ctx->mux_sing_padding_len =
-            ((size_t) ctx->mux_sing_handshake[3] << 8)
-            | ctx->mux_sing_handshake[4];
-    }
-
-    while (ctx->mux_sing_padding_read < ctx->mux_sing_padding_len) {
-        to_read = ctx->mux_sing_padding_len - ctx->mux_sing_padding_read;
-        if (to_read > NGX_STREAM_TROJAN_MUX_MAX_FRAME_SIZE) {
-            to_read = NGX_STREAM_TROJAN_MUX_MAX_FRAME_SIZE;
-        }
-
-        n = c->recv(c, ctx->mux_payload, to_read);
-
-        if (n == NGX_AGAIN) {
-            return NGX_AGAIN;
-        }
-
-        if (n == 0 || n == NGX_ERROR) {
-            return NGX_DONE;
-        }
-
-        ctx->mux_sing_padding_read += (size_t) n;
+    if (ctx->mux_sing_handshake[2]) {
+        return NGX_ERROR;
     }
 
     ctx->mux_sing_handshake_done = 1;
