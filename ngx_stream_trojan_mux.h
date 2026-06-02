@@ -18,6 +18,17 @@
 #define NGX_STREAM_TROJAN_MUX_COOL_HOST_LEN 11
 #define NGX_STREAM_TROJAN_MUX_COOL_MAX_META_LEN 512
 
+#define NGX_STREAM_TROJAN_MUX_SING_HOST "sp.mux.sing-box.arpa"
+#define NGX_STREAM_TROJAN_MUX_SING_HOST_LEN 20
+#define NGX_STREAM_TROJAN_MUX_SING_PORT 444
+#define NGX_STREAM_TROJAN_MUX_SING_VERSION0 0
+#define NGX_STREAM_TROJAN_MUX_SING_VERSION1 1
+#define NGX_STREAM_TROJAN_MUX_SING_PROTOCOL_SMUX 0
+
+#define NGX_STREAM_TROJAN_MUX_SING_STATUS_SUCCESS 0
+#define NGX_STREAM_TROJAN_MUX_SING_FLAG_UDP 0x0001
+#define NGX_STREAM_TROJAN_MUX_SING_FLAG_ADDR 0x0002
+
 #define NGX_STREAM_TROJAN_MUX_COOL_STATUS_NEW 0x01
 #define NGX_STREAM_TROJAN_MUX_COOL_STATUS_KEEP 0x02
 #define NGX_STREAM_TROJAN_MUX_COOL_STATUS_END 0x03
@@ -63,6 +74,10 @@ int ngx_stream_trojan_mux_pack_header(uint8_t *buf, size_t len,
     uint8_t command, uint16_t payload_len, uint32_t stream_id);
 int ngx_stream_trojan_mux_request_needed(const uint8_t *buf, size_t len,
     size_t *needed);
+int ngx_stream_trojan_mux_sing_request_needed(const uint8_t *buf, size_t len,
+    size_t *needed);
+int ngx_stream_trojan_mux_sing_parse_request(const uint8_t *buf, size_t len,
+    ngx_stream_trojan_addr_t *addr);
 int ngx_stream_trojan_mux_cool_parse_metadata(const uint8_t *buf, size_t len,
     ngx_stream_trojan_mux_cool_frame_t *frame);
 int ngx_stream_trojan_mux_cool_pack_header(uint8_t *buf, size_t len,

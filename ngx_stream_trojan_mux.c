@@ -183,6 +183,79 @@ ngx_stream_trojan_mux_request_needed(const uint8_t *buf, size_t len,
 
 
 int
+ngx_stream_trojan_mux_sing_request_needed(const uint8_t *buf, size_t len,
+    size_t *needed)
+{
+    size_t   addr_len;
+    uint16_t flags;
+
+    if (buf == NULL || needed == NULL) {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    if (len < 3) {
+        *needed = 3;
+        return NGX_STREAM_TROJAN_MUX_AGAIN;
+    }
+
+    flags = ngx_stream_trojan_mux_get16be(buf);
+    if (flags & NGX_STREAM_TROJAN_MUX_SING_FLAG_UDP) {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    switch (buf[2]) {
+    case NGX_STREAM_TROJAN_ADDR_IPV4:
+        addr_len = 1 + 4 + 2;
+        break;
+
+    case NGX_STREAM_TROJAN_ADDR_DOMAIN:
+        if (len < 4) {
+            *needed = 4;
+            return NGX_STREAM_TROJAN_MUX_AGAIN;
+        }
+        if (buf[3] == 0) {
+            return NGX_STREAM_TROJAN_MUX_ERROR;
+        }
+        addr_len = 1 + 1 + buf[3] + 2;
+        break;
+
+    case NGX_STREAM_TROJAN_ADDR_IPV6:
+        addr_len = 1 + 16 + 2;
+        break;
+
+    default:
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    *needed = 2 + addr_len;
+    if (len < *needed) {
+        return NGX_STREAM_TROJAN_MUX_AGAIN;
+    }
+
+    return NGX_STREAM_TROJAN_MUX_OK;
+}
+
+
+int
+ngx_stream_trojan_mux_sing_parse_request(const uint8_t *buf, size_t len,
+    ngx_stream_trojan_addr_t *addr)
+{
+    size_t  needed;
+
+    if (addr == NULL
+        || ngx_stream_trojan_mux_sing_request_needed(buf, len, &needed)
+           != NGX_STREAM_TROJAN_MUX_OK
+        || needed != len)
+    {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    return ngx_stream_trojan_parse_addr(buf + 2, len - 2, addr) == 0
+           ? NGX_STREAM_TROJAN_MUX_OK : NGX_STREAM_TROJAN_MUX_ERROR;
+}
+
+
+int
 ngx_stream_trojan_mux_cool_parse_metadata(const uint8_t *buf, size_t len,
     ngx_stream_trojan_mux_cool_frame_t *frame)
 {
