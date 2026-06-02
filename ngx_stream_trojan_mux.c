@@ -1,4 +1,5 @@
 #include "ngx_stream_trojan_mux.h"
+#include <string.h>
 
 
 static uint16_t
@@ -33,6 +34,20 @@ ngx_stream_trojan_mux_put32le(uint8_t *p, uint32_t value)
     p[1] = (uint8_t) (value >> 8);
     p[2] = (uint8_t) (value >> 16);
     p[3] = (uint8_t) (value >> 24);
+}
+
+static uint16_t
+ngx_stream_trojan_mux_get16be(const uint8_t *p)
+{
+    return (uint16_t) ((p[0] << 8) | p[1]);
+}
+
+
+static void
+ngx_stream_trojan_mux_put16be(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t) (value >> 8);
+    p[1] = (uint8_t) value;
 }
 
 
@@ -163,5 +178,139 @@ ngx_stream_trojan_mux_request_needed(const uint8_t *buf, size_t len,
         return NGX_STREAM_TROJAN_MUX_AGAIN;
     }
 
+    return NGX_STREAM_TROJAN_MUX_OK;
+}
+
+
+int
+ngx_stream_trojan_mux_cool_parse_metadata(const uint8_t *buf, size_t len,
+    ngx_stream_trojan_mux_cool_frame_t *frame)
+{
+    size_t   pos, host_len;
+    uint8_t  atyp;
+
+    if (buf == NULL || frame == NULL || len < 4
+        || len > NGX_STREAM_TROJAN_MUX_COOL_MAX_META_LEN)
+    {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    memset(frame, 0, sizeof(*frame));
+
+    frame->session_id = ngx_stream_trojan_mux_get16be(buf);
+    frame->status = buf[2];
+    frame->option = buf[3];
+    pos = 4;
+
+    switch (frame->status) {
+    case NGX_STREAM_TROJAN_MUX_COOL_STATUS_NEW:
+        if (len < pos + 4) {
+            return NGX_STREAM_TROJAN_MUX_ERROR;
+        }
+
+        frame->network = buf[pos++];
+        frame->target.port = ngx_stream_trojan_mux_get16be(buf + pos);
+        pos += 2;
+        atyp = buf[pos++];
+
+        switch (atyp) {
+        case NGX_STREAM_TROJAN_MUX_COOL_ADDR_IPV4:
+            if (len < pos + 4) {
+                return NGX_STREAM_TROJAN_MUX_ERROR;
+            }
+            frame->target.type = NGX_STREAM_TROJAN_ADDR_IPV4;
+            memcpy(frame->target.host, buf + pos, 4);
+            frame->target.host_len = 4;
+            frame->target.wire_len = 1 + 4 + 2;
+            pos += 4;
+            break;
+
+        case NGX_STREAM_TROJAN_MUX_COOL_ADDR_DOMAIN:
+            if (len < pos + 1) {
+                return NGX_STREAM_TROJAN_MUX_ERROR;
+            }
+            host_len = buf[pos++];
+            if (host_len == 0 || len < pos + host_len) {
+                return NGX_STREAM_TROJAN_MUX_ERROR;
+            }
+            frame->target.type = NGX_STREAM_TROJAN_ADDR_DOMAIN;
+            memcpy(frame->target.host, buf + pos, host_len);
+            frame->target.host_len = host_len;
+            frame->target.wire_len = 1 + 1 + host_len + 2;
+            pos += host_len;
+            break;
+
+        case NGX_STREAM_TROJAN_MUX_COOL_ADDR_IPV6:
+            if (len < pos + 16) {
+                return NGX_STREAM_TROJAN_MUX_ERROR;
+            }
+            frame->target.type = NGX_STREAM_TROJAN_ADDR_IPV6;
+            memcpy(frame->target.host, buf + pos, 16);
+            frame->target.host_len = 16;
+            frame->target.wire_len = 1 + 16 + 2;
+            pos += 16;
+            break;
+
+        default:
+            return NGX_STREAM_TROJAN_MUX_ERROR;
+        }
+
+        if (frame->network != NGX_STREAM_TROJAN_MUX_COOL_NETWORK_TCP
+            && frame->network != NGX_STREAM_TROJAN_MUX_COOL_NETWORK_UDP)
+        {
+            return NGX_STREAM_TROJAN_MUX_ERROR;
+        }
+        break;
+
+    case NGX_STREAM_TROJAN_MUX_COOL_STATUS_KEEP:
+    case NGX_STREAM_TROJAN_MUX_COOL_STATUS_END:
+    case NGX_STREAM_TROJAN_MUX_COOL_STATUS_KEEPALIVE:
+        break;
+
+    default:
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    return NGX_STREAM_TROJAN_MUX_OK;
+}
+
+
+int
+ngx_stream_trojan_mux_cool_pack_header(uint8_t *buf, size_t len,
+    uint16_t session_id, uint8_t status, uint8_t option,
+    uint16_t payload_len, size_t *written)
+{
+    size_t  n;
+
+    if (buf == NULL || written == NULL || len < 6) {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    if ((option & NGX_STREAM_TROJAN_MUX_COOL_OPT_DATA) && len < 8) {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    switch (status) {
+    case NGX_STREAM_TROJAN_MUX_COOL_STATUS_KEEP:
+    case NGX_STREAM_TROJAN_MUX_COOL_STATUS_END:
+    case NGX_STREAM_TROJAN_MUX_COOL_STATUS_KEEPALIVE:
+        break;
+
+    default:
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    ngx_stream_trojan_mux_put16be(buf, 4);
+    ngx_stream_trojan_mux_put16be(buf + 2, session_id);
+    buf[4] = status;
+    buf[5] = option;
+    n = 6;
+
+    if (option & NGX_STREAM_TROJAN_MUX_COOL_OPT_DATA) {
+        ngx_stream_trojan_mux_put16be(buf + 6, payload_len);
+        n = 8;
+    }
+
+    *written = n;
     return NGX_STREAM_TROJAN_MUX_OK;
 }

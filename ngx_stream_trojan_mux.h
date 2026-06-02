@@ -14,6 +14,25 @@
 #define NGX_STREAM_TROJAN_MUX_STREAM_BUFFER_SIZE 65536
 #define NGX_STREAM_TROJAN_MUX_MAX_STREAMS 128
 
+#define NGX_STREAM_TROJAN_MUX_COOL_HOST "v1.mux.cool"
+#define NGX_STREAM_TROJAN_MUX_COOL_HOST_LEN 11
+#define NGX_STREAM_TROJAN_MUX_COOL_MAX_META_LEN 512
+
+#define NGX_STREAM_TROJAN_MUX_COOL_STATUS_NEW 0x01
+#define NGX_STREAM_TROJAN_MUX_COOL_STATUS_KEEP 0x02
+#define NGX_STREAM_TROJAN_MUX_COOL_STATUS_END 0x03
+#define NGX_STREAM_TROJAN_MUX_COOL_STATUS_KEEPALIVE 0x04
+
+#define NGX_STREAM_TROJAN_MUX_COOL_OPT_DATA 0x01
+#define NGX_STREAM_TROJAN_MUX_COOL_OPT_ERROR 0x02
+
+#define NGX_STREAM_TROJAN_MUX_COOL_NETWORK_TCP 0x01
+#define NGX_STREAM_TROJAN_MUX_COOL_NETWORK_UDP 0x02
+
+#define NGX_STREAM_TROJAN_MUX_COOL_ADDR_IPV4 0x01
+#define NGX_STREAM_TROJAN_MUX_COOL_ADDR_DOMAIN 0x02
+#define NGX_STREAM_TROJAN_MUX_COOL_ADDR_IPV6 0x03
+
 #define NGX_STREAM_TROJAN_MUX_CMD_SYN 0x00
 #define NGX_STREAM_TROJAN_MUX_CMD_FIN 0x01
 #define NGX_STREAM_TROJAN_MUX_CMD_PSH 0x02
@@ -30,11 +49,24 @@ typedef struct {
     uint32_t stream_id;
 } ngx_stream_trojan_mux_frame_t;
 
+typedef struct {
+    uint16_t                  session_id;
+    uint8_t                   status;
+    uint8_t                   option;
+    uint8_t                   network;
+    ngx_stream_trojan_addr_t  target;
+} ngx_stream_trojan_mux_cool_frame_t;
+
 int ngx_stream_trojan_mux_parse_header(const uint8_t *buf, size_t len,
     ngx_stream_trojan_mux_frame_t *frame);
 int ngx_stream_trojan_mux_pack_header(uint8_t *buf, size_t len,
     uint8_t command, uint16_t payload_len, uint32_t stream_id);
 int ngx_stream_trojan_mux_request_needed(const uint8_t *buf, size_t len,
     size_t *needed);
+int ngx_stream_trojan_mux_cool_parse_metadata(const uint8_t *buf, size_t len,
+    ngx_stream_trojan_mux_cool_frame_t *frame);
+int ngx_stream_trojan_mux_cool_pack_header(uint8_t *buf, size_t len,
+    uint16_t session_id, uint8_t status, uint8_t option,
+    uint16_t payload_len, size_t *written);
 
 #endif /* _NGX_STREAM_TROJAN_MUX_H_INCLUDED_ */
