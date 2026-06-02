@@ -1,0 +1,71 @@
+#ifndef _NGX_STREAM_TROJAN_DOH_H_INCLUDED_
+#define _NGX_STREAM_TROJAN_DOH_H_INCLUDED_
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_event.h>
+#include <ngx_event_connect.h>
+
+#define NGX_STREAM_TROJAN_DOH_MAX_QUERY_SIZE     512
+#define NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE  4096
+#define NGX_STREAM_TROJAN_DOH_DEFAULT_TIMEOUT    10000
+
+/* DoH per-server parsed configuration */
+typedef struct {
+    ngx_str_t     host;         /* hostname string (for Host header) */
+    ngx_str_t     host_header;  /* "host:port" for HTTP Host header */
+    ngx_str_t     path;         /* URL path, e.g. "/dns-query" */
+    in_port_t     port;
+    ngx_uint_t    https;        /* 1 if HTTPS */
+    ngx_msec_t    timeout;
+
+    /* pre-resolved server addresses (populated at config time) */
+    ngx_addr_t   *addrs;
+    ngx_uint_t    naddrs;
+
+#if (NGX_SSL)
+    ngx_ssl_t     ssl;          /* SSL client context */
+    ngx_str_t     ssl_hostname; /* hostname for SNI + cert verification */
+#endif
+} ngx_stream_trojan_doh_conf_t;
+
+/*
+ * Build a DNS query in wire format (RFC 1035).
+ * Returns query length on success, 0 on error.
+ */
+size_t ngx_stream_trojan_doh_build_query(u_char *buf, size_t buf_len,
+    const u_char *name, size_t name_len, uint16_t qtype, uint16_t dns_id);
+
+/*
+ * Parse DNS wire-format response, extract A/AAAA records.
+ * Allocates resolved addresses from pool.
+ * Returns NGX_OK on success, NGX_ERROR on error.
+ */
+ngx_int_t ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
+    uint16_t expected_id, ngx_resolver_addr_t **addrs_p,
+    ngx_uint_t *naddrs_p, ngx_pool_t *pool);
+
+/*
+ * Parse a DoH URL string (e.g. "https://dns.google/dns-query").
+ * Resolves the hostname at config time using ngx_parse_url.
+ * Returns NGX_OK on success, NGX_ERROR on error.
+ */
+ngx_int_t ngx_stream_trojan_doh_parse_url(ngx_str_t *url,
+    ngx_stream_trojan_doh_conf_t *doh_conf, ngx_pool_t *pool, ngx_log_t *log);
+
+/*
+ * Callback type for DoH resolution completion.
+ */
+typedef void (*ngx_stream_trojan_doh_handler_pt)(void *ctx, ngx_int_t status,
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
+
+/*
+ * Initiate an async DoH resolution.
+ * doh_conf->addrs must contain pre-resolved server addresses.
+ * Returns NGX_OK on success, NGX_ERROR on immediate failure.
+ */
+ngx_int_t ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
+    u_char *name, size_t name_len, uint16_t qtype,
+    ngx_log_t *log, void *data, ngx_stream_trojan_doh_handler_pt handler);
+
+#endif /* _NGX_STREAM_TROJAN_DOH_H_INCLUDED_ */
