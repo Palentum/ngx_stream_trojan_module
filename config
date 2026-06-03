@@ -7,7 +7,9 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/ngx_stream_trojan_protocol.c \
                      $ngx_addon_dir/ngx_stream_trojan_socks5_protocol.c \
                      $ngx_addon_dir/ngx_stream_trojan_mux.c \
-                     $ngx_addon_dir/ngx_stream_trojan_doh.c"
+                     $ngx_addon_dir/ngx_stream_trojan_doh.c \
+                     $ngx_addon_dir/ngx_stream_trojan_dns_rules.c \
+                     $ngx_addon_dir/ngx_stream_trojan_geosite.c"
 
     . auto/module
 else
@@ -17,5 +19,7 @@ else
                     $ngx_addon_dir/ngx_stream_trojan_protocol.c \
                     $ngx_addon_dir/ngx_stream_trojan_socks5_protocol.c \
                     $ngx_addon_dir/ngx_stream_trojan_mux.c \
-                    $ngx_addon_dir/ngx_stream_trojan_doh.c"
+                    $ngx_addon_dir/ngx_stream_trojan_doh.c \
+                    $ngx_addon_dir/ngx_stream_trojan_dns_rules.c \
+                    $ngx_addon_dir/ngx_stream_trojan_geosite.c"
 fi

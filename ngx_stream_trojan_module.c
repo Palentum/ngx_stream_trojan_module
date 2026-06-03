@@ -11,6 +11,8 @@
 #include "ngx_stream_trojan_socks5_protocol.h"
 #include "ngx_stream_trojan_mux.h"
 #include "ngx_stream_trojan_doh.h"
+#include "ngx_stream_trojan_dns_rules.h"
+#include "ngx_stream_trojan_geosite.h"
 
 
 #define NGX_STREAM_TROJAN_DEFAULT_BUFFER_SIZE 32768
@@ -100,6 +102,8 @@ struct ngx_stream_trojan_srv_conf_s {
     size_t       buffer_size;
     ngx_array_t *outbounds;
     ngx_stream_trojan_doh_conf_t *doh_conf;
+    ngx_stream_trojan_dns_rules_conf_t *dns_rules;
+    ngx_stream_trojan_geosite_t *geosite;
     ngx_stream_trojan_srv_conf_t *effective;
     ngx_stream_trojan_server_ref_t socks5_ref;
 };
@@ -336,7 +340,9 @@ static void ngx_stream_trojan_start_socks5_tcp(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_start_socks5_udp(ngx_stream_trojan_ctx_t *ctx);
 static ngx_int_t ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_addr_t *addr, ngx_stream_trojan_resolve_e type,
-    const u_char *payload, uint16_t payload_len, size_t wire_len);
+    const u_char *payload, uint16_t payload_len, size_t wire_len,
+    ngx_resolver_t *resolver, ngx_msec_t resolver_timeout,
+    ngx_uint_t ip_prefer);
 static void ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx);
 static void ngx_stream_trojan_resolve_complete(
     ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_resolve_data_t *data,
@@ -448,7 +454,8 @@ static ngx_uint_t ngx_stream_trojan_mux_stream_ip_prefer(
 static ngx_uint_t ngx_stream_trojan_mux_stream_request_blocked(
     ngx_stream_trojan_mux_stream_t *stream);
 static ngx_int_t ngx_stream_trojan_mux_start_resolver(
-    ngx_stream_trojan_mux_stream_t *stream);
+    ngx_stream_trojan_mux_stream_t *stream,
+    ngx_stream_trojan_dns_rule_group_t *dns_rule);
 static void ngx_stream_trojan_mux_resolve_handler(ngx_resolver_ctx_t *rctx);
 static ngx_int_t ngx_stream_trojan_mux_start_doh_resolver(
     ngx_stream_trojan_mux_stream_t *stream,
@@ -487,6 +494,8 @@ static ngx_int_t ngx_stream_trojan_resolver_addr_to_ngx_addr(ngx_pool_t *pool,
     ngx_resolver_addr_t *resolved, uint16_t port, ngx_addr_t *out);
 static ngx_uint_t ngx_stream_trojan_current_ip_prefer(
     ngx_stream_trojan_ctx_t *ctx);
+static ngx_stream_trojan_dns_rule_group_t *ngx_stream_trojan_match_dns_rule(
+    ngx_stream_trojan_srv_conf_t *conf, ngx_stream_trojan_addr_t *addr);
 static ngx_int_t ngx_stream_trojan_parse_ip_prefer(ngx_str_t *value,
     ngx_uint_t *prefer);
 static ngx_int_t ngx_stream_trojan_parse_block(ngx_str_t *value,
@@ -548,6 +557,10 @@ static char *ngx_stream_trojan_outbound_socks5_directive(ngx_conf_t *cf,
 static char *ngx_stream_trojan_outbounds_block(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_stream_trojan_doh_directive(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_stream_trojan_geosite_directive(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_stream_trojan_dns_rules_directive(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
 
@@ -633,6 +646,20 @@ static ngx_command_t ngx_stream_trojan_commands[] = {
     { ngx_string("trojan_doh"),
       NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
       ngx_stream_trojan_doh_directive,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("trojan_geosite"),
+      NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_stream_trojan_geosite_directive,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("trojan_dns_rules"),
+      NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_stream_trojan_dns_rules_directive,
       NGX_STREAM_SRV_CONF_OFFSET,
       0,
       NULL },
@@ -1615,6 +1642,7 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
     ngx_addr_t                          addr;
     ngx_stream_trojan_resolve_data_t   *data;
     ngx_stream_trojan_srv_conf_t       *conf;
+    ngx_stream_trojan_dns_rule_group_t *dns_rule;
 
     if (ngx_stream_trojan_outbound_type(ctx)
         == ngx_stream_trojan_outbound_socks5)
@@ -1624,6 +1652,25 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
     }
 
     conf = ctx->conf;
+    dns_rule = ngx_stream_trojan_match_dns_rule(conf, &ctx->target);
+
+    if (dns_rule != NULL) {
+        if (ngx_stream_trojan_set_pending(ctx, NULL, 0) != NGX_OK) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        ctx->peer_kind = ngx_stream_trojan_peer_tcp;
+        if (ngx_stream_trojan_start_resolver(ctx, &ctx->target,
+                                             ngx_stream_trojan_resolve_tcp,
+                                             NULL, 0, 0, dns_rule->resolver,
+                                             0, dns_rule->ip_prefer)
+            != NGX_OK)
+        {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        }
+        return;
+    }
 
     /* try DoH first if configured and target is a domain */
     if (conf->doh_conf != NULL
@@ -1678,7 +1725,8 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
         ctx->peer_kind = ngx_stream_trojan_peer_tcp;
         if (ngx_stream_trojan_start_resolver(ctx, &ctx->target,
                                              ngx_stream_trojan_resolve_tcp,
-                                             NULL, 0, 0)
+                                             NULL, 0, 0, NULL, 0,
+                                             ngx_stream_trojan_current_ip_prefer(ctx))
             != NGX_OK)
         {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -1733,7 +1781,9 @@ ngx_stream_trojan_start_udp(ngx_stream_trojan_ctx_t *ctx)
 static ngx_int_t
 ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_addr_t *addr, ngx_stream_trojan_resolve_e type,
-    const u_char *payload, uint16_t payload_len, size_t wire_len)
+    const u_char *payload, uint16_t payload_len, size_t wire_len,
+    ngx_resolver_t *resolver, ngx_msec_t resolver_timeout,
+    ngx_uint_t ip_prefer)
 {
     ngx_str_t                         name;
     ngx_pool_t                       *pool;
@@ -1771,7 +1821,7 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
 
     data->ctx = ctx;
     data->type = type;
-    data->ip_prefer = ngx_stream_trojan_current_ip_prefer(ctx);
+    data->ip_prefer = ip_prefer;
     data->port = addr->port;
     data->payload_len = payload_len;
 
@@ -1779,7 +1829,14 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     temp.name = name;
 
     cscf = ngx_stream_get_module_srv_conf(ctx->session, ngx_stream_core_module);
-    rctx = ngx_resolve_start(cscf->resolver, &temp);
+    if (resolver == NULL) {
+        resolver = cscf->resolver;
+    }
+    if (resolver_timeout == 0) {
+        resolver_timeout = cscf->resolver_timeout;
+    }
+
+    rctx = ngx_resolve_start(resolver, &temp);
     if (rctx == NULL || rctx == NGX_NO_RESOLVER) {
         return NGX_ERROR;
     }
@@ -1787,7 +1844,7 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     rctx->name = name;
     rctx->handler = ngx_stream_trojan_resolve_handler;
     rctx->data = data;
-    rctx->timeout = cscf->resolver_timeout;
+    rctx->timeout = resolver_timeout;
 
     ctx->resolver_ctx = rctx;
     ctx->state = ngx_stream_trojan_state_resolving;
@@ -2737,6 +2794,22 @@ ngx_stream_trojan_current_ip_prefer(ngx_stream_trojan_ctx_t *ctx)
     }
 
     return ctx->outbound->ip_prefer;
+}
+
+
+static ngx_stream_trojan_dns_rule_group_t *
+ngx_stream_trojan_match_dns_rule(ngx_stream_trojan_srv_conf_t *conf,
+    ngx_stream_trojan_addr_t *addr)
+{
+    if (conf->dns_rules == NULL
+        || addr->type != NGX_STREAM_TROJAN_ADDR_DOMAIN
+        || addr->host_len == 0)
+    {
+        return NULL;
+    }
+
+    return ngx_stream_trojan_dns_rules_match(conf->dns_rules, addr->host,
+                                             addr->host_len);
 }
 
 
@@ -4217,6 +4290,7 @@ ngx_stream_trojan_mux_start_tcp(ngx_stream_trojan_mux_stream_t *stream)
     ngx_pool_t                        *pool;
     ngx_stream_trojan_ctx_t           *ctx;
     ngx_stream_trojan_mux_resolve_data_t *data;
+    ngx_stream_trojan_dns_rule_group_t *dns_rule;
 
     ctx = stream->ctx;
 
@@ -4228,6 +4302,14 @@ ngx_stream_trojan_mux_start_tcp(ngx_stream_trojan_mux_stream_t *stream)
     }
 
     pool = stream->pool;
+    dns_rule = ngx_stream_trojan_match_dns_rule(ctx->conf, &stream->target);
+
+    if (dns_rule != NULL) {
+        if (ngx_stream_trojan_mux_start_resolver(stream, dns_rule) != NGX_OK) {
+            ngx_stream_trojan_mux_close_stream(stream, 1);
+        }
+        return;
+    }
 
     if (ctx->conf->doh_conf != NULL
         && stream->target.type == NGX_STREAM_TROJAN_ADDR_DOMAIN
@@ -4265,7 +4347,7 @@ ngx_stream_trojan_mux_start_tcp(ngx_stream_trojan_mux_stream_t *stream)
             stream->target.type,
             ngx_stream_trojan_resolver_configured(ctx->session)))
     {
-        if (ngx_stream_trojan_mux_start_resolver(stream) != NGX_OK) {
+        if (ngx_stream_trojan_mux_start_resolver(stream, NULL) != NGX_OK) {
             ngx_stream_trojan_mux_close_stream(stream, 1);
         }
         return;
@@ -4285,7 +4367,8 @@ ngx_stream_trojan_mux_start_tcp(ngx_stream_trojan_mux_stream_t *stream)
 
 
 static ngx_int_t
-ngx_stream_trojan_mux_start_resolver(ngx_stream_trojan_mux_stream_t *stream)
+ngx_stream_trojan_mux_start_resolver(ngx_stream_trojan_mux_stream_t *stream,
+    ngx_stream_trojan_dns_rule_group_t *dns_rule)
 {
     ngx_str_t                           name;
     ngx_pool_t                         *pool;
@@ -4313,7 +4396,8 @@ ngx_stream_trojan_mux_start_resolver(ngx_stream_trojan_mux_stream_t *stream)
     name.len = stream->target.host_len;
 
     data->stream = stream;
-    data->ip_prefer = ngx_stream_trojan_mux_stream_ip_prefer(stream);
+    data->ip_prefer = dns_rule != NULL ? dns_rule->ip_prefer
+                                       : ngx_stream_trojan_mux_stream_ip_prefer(stream);
     data->port = stream->target.port;
 
     ngx_memzero(&temp, sizeof(ngx_resolver_ctx_t));
@@ -4321,7 +4405,9 @@ ngx_stream_trojan_mux_start_resolver(ngx_stream_trojan_mux_stream_t *stream)
 
     cscf = ngx_stream_get_module_srv_conf(stream->ctx->session,
                                           ngx_stream_core_module);
-    rctx = ngx_resolve_start(cscf->resolver, &temp);
+    rctx = ngx_resolve_start(dns_rule != NULL ? dns_rule->resolver
+                                              : cscf->resolver,
+                             &temp);
     if (rctx == NULL || rctx == NGX_NO_RESOLVER) {
         return NGX_ERROR;
     }
@@ -5829,6 +5915,7 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     struct sockaddr     *sa;
     socklen_t            socklen;
     ngx_uint_t           free_res;
+    ngx_stream_trojan_dns_rule_group_t *dns_rule;
 
     if (ngx_stream_trojan_outbound_type(ctx)
         == ngx_stream_trojan_outbound_socks5)
@@ -5861,6 +5948,23 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
 #endif
 
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
+        dns_rule = ngx_stream_trojan_match_dns_rule(ctx->conf, &frame->addr);
+        if (dns_rule != NULL) {
+            if (ngx_stream_trojan_start_resolver(ctx, &frame->addr,
+                                                 ngx_stream_trojan_resolve_udp,
+                                                 frame->payload,
+                                                 frame->payload_len,
+                                                 frame->wire_len,
+                                                 dns_rule->resolver, 0,
+                                                 dns_rule->ip_prefer)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+
+            return NGX_AGAIN;
+        }
+
         /* try DoH first */
         if (ctx->conf->doh_conf != NULL
             && frame->addr.host_len > 0 && frame->addr.host_len <= 255)
@@ -5923,7 +6027,8 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
                                                  ngx_stream_trojan_resolve_udp,
                                                  frame->payload,
                                                  frame->payload_len,
-                                                 frame->wire_len)
+                                                 frame->wire_len, NULL, 0,
+                                                 ngx_stream_trojan_current_ip_prefer(ctx))
                 != NGX_OK)
             {
                 return NGX_ERROR;
@@ -7020,6 +7125,21 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->doh_conf = prev->doh_conf;
     }
 
+    if (conf->geosite == NULL) {
+        conf->geosite = prev->geosite;
+    }
+
+    if (conf->dns_rules == NULL) {
+        conf->dns_rules = prev->dns_rules;
+    }
+
+    if (ngx_stream_trojan_dns_rules_prepare_geosite(cf, conf->dns_rules,
+                                                    conf->geosite)
+        != NGX_OK)
+    {
+        return NGX_CONF_ERROR;
+    }
+
     conf->effective = conf->enable ? conf : NULL;
 
     if (conf->enable && (conf->keys == NULL || conf->keys->nelts == 0)) {
@@ -7219,6 +7339,43 @@ ngx_stream_trojan_doh_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     (void) cmd;
     return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_stream_trojan_geosite_directive(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_stream_trojan_srv_conf_t *tscf = conf;
+    ngx_str_t                    *value;
+
+    if (tscf->geosite != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    (void) cmd;
+    return ngx_stream_trojan_geosite_load(cf, &value[1], &tscf->geosite);
+}
+
+
+static char *
+ngx_stream_trojan_dns_rules_directive(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_stream_trojan_srv_conf_t *tscf = conf;
+    ngx_str_t                    *value;
+
+    if (tscf->dns_rules != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    (void) cmd;
+    return ngx_stream_trojan_dns_rules_parse(cf, &value[1],
+                                             &tscf->dns_rules);
 }
 
 static char *
