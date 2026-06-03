@@ -10,6 +10,7 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/ngx_stream_trojan_doh.c \
                      $ngx_addon_dir/ngx_stream_trojan_dns_rules.c \
                      $ngx_addon_dir/ngx_stream_trojan_geosite.c \
+                     $ngx_addon_dir/ngx_stream_trojan_geoip.c \
                      $ngx_addon_dir/ngx_stream_trojan_http_proxy_protocol.c"
 
     . auto/module
@@ -23,5 +24,6 @@ else
                     $ngx_addon_dir/ngx_stream_trojan_doh.c \
                     $ngx_addon_dir/ngx_stream_trojan_dns_rules.c \
                     $ngx_addon_dir/ngx_stream_trojan_geosite.c \
+                    $ngx_addon_dir/ngx_stream_trojan_geoip.c \
                     $ngx_addon_dir/ngx_stream_trojan_http_proxy_protocol.c"
 fi
