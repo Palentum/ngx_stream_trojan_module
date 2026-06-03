@@ -23,6 +23,14 @@ typedef enum {
     ngx_stream_trojan_outbound_socks5
 } ngx_stream_trojan_outbound_e;
 
+typedef enum {
+    ngx_stream_trojan_block_none = 0,
+    ngx_stream_trojan_block_h3,
+    ngx_stream_trojan_block_udp,
+    ngx_stream_trojan_block_all
+} ngx_stream_trojan_block_e;
+
+
 
 typedef enum {
     ngx_stream_trojan_socks5_mode_tcp = 0,
@@ -49,6 +57,8 @@ typedef struct {
     ngx_uint_t   type;
     ngx_uint_t   ip_prefer;
     ngx_uint_t   ip_prefer_set;
+    ngx_uint_t   block;
+    ngx_uint_t   block_set;
     ngx_addr_t  *socks5_server;
     ngx_str_t    socks5_username;
     ngx_str_t    socks5_password;
@@ -305,6 +315,11 @@ static ngx_stream_trojan_outbound_t *ngx_stream_trojan_select_outbound(
     ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_addr_t *target);
 static ngx_uint_t ngx_stream_trojan_outbound_type(
     ngx_stream_trojan_ctx_t *ctx);
+static ngx_uint_t ngx_stream_trojan_outbound_request_blocked(
+    ngx_stream_trojan_outbound_t *outbound, ngx_uint_t command,
+    ngx_stream_trojan_addr_t *target);
+static ngx_uint_t ngx_stream_trojan_request_blocked(
+    ngx_stream_trojan_ctx_t *ctx);
 static ngx_int_t ngx_stream_trojan_test_connect(ngx_connection_t *c);
 static void ngx_stream_trojan_init_proxy(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx);
@@ -374,6 +389,8 @@ static ngx_uint_t ngx_stream_trojan_mux_stream_outbound_type(
     ngx_stream_trojan_mux_stream_t *stream);
 static ngx_uint_t ngx_stream_trojan_mux_stream_ip_prefer(
     ngx_stream_trojan_mux_stream_t *stream);
+static ngx_uint_t ngx_stream_trojan_mux_stream_request_blocked(
+    ngx_stream_trojan_mux_stream_t *stream);
 static ngx_int_t ngx_stream_trojan_mux_start_resolver(
     ngx_stream_trojan_mux_stream_t *stream);
 static void ngx_stream_trojan_mux_resolve_handler(ngx_resolver_ctx_t *rctx);
@@ -416,6 +433,8 @@ static ngx_uint_t ngx_stream_trojan_current_ip_prefer(
     ngx_stream_trojan_ctx_t *ctx);
 static ngx_int_t ngx_stream_trojan_parse_ip_prefer(ngx_str_t *value,
     ngx_uint_t *prefer);
+static ngx_int_t ngx_stream_trojan_parse_block(ngx_str_t *value,
+    ngx_uint_t *block);
 static ngx_int_t ngx_stream_trojan_sockaddr_to_addr(struct sockaddr *sa,
     socklen_t socklen, ngx_stream_trojan_addr_t *addr);
 static ngx_connection_t *ngx_stream_trojan_create_udp_connection(
@@ -841,6 +860,11 @@ ngx_stream_trojan_process_request(ngx_stream_trojan_ctx_t *ctx)
 
     ctx->command = ctx->request[0];
     ctx->outbound = ngx_stream_trojan_select_outbound(ctx, &ctx->target);
+
+    if (ngx_stream_trojan_request_blocked(ctx)) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_FORBIDDEN);
+        return;
+    }
 
     if (ctx->command == NGX_STREAM_TROJAN_CMD_CONNECT
         && ngx_stream_trojan_is_mux_cool_target(ctx))
@@ -2013,6 +2037,52 @@ ngx_stream_trojan_outbound_type(ngx_stream_trojan_ctx_t *ctx)
     return ctx->outbound->type;
 }
 
+static ngx_uint_t
+ngx_stream_trojan_outbound_request_blocked(
+    ngx_stream_trojan_outbound_t *outbound, ngx_uint_t command,
+    ngx_stream_trojan_addr_t *target)
+{
+    ngx_uint_t block;
+
+    if (outbound == NULL) {
+        return 0;
+    }
+
+    block = outbound->block;
+
+    if (block == ngx_stream_trojan_block_none) {
+        return 0;
+    }
+
+    if (block == ngx_stream_trojan_block_all) {
+        return 1;
+    }
+
+    if (command != NGX_STREAM_TROJAN_CMD_ASSOCIATE) {
+        return 0;
+    }
+
+    if (block == ngx_stream_trojan_block_udp) {
+        return 1;
+    }
+
+    if (block == ngx_stream_trojan_block_h3 && target->port == 443) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_request_blocked(ngx_stream_trojan_ctx_t *ctx)
+{
+    return ngx_stream_trojan_outbound_request_blocked(ctx->outbound,
+                                                      ctx->command,
+                                                      &ctx->target);
+}
+
+
 
 static ngx_int_t
 ngx_stream_trojan_parse_ip_prefer(ngx_str_t *value, ngx_uint_t *prefer)
@@ -2034,6 +2104,33 @@ ngx_stream_trojan_parse_ip_prefer(ngx_str_t *value, ngx_uint_t *prefer)
 
     return NGX_ERROR;
 }
+
+static ngx_int_t
+ngx_stream_trojan_parse_block(ngx_str_t *value, ngx_uint_t *block)
+{
+    if (value->len == 4 && ngx_strncmp(value->data, "none", 4) == 0) {
+        *block = ngx_stream_trojan_block_none;
+        return NGX_OK;
+    }
+
+    if (value->len == 2 && ngx_strncmp(value->data, "h3", 2) == 0) {
+        *block = ngx_stream_trojan_block_h3;
+        return NGX_OK;
+    }
+
+    if (value->len == 3 && ngx_strncmp(value->data, "udp", 3) == 0) {
+        *block = ngx_stream_trojan_block_udp;
+        return NGX_OK;
+    }
+
+    if (value->len == 3 && ngx_strncmp(value->data, "all", 3) == 0) {
+        *block = ngx_stream_trojan_block_all;
+        return NGX_OK;
+    }
+
+    return NGX_ERROR;
+}
+
 
 
 static ngx_uint_t
@@ -3474,6 +3571,11 @@ ngx_stream_trojan_mux_start_stream(ngx_stream_trojan_mux_stream_t *stream)
         return;
     }
 
+    if (ngx_stream_trojan_mux_stream_request_blocked(stream)) {
+        ngx_stream_trojan_mux_close_stream(stream, 1);
+        return;
+    }
+
     ngx_stream_trojan_mux_start_tcp(stream);
 }
 
@@ -3502,6 +3604,16 @@ ngx_stream_trojan_mux_stream_ip_prefer(
 
     return stream->outbound->ip_prefer;
 }
+
+static ngx_uint_t
+ngx_stream_trojan_mux_stream_request_blocked(
+    ngx_stream_trojan_mux_stream_t *stream)
+{
+    return ngx_stream_trojan_outbound_request_blocked(stream->outbound,
+                                                      stream->command,
+                                                      &stream->target);
+}
+
 
 
 static void
@@ -5866,6 +5978,7 @@ ngx_stream_trojan_outbounds(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_memzero(outbound, sizeof(*outbound));
     outbound->type = ngx_stream_trojan_outbound_socks5;
     outbound->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
+    outbound->block = ngx_stream_trojan_block_none;
 
     save = *cf;
     cf->handler = ngx_stream_trojan_outbounds_block;
@@ -5932,6 +6045,7 @@ ngx_stream_trojan_outbound_direct_directive(ngx_conf_t *cf, ngx_command_t *cmd,
     ngx_memzero(outbound, sizeof(*outbound));
     outbound->type = ngx_stream_trojan_outbound_direct;
     outbound->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
+    outbound->block = ngx_stream_trojan_block_none;
 
     save = *cf;
     cf->handler = ngx_stream_trojan_outbounds_block;
@@ -5972,6 +6086,7 @@ ngx_stream_trojan_outbound_socks5_directive(ngx_conf_t *cf,
     ngx_memzero(outbound, sizeof(*outbound));
     outbound->type = ngx_stream_trojan_outbound_socks5;
     outbound->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
+    outbound->block = ngx_stream_trojan_block_none;
 
     save = *cf;
     cf->handler = ngx_stream_trojan_outbounds_block;
@@ -6127,6 +6242,31 @@ ngx_stream_trojan_outbounds_block(ngx_conf_t *cf, ngx_command_t *cmd,
         }
 
         outbound->ip_prefer_set = 1;
+        return NGX_CONF_OK;
+    }
+
+    if (cf->args->nelts == 2 && ngx_strcmp(value[0].data, "block") == 0) {
+        if (outbound->block_set) {
+            return "duplicate block";
+        }
+
+        if (ngx_stream_trojan_parse_block(&value[1], &outbound->block)
+            != NGX_OK)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid block value \"%V\"", &value[1]);
+            return NGX_CONF_ERROR;
+        }
+
+        if (outbound->type == ngx_stream_trojan_outbound_socks5
+            && outbound->block == ngx_stream_trojan_block_all)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "block all is only allowed for outbounds_direct");
+            return NGX_CONF_ERROR;
+        }
+
+        outbound->block_set = 1;
         return NGX_CONF_OK;
     }
 
