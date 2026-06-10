@@ -297,6 +297,7 @@ ngx_stream_trojan_parse_addr(const uint8_t *buf, size_t len, ngx_stream_trojan_a
 {
     size_t host_len;
     size_t wire_len;
+    uint16_t port;
 
     if (buf == NULL || addr == NULL || len < 1) {
         return -1;
@@ -312,9 +313,15 @@ ngx_stream_trojan_parse_addr(const uint8_t *buf, size_t len, ngx_stream_trojan_a
         if (len < wire_len) {
             return -1;
         }
+        port = (uint16_t) ((buf[1 + host_len] << 8)
+                           | buf[1 + host_len + 1]);
+        if (port == 0) {
+            return -1;
+        }
+
         memcpy(addr->host, buf + 1, host_len);
         addr->host_len = host_len;
-        addr->port = (uint16_t) ((buf[1 + host_len] << 8) | buf[1 + host_len + 1]);
+        addr->port = port;
         addr->wire_len = wire_len;
         return 0;
 
@@ -330,9 +337,15 @@ ngx_stream_trojan_parse_addr(const uint8_t *buf, size_t len, ngx_stream_trojan_a
         if (!ngx_stream_trojan_valid_domain(buf + 2, host_len)) {
             return -1;
         }
+        port = (uint16_t) ((buf[2 + host_len] << 8)
+                           | buf[2 + host_len + 1]);
+        if (port == 0) {
+            return -1;
+        }
+
         memcpy(addr->host, buf + 2, host_len);
         addr->host_len = host_len;
-        addr->port = (uint16_t) ((buf[2 + host_len] << 8) | buf[2 + host_len + 1]);
+        addr->port = port;
         addr->wire_len = wire_len;
         return 0;
 
@@ -342,9 +355,15 @@ ngx_stream_trojan_parse_addr(const uint8_t *buf, size_t len, ngx_stream_trojan_a
         if (len < wire_len) {
             return -1;
         }
+        port = (uint16_t) ((buf[1 + host_len] << 8)
+                           | buf[1 + host_len + 1]);
+        if (port == 0) {
+            return -1;
+        }
+
         memcpy(addr->host, buf + 1, host_len);
         addr->host_len = host_len;
-        addr->port = (uint16_t) ((buf[1 + host_len] << 8) | buf[1 + host_len + 1]);
+        addr->port = port;
         addr->wire_len = wire_len;
         return 0;
 
