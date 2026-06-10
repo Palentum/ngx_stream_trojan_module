@@ -22,6 +22,45 @@ typedef struct {
     size_t block_len;
 } ngx_stream_trojan_sha224_ctx_t;
 
+static int
+ngx_stream_trojan_valid_domain(const uint8_t *host, size_t len)
+{
+    size_t  i;
+    size_t  label_len;
+    uint8_t ch;
+
+    if (host == NULL || len == 0 || len > 253) {
+        return 0;
+    }
+
+    label_len = 0;
+
+    for (i = 0; i < len; i++) {
+        ch = host[i];
+
+        if (ch <= 0x20 || ch >= 0x7f) {
+            return 0;
+        }
+
+        if (ch == '.') {
+            if (label_len == 0 || label_len > 63) {
+                return 0;
+            }
+
+            label_len = 0;
+            continue;
+        }
+
+        label_len++;
+        if (label_len > 63) {
+            return 0;
+        }
+    }
+
+    return label_len != 0;
+}
+
+
 static uint32_t
 ngx_stream_trojan_rotr32(uint32_t v, unsigned n)
 {
@@ -286,6 +325,9 @@ ngx_stream_trojan_parse_addr(const uint8_t *buf, size_t len, ngx_stream_trojan_a
         host_len = buf[1];
         wire_len = 1 + 1 + host_len + 2;
         if (host_len == 0 || len < wire_len) {
+            return -1;
+        }
+        if (!ngx_stream_trojan_valid_domain(buf + 2, host_len)) {
             return -1;
         }
         memcpy(addr->host, buf + 2, host_len);
