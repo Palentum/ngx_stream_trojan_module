@@ -3,6 +3,7 @@
 
 #include <ngx_config.h>
 #include <ngx_core.h>
+#include "ngx_stream_trojan_doh.h"
 #include "ngx_stream_trojan_geosite.h"
 
 
@@ -11,8 +12,9 @@ typedef struct ngx_stream_trojan_dns_rule_group_s ngx_stream_trojan_dns_rule_gro
 
 
 struct ngx_stream_trojan_dns_rule_group_s {
-    ngx_resolver_t  *resolver;
-    ngx_uint_t       ip_prefer;
+    ngx_resolver_t                    *resolver;
+    ngx_stream_trojan_doh_conf_t      *doh_conf;
+    ngx_uint_t                         ip_prefer;
     ngx_array_t     *rules;
     ngx_uint_t       strategy_set;
 };

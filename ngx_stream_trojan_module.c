@@ -199,6 +199,7 @@ typedef struct {
     ngx_stream_trojan_ctx_t        *ctx;
     ngx_stream_trojan_resolve_e     type;
     ngx_uint_t                      ip_prefer;
+    ngx_stream_trojan_doh_conf_t   *doh_conf;
     u_char                         *name;
     size_t                          name_len;
     uint16_t                        qtype;
@@ -231,6 +232,7 @@ typedef enum {
 typedef struct {
     ngx_stream_trojan_mux_stream_t  *stream;
     ngx_uint_t                       ip_prefer;
+    ngx_stream_trojan_doh_conf_t    *doh_conf;
     u_char                          *name;
     size_t                           name_len;
     uint16_t                         qtype;
@@ -2083,11 +2085,117 @@ ngx_stream_trojan_doh_fallback_qtype(ngx_uint_t ip_prefer)
 }
 
 
+
+static ngx_stream_trojan_resolve_data_t *
+ngx_stream_trojan_create_doh_resolve_data(ngx_stream_trojan_ctx_t *ctx,
+    ngx_stream_trojan_addr_t *addr, ngx_stream_trojan_resolve_e type,
+    const u_char *payload, uint16_t payload_len, size_t wire_len,
+    ngx_uint_t ip_prefer, ngx_stream_trojan_doh_conf_t *doh_conf)
+{
+    ngx_pool_t                       *pool;
+    ngx_stream_trojan_resolve_data_t *data;
+
+    if (doh_conf == NULL
+        || addr->type != NGX_STREAM_TROJAN_ADDR_DOMAIN
+        || addr->host_len == 0 || addr->host_len > 255)
+    {
+        return NULL;
+    }
+
+    if (payload_len != 0 && payload == NULL) {
+        return NULL;
+    }
+
+    pool = ctx->session->connection->pool;
+
+    data = ngx_pcalloc(pool, sizeof(ngx_stream_trojan_resolve_data_t));
+    if (data == NULL) {
+        return NULL;
+    }
+
+    data->name = ngx_pnalloc(pool, addr->host_len);
+    if (data->name == NULL) {
+        return NULL;
+    }
+    ngx_memcpy(data->name, addr->host, addr->host_len);
+
+    if (payload_len != 0) {
+        data->payload = ngx_pnalloc(pool, payload_len);
+        if (data->payload == NULL) {
+            return NULL;
+        }
+        ngx_memcpy(data->payload, payload, payload_len);
+    }
+
+    data->ctx = ctx;
+    data->type = type;
+    data->ip_prefer = ip_prefer;
+    data->doh_conf = doh_conf;
+    data->name_len = addr->host_len;
+    data->qtype = ngx_stream_trojan_doh_first_qtype(ip_prefer);
+    data->fallback_qtype = ngx_stream_trojan_doh_fallback_qtype(ip_prefer);
+    data->port = addr->port;
+    data->payload_len = payload_len;
+
+    if (type == ngx_stream_trojan_resolve_udp
+        && wire_len <= ctx->udp_in_len)
+    {
+        if (wire_len < ctx->udp_in_len) {
+            ngx_memmove(ctx->udp_in, ctx->udp_in + wire_len,
+                        ctx->udp_in_len - wire_len);
+        }
+        ctx->udp_in_len -= wire_len;
+    }
+
+    return data;
+}
+
+
+static ngx_stream_trojan_mux_resolve_data_t *
+ngx_stream_trojan_mux_create_doh_resolve_data(
+    ngx_stream_trojan_mux_stream_t *stream, ngx_uint_t ip_prefer,
+    ngx_stream_trojan_doh_conf_t *doh_conf)
+{
+    ngx_pool_t                           *pool;
+    ngx_stream_trojan_mux_resolve_data_t *data;
+
+    if (doh_conf == NULL
+        || stream->target.type != NGX_STREAM_TROJAN_ADDR_DOMAIN
+        || stream->target.host_len == 0 || stream->target.host_len > 255)
+    {
+        return NULL;
+    }
+
+    pool = stream->pool;
+
+    data = ngx_pcalloc(pool, sizeof(ngx_stream_trojan_mux_resolve_data_t));
+    if (data == NULL) {
+        return NULL;
+    }
+
+    data->name = ngx_pnalloc(pool, stream->target.host_len);
+    if (data->name == NULL) {
+        return NULL;
+    }
+    ngx_memcpy(data->name, stream->target.host, stream->target.host_len);
+
+    data->stream = stream;
+    data->ip_prefer = ip_prefer;
+    data->doh_conf = doh_conf;
+    data->name_len = stream->target.host_len;
+    data->qtype = ngx_stream_trojan_doh_first_qtype(ip_prefer);
+    data->fallback_qtype = ngx_stream_trojan_doh_fallback_qtype(ip_prefer);
+    data->port = stream->target.port;
+
+    return data;
+}
+
+
 static ngx_int_t
 ngx_stream_trojan_start_doh_resolver(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_resolve_data_t *data)
 {
-    if (ctx->conf->doh_conf == NULL
+    if (data->doh_conf == NULL
         || data->name == NULL || data->name_len == 0)
     {
         return NGX_ERROR;
@@ -2095,7 +2203,7 @@ ngx_stream_trojan_start_doh_resolver(ngx_stream_trojan_ctx_t *ctx,
 
     ctx->state = ngx_stream_trojan_state_resolving;
 
-    return ngx_stream_trojan_doh_resolve(ctx->conf->doh_conf,
+    return ngx_stream_trojan_doh_resolve(data->doh_conf,
         data->name, data->name_len, data->qtype,
         ctx->session->connection->log, data,
         ngx_stream_trojan_doh_resolve_handler, &ctx->doh_ctx);
@@ -2127,6 +2235,23 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
         }
 
         ctx->peer_kind = ngx_stream_trojan_peer_tcp;
+
+        if (dns_rule->doh_conf != NULL) {
+            data = ngx_stream_trojan_create_doh_resolve_data(ctx, &ctx->target,
+                       ngx_stream_trojan_resolve_tcp, NULL, 0, 0,
+                       dns_rule->ip_prefer, dns_rule->doh_conf);
+            if (data == NULL) {
+                ngx_stream_trojan_finalize(ctx,
+                                           NGX_STREAM_INTERNAL_SERVER_ERROR);
+                return;
+            }
+
+            if (ngx_stream_trojan_start_doh_resolver(ctx, data) != NGX_OK) {
+                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            }
+            return;
+        }
+
         if (ngx_stream_trojan_start_resolver(ctx, &ctx->target,
                                              ngx_stream_trojan_resolve_tcp,
                                              NULL, 0, 0, dns_rule->resolver,
@@ -2143,31 +2268,13 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
         && ctx->target.type == NGX_STREAM_TROJAN_ADDR_DOMAIN
         && ctx->target.host_len > 0 && ctx->target.host_len <= 255)
     {
-        data = ngx_pcalloc(ctx->session->connection->pool,
-                           sizeof(ngx_stream_trojan_resolve_data_t));
+        data = ngx_stream_trojan_create_doh_resolve_data(ctx, &ctx->target,
+                   ngx_stream_trojan_resolve_tcp, NULL, 0, 0,
+                   ngx_stream_trojan_current_ip_prefer(ctx), conf->doh_conf);
         if (data == NULL) {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
             return;
         }
-
-        data->name = ngx_pnalloc(ctx->session->connection->pool,
-                                 ctx->target.host_len);
-        if (data->name == NULL) {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
-            return;
-        }
-        ngx_memcpy(data->name, ctx->target.host, ctx->target.host_len);
-
-        data->ctx = ctx;
-        data->type = ngx_stream_trojan_resolve_tcp;
-        data->ip_prefer = ngx_stream_trojan_current_ip_prefer(ctx);
-        data->name_len = ctx->target.host_len;
-        data->qtype = ngx_stream_trojan_doh_first_qtype(data->ip_prefer);
-        data->fallback_qtype =
-            ngx_stream_trojan_doh_fallback_qtype(data->ip_prefer);
-        data->port = ctx->target.port;
-        data->payload_len = 0;
-        data->payload = NULL;
 
         ctx->peer_kind = ngx_stream_trojan_peer_tcp;
 
@@ -5075,6 +5182,22 @@ ngx_stream_trojan_mux_start_tcp(ngx_stream_trojan_mux_stream_t *stream)
     dns_rule = ngx_stream_trojan_match_dns_rule(ctx->conf, &stream->target);
 
     if (dns_rule != NULL) {
+        if (dns_rule->doh_conf != NULL) {
+            data = ngx_stream_trojan_mux_create_doh_resolve_data(stream,
+                       dns_rule->ip_prefer, dns_rule->doh_conf);
+            if (data == NULL) {
+                ngx_stream_trojan_mux_close_stream(stream, 1);
+                return;
+            }
+
+            if (ngx_stream_trojan_mux_start_doh_resolver(stream, data)
+                != NGX_OK)
+            {
+                ngx_stream_trojan_mux_close_stream(stream, 1);
+            }
+            return;
+        }
+
         if (ngx_stream_trojan_mux_start_resolver(stream, dns_rule) != NGX_OK) {
             ngx_stream_trojan_mux_close_stream(stream, 1);
         }
@@ -5085,26 +5208,13 @@ ngx_stream_trojan_mux_start_tcp(ngx_stream_trojan_mux_stream_t *stream)
         && stream->target.type == NGX_STREAM_TROJAN_ADDR_DOMAIN
         && stream->target.host_len > 0 && stream->target.host_len <= 255)
     {
-        data = ngx_pcalloc(pool, sizeof(ngx_stream_trojan_mux_resolve_data_t));
+        data = ngx_stream_trojan_mux_create_doh_resolve_data(stream,
+                   ngx_stream_trojan_mux_stream_ip_prefer(stream),
+                   ctx->conf->doh_conf);
         if (data == NULL) {
             ngx_stream_trojan_mux_close_stream(stream, 1);
             return;
         }
-
-        data->name = ngx_pnalloc(pool, stream->target.host_len);
-        if (data->name == NULL) {
-            ngx_stream_trojan_mux_close_stream(stream, 1);
-            return;
-        }
-
-        ngx_memcpy(data->name, stream->target.host, stream->target.host_len);
-        data->stream = stream;
-        data->ip_prefer = ngx_stream_trojan_mux_stream_ip_prefer(stream);
-        data->name_len = stream->target.host_len;
-        data->qtype = ngx_stream_trojan_doh_first_qtype(data->ip_prefer);
-        data->fallback_qtype =
-            ngx_stream_trojan_doh_fallback_qtype(data->ip_prefer);
-        data->port = stream->target.port;
 
         if (ngx_stream_trojan_mux_start_doh_resolver(stream, data) != NGX_OK)
         {
@@ -5265,7 +5375,7 @@ ngx_stream_trojan_mux_start_doh_resolver(
     ngx_stream_trojan_mux_stream_t *stream,
     ngx_stream_trojan_mux_resolve_data_t *data)
 {
-    if (stream->ctx->conf->doh_conf == NULL
+    if (data->doh_conf == NULL
         || data->name == NULL || data->name_len == 0)
     {
         return NGX_ERROR;
@@ -5273,7 +5383,7 @@ ngx_stream_trojan_mux_start_doh_resolver(
 
     stream->state = ngx_stream_trojan_mux_stream_resolving;
 
-    return ngx_stream_trojan_doh_resolve(stream->ctx->conf->doh_conf,
+    return ngx_stream_trojan_doh_resolve(data->doh_conf,
         data->name, data->name_len, data->qtype,
         stream->ctx->session->connection->log, data,
         ngx_stream_trojan_mux_doh_resolve_handler, &stream->doh_ctx);
@@ -6738,6 +6848,27 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
         dns_rule = ngx_stream_trojan_match_dns_rule(ctx->conf, &frame->addr);
         if (dns_rule != NULL) {
+            if (dns_rule->doh_conf != NULL) {
+                ngx_stream_trojan_resolve_data_t  *udata;
+
+                udata = ngx_stream_trojan_create_doh_resolve_data(ctx,
+                            &frame->addr, ngx_stream_trojan_resolve_udp,
+                            frame->payload, frame->payload_len,
+                            frame->wire_len, dns_rule->ip_prefer,
+                            dns_rule->doh_conf);
+                if (udata == NULL) {
+                    return NGX_ERROR;
+                }
+
+                if (ngx_stream_trojan_start_doh_resolver(ctx, udata)
+                    != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
+
+                return NGX_AGAIN;
+            }
+
             if (ngx_stream_trojan_start_resolver(ctx, &frame->addr,
                                                  ngx_stream_trojan_resolve_udp,
                                                  frame->payload,
@@ -6757,46 +6888,15 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
         if (ctx->conf->doh_conf != NULL
             && frame->addr.host_len > 0 && frame->addr.host_len <= 255)
         {
-            ngx_stream_trojan_resolve_data_t *udata;
+            ngx_stream_trojan_resolve_data_t  *udata;
 
-            udata = ngx_pcalloc(ctx->session->connection->pool,
-                                sizeof(ngx_stream_trojan_resolve_data_t));
+            udata = ngx_stream_trojan_create_doh_resolve_data(ctx,
+                        &frame->addr, ngx_stream_trojan_resolve_udp,
+                        frame->payload, frame->payload_len, frame->wire_len,
+                        ngx_stream_trojan_current_ip_prefer(ctx),
+                        ctx->conf->doh_conf);
             if (udata == NULL) {
                 return NGX_ERROR;
-            }
-
-            udata->name = ngx_pnalloc(ctx->session->connection->pool,
-                                      frame->addr.host_len);
-            if (udata->name == NULL) {
-                return NGX_ERROR;
-            }
-            ngx_memcpy(udata->name, frame->addr.host, frame->addr.host_len);
-
-            udata->ctx = ctx;
-            udata->type = ngx_stream_trojan_resolve_udp;
-            udata->ip_prefer = ngx_stream_trojan_current_ip_prefer(ctx);
-            udata->name_len = frame->addr.host_len;
-            udata->qtype = ngx_stream_trojan_doh_first_qtype(udata->ip_prefer);
-            udata->fallback_qtype =
-                ngx_stream_trojan_doh_fallback_qtype(udata->ip_prefer);
-            udata->port = frame->addr.port;
-
-            if (frame->payload_len) {
-                udata->payload = ngx_pnalloc(ctx->session->connection->pool,
-                                             frame->payload_len);
-                if (udata->payload == NULL) {
-                    return NGX_ERROR;
-                }
-                ngx_memcpy(udata->payload, frame->payload, frame->payload_len);
-                udata->payload_len = frame->payload_len;
-            }
-
-            if (frame->wire_len <= ctx->udp_in_len) {
-                if (frame->wire_len < ctx->udp_in_len) {
-                    ngx_memmove(ctx->udp_in, ctx->udp_in + frame->wire_len,
-                                ctx->udp_in_len - frame->wire_len);
-                }
-                ctx->udp_in_len -= frame->wire_len;
             }
 
             if (ngx_stream_trojan_start_doh_resolver(ctx, udata) != NGX_OK)

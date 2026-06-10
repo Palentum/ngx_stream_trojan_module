@@ -37,6 +37,10 @@ static ngx_int_t ngx_stream_trojan_dns_rules_parse_content(ngx_conf_t *cf,
 static ngx_int_t ngx_stream_trojan_dns_rules_parse_group(ngx_conf_t *cf,
     ngx_stream_trojan_dns_rules_conf_t *rules, ngx_str_t *servers,
     ngx_uint_t line_no, ngx_stream_trojan_dns_rule_group_t **group);
+static ngx_int_t ngx_stream_trojan_dns_rules_is_doh_url(ngx_str_t *value);
+static ngx_stream_trojan_dns_rule_group_t *
+ngx_stream_trojan_dns_rules_add_group(ngx_conf_t *cf,
+    ngx_stream_trojan_dns_rules_conf_t *rules);
 static ngx_int_t ngx_stream_trojan_dns_rules_parse_strategy(ngx_conf_t *cf,
     ngx_stream_trojan_dns_rule_group_t *group, ngx_str_t *value,
     ngx_uint_t line_no);
@@ -172,6 +176,48 @@ ngx_stream_trojan_dns_rules_key_eq(ngx_str_t *key, const char *literal,
     size_t len)
 {
     return key->len == len && ngx_strncmp(key->data, literal, len) == 0;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_dns_rules_is_doh_url(ngx_str_t *value)
+{
+    if (value->len >= 8
+        && ngx_strncasecmp(value->data, (u_char *) "https://", 8) == 0)
+    {
+        return 1;
+    }
+
+    if (value->len >= 7
+        && ngx_strncasecmp(value->data, (u_char *) "http://", 7) == 0)
+    {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static ngx_stream_trojan_dns_rule_group_t *
+ngx_stream_trojan_dns_rules_add_group(ngx_conf_t *cf,
+    ngx_stream_trojan_dns_rules_conf_t *rules)
+{
+    ngx_stream_trojan_dns_rule_group_t  *group;
+
+    group = ngx_array_push(rules->groups);
+    if (group == NULL) {
+        return NULL;
+    }
+
+    ngx_memzero(group, sizeof(ngx_stream_trojan_dns_rule_group_t));
+    group->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
+    group->rules = ngx_array_create(cf->pool, 4,
+                                    sizeof(ngx_stream_trojan_dns_rule_t));
+    if (group->rules == NULL) {
+        return NULL;
+    }
+
+    return group;
 }
 
 
@@ -428,23 +474,15 @@ ngx_stream_trojan_dns_rules_parse_group(ngx_conf_t *cf,
     ngx_uint_t line_no, ngx_stream_trojan_dns_rule_group_t **group_p)
 {
     u_char                                *p, *last, *start;
-    ngx_uint_t                             n, i;
-    ngx_str_t                             *names, token;
+    ngx_uint_t                             n, i, doh;
+    ngx_str_t                             *names, token, doh_url;
     ngx_stream_trojan_dns_rule_group_t    *group;
 
-    n = 1;
-    for (p = servers->data, last = servers->data + servers->len; p < last; p++) {
-        if (*p == ',') {
-            n++;
-        }
-    }
+    n = 0;
+    doh = 0;
+    doh_url.data = NULL;
+    doh_url.len = 0;
 
-    names = ngx_pcalloc(cf->pool, n * sizeof(ngx_str_t));
-    if (names == NULL) {
-        return NGX_ERROR;
-    }
-
-    i = 0;
     p = servers->data;
     last = servers->data + servers->len;
 
@@ -465,6 +503,71 @@ ngx_stream_trojan_dns_rules_parse_group(ngx_conf_t *cf,
             return NGX_ERROR;
         }
 
+        n++;
+
+        if (ngx_stream_trojan_dns_rules_is_doh_url(&token)) {
+            doh = 1;
+            doh_url = token;
+        }
+
+        if (p == last) {
+            break;
+        }
+        p++;
+    }
+
+    if (doh) {
+        if (n != 1) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid trojan_dns_rules line %ui: DoH URL "
+                               "cannot be mixed with DNS servers", line_no);
+            return NGX_ERROR;
+        }
+
+        group = ngx_stream_trojan_dns_rules_add_group(cf, rules);
+        if (group == NULL) {
+            return NGX_ERROR;
+        }
+
+        group->doh_conf = ngx_pcalloc(cf->pool,
+                                      sizeof(ngx_stream_trojan_doh_conf_t));
+        if (group->doh_conf == NULL) {
+            return NGX_ERROR;
+        }
+
+        if (ngx_stream_trojan_doh_parse_url(&doh_url, group->doh_conf,
+                                            cf->pool, cf->log)
+            != NGX_OK)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid trojan_dns_rules DoH URL on line %ui",
+                               line_no);
+            return NGX_ERROR;
+        }
+
+        *group_p = group;
+
+        return NGX_OK;
+    }
+
+    names = ngx_pcalloc(cf->pool, n * sizeof(ngx_str_t));
+    if (names == NULL) {
+        return NGX_ERROR;
+    }
+
+    i = 0;
+    p = servers->data;
+
+    while (p <= last) {
+        start = p;
+        while (p < last && *p != ',') {
+            p++;
+        }
+
+        token.data = start;
+        token.len = (size_t) (p - start);
+        token = ngx_stream_trojan_dns_rules_trim(token);
+
         if (ngx_stream_trojan_dns_rules_copy(cf, &token, &names[i], 0)
             != NGX_OK)
         {
@@ -479,16 +582,8 @@ ngx_stream_trojan_dns_rules_parse_group(ngx_conf_t *cf,
         p++;
     }
 
-    group = ngx_array_push(rules->groups);
+    group = ngx_stream_trojan_dns_rules_add_group(cf, rules);
     if (group == NULL) {
-        return NGX_ERROR;
-    }
-
-    ngx_memzero(group, sizeof(ngx_stream_trojan_dns_rule_group_t));
-    group->ip_prefer = NGX_STREAM_TROJAN_IP_PREFER_AUTO;
-    group->rules = ngx_array_create(cf->pool, 4,
-                                    sizeof(ngx_stream_trojan_dns_rule_t));
-    if (group->rules == NULL) {
         return NGX_ERROR;
     }
 
@@ -728,7 +823,15 @@ ngx_stream_trojan_dns_rules_validate(ngx_conf_t *cf,
                                "without rules", &rules->path);
             return NGX_ERROR;
         }
+
+        if ((groups[i].resolver == NULL) == (groups[i].doh_conf == NULL)) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "trojan_dns_rules file \"%V\" has an invalid "
+                               "resolver group", &rules->path);
+            return NGX_ERROR;
+        }
     }
+
 
     return NGX_OK;
 }
