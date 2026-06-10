@@ -1018,6 +1018,16 @@ ngx_stream_trojan_read_client(ngx_event_t *ev)
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
         return;
     }
+    if ((ctx->state == ngx_stream_trojan_state_resolving
+         || ctx->state == ngx_stream_trojan_state_connecting
+         || ctx->state == ngx_stream_trojan_state_socks5_tcp
+         || ctx->state == ngx_stream_trojan_state_socks5_udp)
+        && (c->read->eof || c->read->error))
+    {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+        return;
+    }
+
     if (ctx->websocket) {
         switch (ngx_stream_trojan_websocket_flush_out(ctx)) {
         case NGX_OK:
@@ -1068,6 +1078,7 @@ ngx_stream_trojan_read_client(ngx_event_t *ev)
         break;
 
     case ngx_stream_trojan_state_resolving:
+    case ngx_stream_trojan_state_connecting:
     case ngx_stream_trojan_state_socks5_tcp:
     case ngx_stream_trojan_state_socks5_udp:
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
