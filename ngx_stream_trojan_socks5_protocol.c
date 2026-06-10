@@ -96,7 +96,8 @@ ngx_stream_trojan_socks5_build_auth(const uint8_t *username,
 {
     if (username == NULL || password == NULL || out == NULL || written == NULL
         || username_len == 0 || username_len > 255
-        || password_len > 255 || out_len < 3 + username_len + password_len)
+        || password_len == 0 || password_len > 255
+        || out_len < 3 + username_len + password_len)
     {
         return -1;
     }

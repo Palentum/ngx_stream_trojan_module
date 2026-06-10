@@ -10043,6 +10043,14 @@ ngx_stream_trojan_outbounds(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
+    if (outbound->socks5_password.data != NULL
+        && outbound->socks5_password.len == 0)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "outbounds socks5 password length must be 1..255");
+        return NGX_CONF_ERROR;
+    }
+
     if (outbound->socks5_password.len != 0
         && outbound->socks5_username.len == 0)
     {
@@ -10148,6 +10156,14 @@ ngx_stream_trojan_outbound_socks5_directive(ngx_conf_t *cf,
     if (outbound->socks5_server == NULL) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "outbounds_socks5 requires server");
+        return NGX_CONF_ERROR;
+    }
+
+    if (outbound->socks5_password.data != NULL
+        && outbound->socks5_password.len == 0)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "outbounds_socks5 password length must be 1..255");
         return NGX_CONF_ERROR;
     }
 
@@ -10259,9 +10275,9 @@ ngx_stream_trojan_outbounds_block(ngx_conf_t *cf, ngx_command_t *cmd,
             return "duplicate socks5 password";
         }
 
-        if (value[1].len > 255) {
+        if (value[1].len == 0 || value[1].len > 255) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "socks5 password length must be <= 255");
+                               "socks5 password length must be 1..255");
             return NGX_CONF_ERROR;
         }
 
@@ -10337,7 +10353,15 @@ ngx_stream_trojan_validate_socks5_outbound(ngx_conf_t *cf,
         return NGX_ERROR;
     }
 
-    if (outbound->socks5_password.len != 0
+    if (outbound->socks5_password.data != NULL
+        && outbound->socks5_password.len == 0)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "%s socks5 password length must be 1..255", name);
+        return NGX_ERROR;
+    }
+
+    if (outbound->socks5_password.data != NULL
         && outbound->socks5_username.len == 0)
     {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -10529,9 +10553,9 @@ ngx_stream_trojan_route_outbound_options(ngx_conf_t *cf,
                 return NGX_ERROR;
             }
 
-            if (val.len > 255) {
+            if (val.len == 0 || val.len > 255) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "socks5 password length must be <= 255");
+                                   "socks5 password length must be 1..255");
                 return NGX_ERROR;
             }
 
