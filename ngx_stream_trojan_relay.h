@@ -20,6 +20,10 @@ ngx_stream_trojan_relay_limit(size_t buffer_size)
 {
     size_t limit;
 
+    if (buffer_size > NGX_STREAM_TROJAN_RELAY_MAX_BYTES / 32) {
+        return NGX_STREAM_TROJAN_RELAY_MAX_BYTES;
+    }
+
     limit = buffer_size * 32;
 
     if (limit < NGX_STREAM_TROJAN_RELAY_MIN_BYTES) {
