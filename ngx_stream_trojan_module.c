@@ -148,7 +148,6 @@ typedef struct {
     ngx_uint_t   socks5_naddrs;
     ngx_str_t    socks5_username;
     ngx_str_t    socks5_password;
-    ngx_uint_t   has_rules;
 } ngx_stream_trojan_outbound_t;
 
 
@@ -4550,13 +4549,7 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
 
     outbound = ctx->conf->outbounds->elts;
 
-    for (i = 0; i < ctx->conf->outbounds->nelts; i++) {
-        if (!outbound[i].has_rules) {
-            return &outbound[i];
-        }
-    }
-
-    return NULL;
+    return &outbound[0];
 }
 
 
