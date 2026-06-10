@@ -145,6 +145,7 @@ typedef struct {
     ngx_uint_t   block;
     ngx_uint_t   block_set;
     ngx_addr_t  *socks5_server;
+    ngx_uint_t   socks5_naddrs;
     ngx_str_t    socks5_username;
     ngx_str_t    socks5_password;
     ngx_uint_t   has_rules;
@@ -164,6 +165,7 @@ struct ngx_stream_trojan_srv_conf_s {
     ngx_uint_t   socks5_ref_set;
     ngx_array_t *keys;
     ngx_addr_t  *fallback;
+    ngx_uint_t   fallback_naddrs;
     ngx_msec_t   connect_timeout;
     ngx_msec_t   timeout;
     ngx_msec_t   udp_timeout;
@@ -342,6 +344,7 @@ struct ngx_stream_trojan_ctx_s {
     ngx_stream_trojan_outbound_t *socks5_udp_outbound;
     ngx_connection_t           *socks5_in_udp;
     ngx_addr_t                  socks5_udp_relay;
+    ngx_uint_t                  socks5_server_index;
     struct sockaddr_storage     socks5_udp_client;
     socklen_t                   socks5_udp_client_socklen;
     ngx_uint_t                  socks5_udp_client_set;
@@ -490,6 +493,8 @@ static ngx_int_t ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     const u_char *payload, uint16_t payload_len, size_t wire_len,
     ngx_resolver_t *resolver, ngx_msec_t resolver_timeout,
     ngx_uint_t ip_prefer);
+static ngx_int_t ngx_stream_trojan_socks5_connect_next(
+    ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx);
 static void ngx_stream_trojan_resolve_complete(
     ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_resolve_data_t *data,
@@ -3042,6 +3047,9 @@ ngx_stream_trojan_start_fallback(ngx_stream_trojan_ctx_t *ctx, u_char *data,
         return;
     }
 
+    ctx->connect_addrs = ctx->conf->fallback;
+    ctx->connect_naddrs = ctx->conf->fallback_naddrs;
+    ctx->connect_index = 0;
     ctx->peer_kind = ngx_stream_trojan_peer_fallback;
     ngx_stream_trojan_connect(ctx, ctx->conf->fallback);
 }
@@ -3719,6 +3727,7 @@ ngx_stream_trojan_start_socks5_tcp(ngx_stream_trojan_ctx_t *ctx)
     }
 
     ctx->peer_kind = ngx_stream_trojan_peer_tcp;
+    ctx->socks5_server_index = 0;
     ngx_stream_trojan_socks5_connect(ctx, ngx_stream_trojan_socks5_mode_tcp);
 }
 
@@ -3729,8 +3738,31 @@ ngx_stream_trojan_start_socks5_udp(ngx_stream_trojan_ctx_t *ctx)
     ctx->session->connection->write->handler =
         ngx_stream_trojan_udp_client_write_handler;
     ctx->socks5_udp_outbound = ctx->outbound;
+    ctx->socks5_server_index = 0;
 
     ngx_stream_trojan_socks5_connect(ctx, ngx_stream_trojan_socks5_mode_udp);
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_socks5_connect_next(ngx_stream_trojan_ctx_t *ctx)
+{
+    if (ctx->outbound == NULL || ctx->outbound->socks5_server == NULL
+        || ctx->socks5_server_index + 1 >= ctx->outbound->socks5_naddrs)
+    {
+        return NGX_DECLINED;
+    }
+
+    if (ctx->upstream) {
+        ngx_close_connection(ctx->upstream);
+        ctx->upstream = NULL;
+    }
+
+    ctx->socks5_connected = 0;
+    ctx->socks5_server_index++;
+    ngx_stream_trojan_socks5_connect(ctx, ctx->socks5_mode);
+
+    return NGX_OK;
 }
 
 
@@ -3741,7 +3773,10 @@ ngx_stream_trojan_socks5_connect(ngx_stream_trojan_ctx_t *ctx,
     ngx_int_t          rc;
     ngx_connection_t  *c, *pc;
 
-    if (ctx->outbound == NULL || ctx->outbound->socks5_server == NULL) {
+    if (ctx->outbound == NULL || ctx->outbound->socks5_server == NULL
+        || ctx->outbound->socks5_naddrs == 0
+        || ctx->socks5_server_index >= ctx->outbound->socks5_naddrs)
+    {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
@@ -3769,9 +3804,12 @@ ngx_stream_trojan_socks5_connect(ngx_stream_trojan_ctx_t *ctx,
     }
 
     ngx_memzero(&ctx->peer, sizeof(ngx_peer_connection_t));
-    ctx->peer.sockaddr = ctx->outbound->socks5_server->sockaddr;
-    ctx->peer.socklen = ctx->outbound->socks5_server->socklen;
-    ctx->peer_name = ctx->outbound->socks5_server->name;
+    ctx->peer.sockaddr =
+        ctx->outbound->socks5_server[ctx->socks5_server_index].sockaddr;
+    ctx->peer.socklen =
+        ctx->outbound->socks5_server[ctx->socks5_server_index].socklen;
+    ctx->peer_name =
+        ctx->outbound->socks5_server[ctx->socks5_server_index].name;
     ctx->peer.name = &ctx->peer_name;
     ctx->peer.type = SOCK_STREAM;
     ctx->peer.get = ngx_event_get_peer;
@@ -3783,6 +3821,10 @@ ngx_stream_trojan_socks5_connect(ngx_stream_trojan_ctx_t *ctx,
     rc = ngx_event_connect_peer(&ctx->peer);
 
     if (rc == NGX_ERROR || rc == NGX_BUSY || rc == NGX_DECLINED) {
+        if (ngx_stream_trojan_socks5_connect_next(ctx) == NGX_OK) {
+            return;
+        }
+
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
@@ -3831,6 +3873,10 @@ ngx_stream_trojan_socks5_handler(ngx_event_t *ev)
 
     if (!ctx->socks5_connected) {
         if (ngx_stream_trojan_test_connect(pc) != NGX_OK) {
+            if (ngx_stream_trojan_socks5_connect_next(ctx) == NGX_OK) {
+                return;
+            }
+
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
@@ -9352,6 +9398,7 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->fallback == NULL) {
         conf->fallback = prev->fallback;
+        conf->fallback_naddrs = prev->fallback_naddrs;
     }
     if (conf->websocket_path.len == 0) {
         conf->websocket_path = prev->websocket_path;
@@ -9657,12 +9704,13 @@ ngx_stream_trojan_fallback(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    tscf->fallback = ngx_pcalloc(cf->pool, sizeof(ngx_addr_t));
+    tscf->fallback = ngx_pcalloc(cf->pool, u.naddrs * sizeof(ngx_addr_t));
     if (tscf->fallback == NULL) {
         return NGX_CONF_ERROR;
     }
 
-    *tscf->fallback = u.addrs[0];
+    ngx_memcpy(tscf->fallback, u.addrs, u.naddrs * sizeof(ngx_addr_t));
+    tscf->fallback_naddrs = u.naddrs;
 
     (void) cmd;
     return NGX_CONF_OK;
@@ -10156,12 +10204,15 @@ ngx_stream_trojan_outbounds_block(ngx_conf_t *cf, ngx_command_t *cmd,
             return NGX_CONF_ERROR;
         }
 
-        outbound->socks5_server = ngx_pcalloc(cf->pool, sizeof(ngx_addr_t));
+        outbound->socks5_server = ngx_pcalloc(cf->pool,
+                                              u.naddrs * sizeof(ngx_addr_t));
         if (outbound->socks5_server == NULL) {
             return NGX_CONF_ERROR;
         }
 
-        *outbound->socks5_server = u.addrs[0];
+        ngx_memcpy(outbound->socks5_server, u.addrs,
+                   u.naddrs * sizeof(ngx_addr_t));
+        outbound->socks5_naddrs = u.naddrs;
         return NGX_CONF_OK;
     }
 
@@ -10327,12 +10378,16 @@ ngx_stream_trojan_set_socks5_server(ngx_conf_t *cf,
         return NGX_ERROR;
     }
 
-    outbound->socks5_server = ngx_pcalloc(cf->pool, sizeof(ngx_addr_t));
+    outbound->socks5_server = ngx_pcalloc(cf->pool,
+                                          u.naddrs * sizeof(ngx_addr_t));
     if (outbound->socks5_server == NULL) {
         return NGX_ERROR;
     }
 
-    *outbound->socks5_server = u.addrs[0];
+    ngx_memcpy(outbound->socks5_server, u.addrs,
+               u.naddrs * sizeof(ngx_addr_t));
+    outbound->socks5_naddrs = u.naddrs;
+
     return NGX_OK;
 }
 
