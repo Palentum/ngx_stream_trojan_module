@@ -16,7 +16,7 @@
 - **本地 HTTP CONNECT 入站**：`http_proxy on;` 提供 HTTP/1.x CONNECT；其他 HTTP 方法返回 405。
 - **出站选择**：支持直连出站、SOCKS5 出站、阻断 UDP/HTTP3/全部请求、IPv4/IPv6 偏好。
 - **路由**：`trojan_route on;` 后按 `trojan_routes` 顺序匹配域名、geosite、geoip、IP/CIDR、端口，并在命中路由的可用出站中随机选择一个。
-- **DNS 解析链路**：直连域名命中 `trojan_dns_rules` 后使用该组配置的普通 resolver 或 DoH；未命中规则才按 `trojan_doh` → NGINX `resolver` → 系统解析推进。DoH 查询失败不会静默回退到下一层。
+- **DNS 解析链路**：直连域名命中 `trojan_dns_rules` 后使用该组配置的普通 resolver 或 DoH；未命中规则才按 `trojan_doh` → NGINX `resolver` 推进。未配置异步解析器时，域名直连请求失败；IP 目标无需解析。
 - **Trojan-Go WebSocket**：`trojan_websocket on;` 使该 TLS server 进入 WebSocket-only Trojan 入站模式；WebSocket binary payload 承载现有 Trojan TCP/UDP/mux 字节。若需要同时提供裸 Trojan over TLS，必须配置另一个未开启 `trojan_websocket` 的 `stream server`。
 
 ## 构建要求
@@ -61,7 +61,7 @@ load_module modules/ngx_stream_trojan_module.so;
 3. 未开启 `trojan_websocket` 时，模块直接读取 Trojan 56 字节 key 和 CRLF。
 4. key 匹配成功后解析请求命令：TCP CONNECT、UDP ASSOCIATE 或 mux。
 5. 选择出站：未启用路由时使用 server 级第一个出站；未配置出站则直连。启用路由时按 `trojan_routes` 顺序匹配。
-6. 直连域名命中 DNS 规则时使用该规则组的普通 resolver 或 DoH；未命中规则再按 server 级 DoH、NGINX resolver、系统解析推进。
+6. 直连域名命中 DNS 规则时使用该规则组的普通 resolver 或 DoH；未命中规则再按 server 级 DoH、NGINX resolver 推进；未配置异步解析器时域名请求失败。
 7. 所有连接、解析、UDP socket 和 relay 都走 NGINX 非阻塞事件模型。
 
 ## 指令总览
@@ -127,7 +127,7 @@ https://dns.google/dns-query:
 
 - 普通 DNS 组行以 `:` 结尾，多个服务器用逗号分隔，交给 NGINX resolver 创建。
 - DoH 组行必须是单个 `http(s)://...` URL，复用 `trojan_doh` 的 `POST application/dns-message`、SNI、证书校验和 A/AAAA fallback 行为。
-- DoH URL 不能和普通 DNS server 写在同一个组头；命中 DoH 规则组后，DoH 失败不会回退到 server 级 `trojan_doh`、NGINX resolver 或系统解析。
+- DoH URL 不能和普通 DNS server 写在同一个组头；命中 DoH 规则组后，DoH 失败不会回退到 server 级 `trojan_doh` 或 NGINX resolver。
 - 每个组必须至少包含一条规则。
 - `strategy` 支持 `auto`、`ipv4_first`、`ipv6_first`，并兼容 `ipv4` / `ipv6`。
 - `domain` 按大小写不敏感的精确或子域后缀匹配。
