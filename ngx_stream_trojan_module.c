@@ -549,6 +549,8 @@ static ngx_int_t ngx_stream_trojan_test_connect(ngx_connection_t *c);
 static void ngx_stream_trojan_init_proxy(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_set_proxy_timeout(ngx_stream_trojan_ctx_t *ctx);
+static ngx_int_t ngx_stream_trojan_update_read_event(ngx_connection_t *c,
+    ngx_uint_t blocked);
 static ngx_int_t ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
     ngx_connection_t *src, ngx_connection_t *dst, ngx_buf_t *buf,
     ngx_uint_t *src_eof);
@@ -4836,11 +4838,26 @@ ngx_stream_trojan_set_proxy_timeout(ngx_stream_trojan_ctx_t *ctx)
     }
 }
 
+static ngx_int_t
+ngx_stream_trojan_update_read_event(ngx_connection_t *c, ngx_uint_t blocked)
+{
+    if (!blocked) {
+        return ngx_handle_read_event(c->read, 0);
+    }
+
+    if (c->read->active && (ngx_event_flags & NGX_USE_LEVEL_EVENT)) {
+        return ngx_del_event(c->read, NGX_READ_EVENT, 0);
+    }
+
+    return NGX_OK;
+}
+
 
 static void
 ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
 {
     ngx_uint_t         client_eof, upstream_eof;
+    ngx_uint_t         client_read_blocked, upstream_read_blocked;
     ngx_connection_t  *c, *pc;
 
     c = ctx->session->connection;
@@ -4894,10 +4911,21 @@ ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
         return;
     }
 
-    ngx_handle_read_event(c->read, 0);
-    ngx_handle_write_event(c->write, 0);
-    ngx_handle_read_event(pc->read, 0);
-    ngx_handle_write_event(pc->write, 0);
+    client_read_blocked = ctx->client_buffer->pos < ctx->client_buffer->last
+                          || (ctx->pending_to_upstream != NULL
+                              && ctx->pending_to_upstream->pos
+                                 < ctx->pending_to_upstream->last);
+    upstream_read_blocked = ctx->upstream_buffer->pos
+                            < ctx->upstream_buffer->last;
+
+    if (ngx_stream_trojan_update_read_event(c, client_read_blocked) != NGX_OK
+        || ngx_handle_write_event(c->write, 0) != NGX_OK
+        || ngx_stream_trojan_update_read_event(pc, upstream_read_blocked)
+           != NGX_OK
+        || ngx_handle_write_event(pc->write, 0) != NGX_OK)
+    {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+    }
 }
 
 
@@ -5325,7 +5353,10 @@ ngx_stream_trojan_process_mux(ngx_stream_trojan_ctx_t *ctx)
         return;
     }
 
-    if (ngx_handle_read_event(c->read, 0) != NGX_OK
+    if (ngx_stream_trojan_update_read_event(c,
+            ngx_stream_trojan_mux_client_blocked_on(ctx,
+                                                    ctx->mux_payload_stream))
+        != NGX_OK
         || ngx_handle_write_event(c->write, 0) != NGX_OK)
     {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
