@@ -402,39 +402,80 @@ ngx_stream_trojan_addr_to_text(const ngx_stream_trojan_addr_t *addr, char *out, 
 }
 
 int
-ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len, ngx_stream_trojan_udp_frame_t *frame)
+ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len,
+    ngx_stream_trojan_udp_frame_t *frame)
 {
+    size_t host_len;
     size_t pos;
     size_t wire_len;
 
     if (buf == NULL || frame == NULL) {
-        return -1;
+        return NGX_STREAM_TROJAN_PARSE_ERROR;
     }
 
     memset(frame, 0, sizeof(*frame));
 
-    if (ngx_stream_trojan_parse_addr(buf, len, &frame->addr) != 0) {
-        return -1;
+    if (len < 1) {
+        return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
+    }
+
+    switch (buf[0]) {
+    case NGX_STREAM_TROJAN_ADDR_IPV4:
+        wire_len = 1 + 4 + 2;
+        if (len < wire_len) {
+            return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
+        }
+        break;
+
+    case NGX_STREAM_TROJAN_ADDR_DOMAIN:
+        if (len < 2) {
+            return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
+        }
+
+        host_len = buf[1];
+        if (host_len == 0) {
+            return NGX_STREAM_TROJAN_PARSE_ERROR;
+        }
+
+        wire_len = 1 + 1 + host_len + 2;
+        if (len < wire_len) {
+            return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
+        }
+        break;
+
+    case NGX_STREAM_TROJAN_ADDR_IPV6:
+        wire_len = 1 + 16 + 2;
+        if (len < wire_len) {
+            return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
+        }
+        break;
+
+    default:
+        return NGX_STREAM_TROJAN_PARSE_ERROR;
+    }
+
+    if (ngx_stream_trojan_parse_addr(buf, wire_len, &frame->addr) != 0) {
+        return NGX_STREAM_TROJAN_PARSE_ERROR;
     }
 
     pos = frame->addr.wire_len;
     if (len < pos + 4) {
-        return -1;
+        return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
     }
 
     frame->payload_len = (uint16_t) ((buf[pos] << 8) | buf[pos + 1]);
     if (buf[pos + 2] != '\r' || buf[pos + 3] != '\n') {
-        return -1;
+        return NGX_STREAM_TROJAN_PARSE_ERROR;
     }
 
     wire_len = pos + 4 + frame->payload_len;
     if (len < wire_len) {
-        return -1;
+        return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
     }
 
     frame->payload = buf + pos + 4;
     frame->wire_len = wire_len;
-    return 0;
+    return NGX_STREAM_TROJAN_PARSE_OK;
 }
 
 int

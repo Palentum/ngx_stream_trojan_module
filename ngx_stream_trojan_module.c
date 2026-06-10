@@ -7976,7 +7976,7 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
         rc = ngx_stream_trojan_parse_udp_frame(ctx->udp_in, ctx->udp_in_len,
                                                &frame);
 
-        if (rc == 0) {
+        if (rc == NGX_STREAM_TROJAN_PARSE_OK) {
             rc = ngx_stream_trojan_prepare_udp_outbound(ctx, &frame.addr);
             if (rc == NGX_DECLINED) {
                 ngx_stream_trojan_finalize(ctx, NGX_STREAM_FORBIDDEN);
@@ -8004,6 +8004,11 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
             }
             ctx->udp_in_len -= frame.wire_len;
             continue;
+        }
+
+        if (rc == NGX_STREAM_TROJAN_PARSE_ERROR) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_REQUEST);
+            return;
         }
 
         if (ctx->udp_in_len == NGX_STREAM_TROJAN_UDP_BUFFER_SIZE)

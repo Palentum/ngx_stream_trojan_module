@@ -33,6 +33,11 @@ typedef struct {
     size_t wire_len;
 } ngx_stream_trojan_udp_frame_t;
 
+#define NGX_STREAM_TROJAN_PARSE_OK 0
+#define NGX_STREAM_TROJAN_PARSE_NEED_MORE 1
+#define NGX_STREAM_TROJAN_PARSE_ERROR -1
+
+
 int ngx_stream_trojan_make_key(const char *password, uint8_t out[NGX_STREAM_TROJAN_KEY_LEN]);
 int ngx_stream_trojan_make_key_len(const uint8_t *password, size_t password_len,
     uint8_t out[NGX_STREAM_TROJAN_KEY_LEN]);
