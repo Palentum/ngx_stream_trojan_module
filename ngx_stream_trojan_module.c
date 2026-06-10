@@ -977,6 +977,7 @@ ngx_stream_trojan_handler(ngx_stream_session_t *s)
     ngx_stream_set_ctx(s, ctx, ngx_stream_trojan_module);
 
     c->read->handler = ngx_stream_trojan_read_client;
+    ngx_add_timer(c->read, tscf->timeout);
     c->write->handler = ngx_stream_trojan_read_client;
 
     if ((tscf->socks5_enable || tscf->http_proxy_enable) && !tscf->enable) {
@@ -1564,6 +1565,7 @@ ngx_stream_trojan_http_in_flush(ngx_stream_trojan_ctx_t *ctx)
         n = c->send(c, b->pos, b->last - b->pos);
 
         if (n == NGX_AGAIN) {
+            ngx_add_timer(c->write, ctx->conf->timeout);
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -1575,6 +1577,11 @@ ngx_stream_trojan_http_in_flush(ngx_stream_trojan_ctx_t *ctx)
         }
 
         b->pos += n;
+        ngx_add_timer(c->write, ctx->conf->timeout);
+    }
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
     }
 
     return NGX_OK;
@@ -1600,6 +1607,7 @@ ngx_stream_trojan_http_in_read(ngx_stream_trojan_ctx_t *ctx)
     n = c->recv(c, b->last, available);
 
     if (n == NGX_AGAIN) {
+        ngx_add_timer(c->read, ctx->conf->timeout);
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
             return NGX_ERROR;
         }
@@ -1611,6 +1619,7 @@ ngx_stream_trojan_http_in_read(ngx_stream_trojan_ctx_t *ctx)
     }
 
     b->last += n;
+    ngx_add_timer(c->read, ctx->conf->timeout);
     return NGX_OK;
 }
 
@@ -1654,6 +1663,7 @@ ngx_stream_trojan_socks5_in_flush(ngx_stream_trojan_ctx_t *ctx)
         n = c->send(c, b->pos, b->last - b->pos);
 
         if (n == NGX_AGAIN) {
+            ngx_add_timer(c->write, ctx->conf->timeout);
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -1665,6 +1675,11 @@ ngx_stream_trojan_socks5_in_flush(ngx_stream_trojan_ctx_t *ctx)
         }
 
         b->pos += n;
+        ngx_add_timer(c->write, ctx->conf->timeout);
+    }
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
     }
 
     return NGX_OK;
@@ -1691,6 +1706,7 @@ ngx_stream_trojan_socks5_in_read(ngx_stream_trojan_ctx_t *ctx, size_t needed)
         n = c->recv(c, b->last, available);
 
         if (n == NGX_AGAIN) {
+            ngx_add_timer(c->read, ctx->conf->timeout);
             if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -1702,6 +1718,7 @@ ngx_stream_trojan_socks5_in_read(ngx_stream_trojan_ctx_t *ctx, size_t needed)
         }
 
         b->last += n;
+        ngx_add_timer(c->read, ctx->conf->timeout);
     }
 
     return NGX_OK;
@@ -1865,6 +1882,7 @@ ngx_stream_trojan_process_prefix(ngx_stream_trojan_ctx_t *ctx)
             return;
         }
 
+        ngx_add_timer(c->read, ctx->conf->timeout);
         for (i = ctx->prefix_len; i < ctx->prefix_len + (size_t) n; i++) {
             if (ctx->prefix[i] == LF && i < NGX_STREAM_TROJAN_KEY_LEN + 1) {
                 ctx->prefix_len += (size_t) n;
@@ -1992,6 +2010,7 @@ ngx_stream_trojan_process_request(ngx_stream_trojan_ctx_t *ctx)
         }
 
         ctx->request_len += (size_t) n;
+        ngx_add_timer(c->read, ctx->conf->timeout);
     }
 
     if (ctx->request[needed - 2] != CR || ctx->request[needed - 1] != LF) {
@@ -3029,6 +3048,7 @@ ngx_stream_trojan_start_default_fallback(ngx_stream_trojan_ctx_t *ctx)
     c->write->handler = ngx_stream_trojan_default_fallback_write_handler;
     c->read->handler = ngx_stream_trojan_default_fallback_write_handler;
 
+    ngx_add_timer(c->write, ctx->conf->timeout);
     ngx_stream_trojan_default_fallback_write_handler(c->write);
 }
 
@@ -3078,6 +3098,7 @@ ngx_stream_trojan_flush_default_fallback(ngx_stream_trojan_ctx_t *ctx)
         n = c->send(c, b->pos, b->last - b->pos);
 
         if (n == NGX_AGAIN) {
+            ngx_add_timer(c->write, ctx->conf->timeout);
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -3089,6 +3110,7 @@ ngx_stream_trojan_flush_default_fallback(ngx_stream_trojan_ctx_t *ctx)
         }
 
         b->pos += n;
+        ngx_add_timer(c->write, ctx->conf->timeout);
     }
 
     return NGX_OK;
