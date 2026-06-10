@@ -8935,7 +8935,10 @@ ngx_stream_trojan_postconfiguration(ngx_conf_t *cf)
         if (tscf->socks5_ref_set) {
             target = ngx_stream_trojan_find_trojan_server(cf,
                                                           &tscf->socks5_ref,
-                                                          NGX_LOG_WARN);
+                                                          NGX_LOG_EMERG);
+            if (target == NULL) {
+                return NGX_ERROR;
+            }
 
             tscf->effective = target;
             continue;
