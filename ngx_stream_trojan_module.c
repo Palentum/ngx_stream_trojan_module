@@ -444,6 +444,10 @@ static ngx_int_t ngx_stream_trojan_socks5_in_prepare_response(
     ngx_stream_trojan_ctx_t *ctx, uint8_t status);
 static ngx_int_t ngx_stream_trojan_http_in_prepare_response(
     ngx_stream_trojan_ctx_t *ctx, uint16_t status);
+static void ngx_stream_trojan_inbound_connect_success(
+    ngx_stream_trojan_ctx_t *ctx);
+static void ngx_stream_trojan_inbound_connect_failure(
+    ngx_stream_trojan_ctx_t *ctx, ngx_uint_t rc);
 static ngx_int_t ngx_stream_trojan_init_udp_buffers(
     ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_refresh_udp_timeout(
@@ -1260,7 +1264,7 @@ ngx_stream_trojan_process_socks5_in(ngx_stream_trojan_ctx_t *ctx)
                 }
 
                 if (ctx->command == NGX_STREAM_TROJAN_CMD_CONNECT) {
-                    ngx_stream_trojan_start_tcp(ctx);
+                    ngx_stream_trojan_init_proxy(ctx);
                     return;
                 }
 
@@ -1412,6 +1416,11 @@ ngx_stream_trojan_process_socks5_in(ngx_stream_trojan_ctx_t *ctx)
                 return;
             }
 
+            if (ctx->command == NGX_STREAM_TROJAN_CMD_CONNECT) {
+                ngx_stream_trojan_start_tcp(ctx);
+                return;
+            }
+
             if (ngx_stream_trojan_socks5_in_prepare_response(
                     ctx, NGX_STREAM_TROJAN_SOCKS5_STATUS_OK)
                 != NGX_OK)
@@ -1541,16 +1550,8 @@ ngx_stream_trojan_process_http_in(ngx_stream_trojan_ctx_t *ctx)
                 continue;
             }
 
-            if (ngx_stream_trojan_http_in_prepare_response(ctx, 200)
-                != NGX_OK)
-            {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
-                return;
-            }
-
-            ctx->state = ngx_stream_trojan_state_http_in_response;
-            ctx->in_http_step = ngx_stream_trojan_in_http_step_response_write;
-            continue;
+            ngx_stream_trojan_start_tcp(ctx);
+            return;
 
         case ngx_stream_trojan_state_http_in_response:
             rc = ngx_stream_trojan_http_in_flush(ctx);
@@ -1568,7 +1569,7 @@ ngx_stream_trojan_process_http_in(ngx_stream_trojan_ctx_t *ctx)
                 return;
             }
 
-            ngx_stream_trojan_start_tcp(ctx);
+            ngx_stream_trojan_init_proxy(ctx);
             return;
 
         default:
@@ -1810,6 +1811,91 @@ ngx_stream_trojan_socks5_in_prepare_response(ngx_stream_trojan_ctx_t *ctx,
 
     b->last += written;
     return NGX_OK;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_inbound_connect_pending(ngx_stream_trojan_ctx_t *ctx)
+{
+    return ctx->command == NGX_STREAM_TROJAN_CMD_CONNECT
+           && (ctx->inbound_socks5 || ctx->inbound_http_proxy)
+           && ctx->state != ngx_stream_trojan_state_proxy;
+}
+
+
+static void
+ngx_stream_trojan_inbound_connect_success(ngx_stream_trojan_ctx_t *ctx)
+{
+    if (!ngx_stream_trojan_inbound_connect_pending(ctx)) {
+        ngx_stream_trojan_init_proxy(ctx);
+        return;
+    }
+
+    if (ctx->inbound_socks5) {
+        if (ngx_stream_trojan_socks5_in_prepare_response(
+                ctx, NGX_STREAM_TROJAN_SOCKS5_STATUS_OK)
+            != NGX_OK)
+        {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        ctx->state = ngx_stream_trojan_state_socks5_in_response;
+        ctx->in_socks5_step =
+            ngx_stream_trojan_in_socks5_step_response_write;
+        ngx_stream_trojan_process_socks5_in(ctx);
+        return;
+    }
+
+    if (ngx_stream_trojan_http_in_prepare_response(ctx, 200) != NGX_OK) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ctx->state = ngx_stream_trojan_state_http_in_response;
+    ctx->in_http_step = ngx_stream_trojan_in_http_step_response_write;
+    ngx_stream_trojan_process_http_in(ctx);
+}
+
+
+static void
+ngx_stream_trojan_inbound_connect_failure(ngx_stream_trojan_ctx_t *ctx,
+    ngx_uint_t rc)
+{
+    if (!ngx_stream_trojan_inbound_connect_pending(ctx)) {
+        ngx_stream_trojan_finalize(ctx, rc);
+        return;
+    }
+
+    if (ctx->upstream) {
+        ngx_close_connection(ctx->upstream);
+        ctx->upstream = NULL;
+    }
+
+    if (ctx->inbound_socks5) {
+        if (ngx_stream_trojan_socks5_in_prepare_response(
+                ctx, NGX_STREAM_TROJAN_SOCKS5_STATUS_GENERAL_FAILURE)
+            != NGX_OK)
+        {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        ctx->state = ngx_stream_trojan_state_socks5_in_response;
+        ctx->in_socks5_step =
+            ngx_stream_trojan_in_socks5_step_response_write;
+        ngx_stream_trojan_process_socks5_in(ctx);
+        return;
+    }
+
+    if (ngx_stream_trojan_http_in_prepare_response(ctx, 502) != NGX_OK) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ctx->state = ngx_stream_trojan_state_http_in_response;
+    ctx->in_http_step = ngx_stream_trojan_in_http_step_response_write;
+    ngx_stream_trojan_process_http_in(ctx);
 }
 
 
@@ -3344,7 +3430,8 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
             }
 
             if (ngx_stream_trojan_start_doh_resolver(ctx, data) != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
             }
             return;
         }
@@ -3355,7 +3442,8 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
                                              0, dns_rule->ip_prefer)
             != NGX_OK)
         {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            ngx_stream_trojan_inbound_connect_failure(ctx,
+                                                      NGX_STREAM_BAD_GATEWAY);
         }
         return;
     }
@@ -3377,7 +3465,8 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
 
         if (ngx_stream_trojan_start_doh_resolver(ctx, data) != NGX_OK)
         {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            ngx_stream_trojan_inbound_connect_failure(ctx,
+                                                      NGX_STREAM_BAD_GATEWAY);
         }
         return;
     }
@@ -3399,7 +3488,8 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
                                              ngx_stream_trojan_current_ip_prefer(ctx))
             != NGX_OK)
         {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            ngx_stream_trojan_inbound_connect_failure(ctx,
+                                                      NGX_STREAM_BAD_GATEWAY);
         }
         return;
     }
@@ -3412,7 +3502,7 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
                                               &addr)
         != NGX_OK)
     {
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3559,7 +3649,7 @@ ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx)
                       &rctx->name, rctx->state,
                       ngx_resolver_strerror(rctx->state));
         ngx_resolve_name_done(rctx);
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3583,7 +3673,8 @@ ngx_stream_trojan_resolve_complete(ngx_stream_trojan_ctx_t *ctx,
                    data->port, data->ip_prefer, &tcp_addrs, &ntcp_addrs)
                != NGX_OK)
         {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            ngx_stream_trojan_inbound_connect_failure(ctx,
+                                                      NGX_STREAM_BAD_GATEWAY);
             return;
         }
 
@@ -3641,7 +3732,7 @@ ngx_stream_trojan_doh_resolve_handler(void *cb_data, ngx_int_t status,
 
         ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log, 0,
                       "DoH: resolution failed");
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3697,7 +3788,7 @@ ngx_stream_trojan_connect(ngx_stream_trojan_ctx_t *ctx, ngx_addr_t *addr)
             return;
         }
 
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3717,7 +3808,7 @@ ngx_stream_trojan_connect(ngx_stream_trojan_ctx_t *ctx, ngx_addr_t *addr)
         return;
     }
 
-    ngx_stream_trojan_init_proxy(ctx);
+    ngx_stream_trojan_inbound_connect_success(ctx);
 }
 
 
@@ -3780,7 +3871,7 @@ ngx_stream_trojan_socks5_connect(ngx_stream_trojan_ctx_t *ctx,
         || ctx->outbound->socks5_naddrs == 0
         || ctx->socks5_server_index >= ctx->outbound->socks5_naddrs)
     {
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3828,7 +3919,7 @@ ngx_stream_trojan_socks5_connect(ngx_stream_trojan_ctx_t *ctx,
             return;
         }
 
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3870,7 +3961,7 @@ ngx_stream_trojan_socks5_handler(ngx_event_t *ev)
 
     if (ev->timedout) {
         ngx_connection_error(pc, NGX_ETIMEDOUT, "trojan socks5 timed out");
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3880,7 +3971,8 @@ ngx_stream_trojan_socks5_handler(ngx_event_t *ev)
                 return;
             }
 
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            ngx_stream_trojan_inbound_connect_failure(ctx,
+                                                      NGX_STREAM_BAD_GATEWAY);
             return;
         }
 
@@ -3902,7 +3994,7 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
     pc = ctx->upstream;
 
     if (pc == NULL) {
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
 
@@ -3916,7 +4008,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
             }
 
             if (rc != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -3932,7 +4025,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
             }
 
             if (rc != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -3952,12 +4046,14 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
             }
 
             if (rc != 0) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
             if (ngx_stream_trojan_socks5_prepare_request(ctx) != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -3971,7 +4067,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
             }
 
             if (rc != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -3991,12 +4088,14 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
                        ctx->socks5_buffer->pos, 2)
                    != 0)
             {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
             if (ngx_stream_trojan_socks5_prepare_request(ctx) != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -4010,7 +4109,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
             }
 
             if (rc != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -4031,7 +4131,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
                 }
 
                 if (rc != NGX_OK) {
-                    ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                    ngx_stream_trojan_inbound_connect_failure(
+                        ctx, NGX_STREAM_BAD_GATEWAY);
                     return;
                 }
 
@@ -4043,7 +4144,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
                        ctx->socks5_buffer->pos, len, &bind_addr)
                    != 0)
             {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -4052,7 +4154,7 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
             }
 
             if (ctx->socks5_mode == ngx_stream_trojan_socks5_mode_tcp) {
-                ngx_stream_trojan_init_proxy(ctx);
+                ngx_stream_trojan_inbound_connect_success(ctx);
                 return;
             }
 
@@ -4060,7 +4162,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
                     ctx, &bind_addr, &ctx->socks5_udp_relay)
                 != NGX_OK)
             {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -4068,7 +4171,8 @@ ngx_stream_trojan_process_socks5(ngx_stream_trojan_ctx_t *ctx)
                 ctx, ctx->socks5_udp_relay.sockaddr->sa_family,
                 ngx_stream_trojan_socks5_udp_read_handler);
             if (ctx->socks5_udp == NULL) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                ngx_stream_trojan_inbound_connect_failure(
+                    ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }
 
@@ -4888,12 +4992,19 @@ ngx_stream_trojan_peer_handler(ngx_event_t *ev)
     if (ctx->state == ngx_stream_trojan_state_connecting) {
         if (ev->timedout) {
             ngx_connection_error(pc, NGX_ETIMEDOUT, "trojan upstream timed out");
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            ngx_stream_trojan_inbound_connect_failure(ctx,
+                                                      NGX_STREAM_BAD_GATEWAY);
             return;
         }
     } else if (ev->timedout) {
         ngx_connection_error(pc, NGX_ETIMEDOUT, "trojan upstream idle timed out");
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+        return;
+    }
+
+    if (ctx->state == ngx_stream_trojan_state_socks5_in_response
+        || ctx->state == ngx_stream_trojan_state_http_in_response)
+    {
         return;
     }
 
@@ -4907,11 +5018,12 @@ ngx_stream_trojan_peer_handler(ngx_event_t *ev)
                 return;
             }
 
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            ngx_stream_trojan_inbound_connect_failure(ctx,
+                                                      NGX_STREAM_BAD_GATEWAY);
             return;
         }
 
-        ngx_stream_trojan_init_proxy(ctx);
+        ngx_stream_trojan_inbound_connect_success(ctx);
         return;
     }
 
