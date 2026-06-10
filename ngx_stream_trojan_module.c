@@ -506,6 +506,8 @@ static ngx_int_t ngx_stream_trojan_send_socks5_udp_frame(
     ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_udp_frame_t *frame);
 static ngx_int_t ngx_stream_trojan_forward_socks5_udp_packet(
     ngx_stream_trojan_ctx_t *ctx, u_char *packet, size_t packet_len);
+static ngx_int_t ngx_stream_trojan_queue_udp_client(
+    ngx_stream_trojan_ctx_t *ctx, u_char *data, size_t len);
 static ngx_int_t ngx_stream_trojan_queue_socks5_udp_packet(
     ngx_stream_trojan_ctx_t *ctx, u_char *packet, size_t packet_len);
 static ngx_int_t ngx_stream_trojan_flush_socks5_udp_packet(
@@ -4965,6 +4967,7 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
 
             buf->pos += n;
             ngx_stream_trojan_set_proxy_timeout(ctx);
+        }
 
         buf->pos = buf->start;
         buf->last = buf->start;
@@ -8052,24 +8055,20 @@ ngx_stream_trojan_send_udp_resolved(ngx_stream_trojan_ctx_t *ctx,
     ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, uint16_t port,
     const u_char *payload, uint16_t payload_len, ngx_uint_t ip_prefer)
 {
-    ngx_resolver_addr_t  *resolved;
-    struct sockaddr      *sa;
+    ngx_resolver_addr_t     *resolved;
+    struct sockaddr_storage  ss;
 
     resolved = ngx_stream_trojan_resolver_pick_addr(addrs, naddrs, ip_prefer);
-    if (resolved == NULL) {
+    if (resolved == NULL || resolved->socklen > sizeof(ss)) {
         return NGX_ERROR;
     }
 
-    sa = ngx_pnalloc(ctx->session->connection->pool, resolved->socklen);
-    if (sa == NULL) {
-        return NGX_ERROR;
-    }
+    ngx_memcpy(&ss, resolved->sockaddr, resolved->socklen);
+    ngx_inet_set_port((struct sockaddr *) &ss, port);
 
-    ngx_memcpy(sa, resolved->sockaddr, resolved->socklen);
-    ngx_inet_set_port(sa, port);
-
-    return ngx_stream_trojan_send_udp_sockaddr(ctx, sa, resolved->socklen,
-                                               payload, payload_len);
+    return ngx_stream_trojan_send_udp_sockaddr(ctx, (struct sockaddr *) &ss,
+                                               resolved->socklen, payload,
+                                               payload_len);
 }
 
 
@@ -8124,6 +8123,33 @@ ngx_stream_trojan_send_udp_sockaddr(ngx_stream_trojan_ctx_t *ctx,
 
 
 static ngx_int_t
+ngx_stream_trojan_queue_udp_client(ngx_stream_trojan_ctx_t *ctx, u_char *data,
+    size_t len)
+{
+    ngx_buf_t  *b;
+
+    if (len > NGX_STREAM_TROJAN_UDP_BUFFER_SIZE) {
+        return NGX_ERROR;
+    }
+
+    if (ctx->udp_pending_to_client == NULL) {
+        ctx->udp_pending_to_client = ngx_stream_trojan_create_temp_buf(
+            ctx->session->connection->pool, NGX_STREAM_TROJAN_UDP_BUFFER_SIZE);
+        if (ctx->udp_pending_to_client == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
+    b = ctx->udp_pending_to_client;
+    b->pos = b->start;
+    b->last = b->start;
+    ngx_memcpy(b->last, data, len);
+    b->last += len;
+
+    return NGX_OK;
+}
+
+static ngx_int_t
 ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
 {
     ssize_t            n;
@@ -8153,10 +8179,10 @@ ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
 
         b->pos += n;
         ngx_stream_trojan_refresh_udp_timeout(ctx);
+    }
 
     b->pos = b->start;
     b->last = b->start;
-    ctx->udp_pending_to_client = NULL;
 
     return NGX_OK;
 }
@@ -8655,15 +8681,12 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
             continue;
         }
 
-        ctx->udp_pending_to_client = ngx_stream_trojan_create_temp_buf(
-            c->pool, written);
-        if (ctx->udp_pending_to_client == NULL) {
+        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_out, written)
+            != NGX_OK)
+        {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
             return;
         }
-
-        ngx_memcpy(ctx->udp_pending_to_client->last, ctx->udp_out, written);
-        ctx->udp_pending_to_client->last += written;
 
         if (ngx_stream_trojan_flush_udp_client(ctx) == NGX_ERROR) {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -8753,15 +8776,12 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
             continue;
         }
 
-        ctx->udp_pending_to_client = ngx_stream_trojan_create_temp_buf(
-            c->pool, written);
-        if (ctx->udp_pending_to_client == NULL) {
+        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_out, written)
+            != NGX_OK)
+        {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
             return;
         }
-
-        ngx_memcpy(ctx->udp_pending_to_client->last, ctx->udp_out, written);
-        ctx->udp_pending_to_client->last += written;
 
         if (ngx_stream_trojan_flush_udp_client(ctx) == NGX_ERROR) {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
