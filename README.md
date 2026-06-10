@@ -1,6 +1,6 @@
 # ngx_stream_trojan_module
 
-`ngx_stream_trojan_module` 是一个 NGINX `stream` 模块，在 NGINX 终结 TLS 后直接处理 Trojan 应用层协议。模块当前实现 Trojan TCP/UDP 中继、Mux TCP 多路复用、fallback、DNS-over-HTTPS、DNS 规则、geosite/geoip 路由、SOCKS5/HTTP CONNECT 本地入站，以及直连或 SOCKS5 出站。
+`ngx_stream_trojan_module` 是一个 NGINX `stream` 模块，在 NGINX 终结 TLS 后直接处理 Trojan 应用层协议。模块当前实现 Trojan TCP/UDP 中继、Trojan-Go WebSocket transport、Mux TCP 多路复用、fallback、DNS-over-HTTPS、DNS 规则、geosite/geoip 路由、SOCKS5/HTTP CONNECT 本地入站，以及直连或 SOCKS5 出站。
 
 完整 NGINX 配置示例见 [`example.conf`](./example.conf)。
 
@@ -17,6 +17,7 @@
 - **出站选择**：支持直连出站、SOCKS5 出站、阻断 UDP/HTTP3/全部请求、IPv4/IPv6 偏好。
 - **路由**：`trojan_route on;` 后按 `trojan_routes` 顺序匹配域名、geosite、geoip、IP/CIDR、端口，并在命中路由的可用出站中随机选择一个。
 - **DNS 解析链路**：直连域名命中 `trojan_dns_rules` 后使用该组配置的普通 resolver 或 DoH；未命中规则才按 `trojan_doh` → NGINX `resolver` → 系统解析推进。DoH 查询失败不会静默回退到下一层。
+- **Trojan-Go WebSocket**：`trojan_websocket on;` 使该 TLS server 进入 WebSocket-only Trojan 入站模式；WebSocket binary payload 承载现有 Trojan TCP/UDP/mux 字节。若需要同时提供裸 Trojan over TLS，必须配置另一个未开启 `trojan_websocket` 的 `stream server`。
 
 ## 构建要求
 
@@ -56,11 +57,12 @@ load_module modules/ngx_stream_trojan_module.so;
 ## 处理流程
 
 1. NGINX `stream` 监听 TLS 连接并完成 TLS 终结。
-2. 模块读取 Trojan 56 字节 key 和 CRLF。
-3. key 匹配成功后解析请求命令：TCP CONNECT、UDP ASSOCIATE 或 mux。
-4. 选择出站：未启用路由时使用 server 级第一个出站；未配置出站则直连。启用路由时按 `trojan_routes` 顺序匹配。
-5. 直连域名命中 DNS 规则时使用该规则组的普通 resolver 或 DoH；未命中规则再按 server 级 DoH、NGINX resolver、系统解析推进。
-6. 所有连接、解析、UDP socket 和 relay 都走 NGINX 非阻塞事件模型。
+2. 若当前 server 开启 `trojan_websocket`，模块先要求 `GET ... Upgrade: websocket` 握手；成功返回 101 后，对 WebSocket binary payload 解帧，再进入 Trojan key/request 解析。非 `GET ... Upgrade: websocket` 首包走 `trojan_fallback`，未配置时返回内置 503。
+3. 未开启 `trojan_websocket` 时，模块直接读取 Trojan 56 字节 key 和 CRLF。
+4. key 匹配成功后解析请求命令：TCP CONNECT、UDP ASSOCIATE 或 mux。
+5. 选择出站：未启用路由时使用 server 级第一个出站；未配置出站则直连。启用路由时按 `trojan_routes` 顺序匹配。
+6. 直连域名命中 DNS 规则时使用该规则组的普通 resolver 或 DoH；未命中规则再按 server 级 DoH、NGINX resolver、系统解析推进。
+7. 所有连接、解析、UDP socket 和 relay 都走 NGINX 非阻塞事件模型。
 
 ## 指令总览
 
@@ -73,6 +75,9 @@ load_module modules/ngx_stream_trojan_module.so;
 | `trojan on \| off;` | `off` | 启用 Trojan 协议处理；启用后必须至少配置一个 `trojan_password`。 |
 | `trojan_password <password> [...];` | — | 配置一个或多个 Trojan 密码。 |
 | `trojan_fallback <address>;` | — | 非 Trojan 流量转发目标；默认端口 80。未配置时返回内置 503。 |
+| `trojan_websocket on \| off;` | `off` | 启用 Trojan-Go WebSocket-only transport；要求 `trojan on;` 和 `trojan_websocket_path`，同一 server 不再接受裸 Trojan over TLS。 |
+| `trojan_websocket_path <path>;` | — | WebSocket request-target 必须与该值逐字节完全一致；值必须以 `/` 开头，不做 URL decode。 |
+| `trojan_websocket_host <host>;` | — | 可选 Host 校验；未配置时接受任意 Host。配置后对完整 `Host` header 做 ASCII 大小写不敏感比较，不自动剥离端口。 |
 | `socks5 on \| off;` | `off` | 启用本地无认证 SOCKS5 入站。 |
 | `socks5_udp on \| off;` | `off` | 启用本地 SOCKS5 UDP ASSOCIATE；要求 `socks5 on;`。 |
 | `http_proxy on \| off;` | `off` | 启用本地 HTTP CONNECT 入站。 |
@@ -212,11 +217,15 @@ trojan_routes {
 - mihomo/sing-box 的 sing-mux 需要使用 `smux`，且关闭 padding；`yamux`、`h2mux` 和 padding 当前不支持。
 - SOCKS5 本地入站只支持无认证方法。
 - HTTP 本地入站只支持 CONNECT，不实现普通 HTTP 正向代理请求转发。
+- Trojan-Go WebSocket 客户端的 `path` 必须与 `trojan_websocket_path` 完全一致；开启 `trojan_websocket` 的 server 不接受普通 Trojan 客户端。
+- WebSocket server→client frame 不掩码，client→server frame 必须掩码；当前不实现 Trojan-Go 可选 Shadowsocks AEAD 层。
 
 ## 注意事项
 
 - Trojan 密码头位于 TLS 应用数据内，`ssl_preread` 不能替代 TLS 终结。
 - `trojan_fallback` 会转发已读到的非 Trojan 前缀数据；未配置 fallback 时发送内置 HTTP 503 后关闭连接。
+- WebSocket 握手前的非 WebSocket 首包或无效 HTTP/WebSocket 请求仍可交给 `trojan_fallback`；未配置 fallback 时返回内置 503 或对应 WebSocket HTTP 错误响应。
+- 101 WebSocket 握手完成后的 Trojan 鉴权失败会关闭 WebSocket，不再 fallback。
 - server 级 `trojan_doh` 或命中的 DoH 规则组查询失败都会结束本次请求，不回退到其他解析层。
 - `trojan_geosite` / `trojan_geoip` 文件只在加载或 reload NGINX 配置时读取；替换文件后需要 reload。
 - 本仓库没有自带 Makefile、测试框架、lint、formatter 或 CI。非平凡代码改动应在 NGINX 源码树中完成 `./configure ... --add-module=/path/to/ngx_stream_trojan_module && make` 验证。
@@ -229,6 +238,7 @@ trojan_routes {
 | `ngx_stream_trojan_protocol.c/h` | Trojan 协议辅助：key 派生、地址解析、UDP frame、默认 fallback 响应。 |
 | `ngx_stream_trojan_socks5_protocol.c/h` | SOCKS5 编解码：握手、认证、请求、响应、UDP 包。 |
 | `ngx_stream_trojan_http_proxy_protocol.c/h` | HTTP CONNECT 入站解析和响应生成。 |
+| `ngx_stream_trojan_websocket_protocol.c/h` | Trojan-Go WebSocket 握手、Accept、错误响应和 frame header/mask 辅助。 |
 | `ngx_stream_trojan_mux.c/h` | Trojan-Go mux、Mux.Cool、sing-mux smux 帧解析/打包。 |
 | `ngx_stream_trojan_doh.c/h` | 异步 DoH client。 |
 | `ngx_stream_trojan_dns_rules.c/h` | DNS 规则文件解析和域名匹配。 |

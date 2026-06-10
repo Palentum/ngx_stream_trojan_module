@@ -16,6 +16,7 @@
 #include "ngx_stream_trojan_dns_rules.h"
 #include "ngx_stream_trojan_geosite.h"
 #include "ngx_stream_trojan_geoip.h"
+#include "ngx_stream_trojan_websocket_protocol.h"
 
 
 #define NGX_STREAM_TROJAN_DEFAULT_BUFFER_SIZE 32768
@@ -23,6 +24,9 @@
 #define NGX_STREAM_TROJAN_UDP_BUFFER_SIZE \
     (NGX_STREAM_TROJAN_MAX_UDP_PAYLOAD + NGX_STREAM_TROJAN_MAX_ADDR_LEN + 4)
 #define NGX_STREAM_TROJAN_SOCKS5_UDP_SESSION_BUCKETS 64
+#define NGX_STREAM_TROJAN_WS_HANDSHAKE_BUFFER_SIZE 4096
+#define NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE 4096
+#define NGX_STREAM_TROJAN_WS_MAX_FRAMES_PER_RECV 32
 
 
 typedef enum {
@@ -143,6 +147,9 @@ typedef struct {
 
 struct ngx_stream_trojan_srv_conf_s {
     ngx_flag_t   enable;
+    ngx_flag_t   websocket_enable;
+    ngx_str_t    websocket_path;
+    ngx_str_t    websocket_host;
     ngx_flag_t   route_enable;
     ngx_flag_t   socks5_enable;
     ngx_flag_t   http_proxy_enable;
@@ -177,6 +184,9 @@ typedef enum {
     ngx_stream_trojan_state_socks5_in_udp_control,
     ngx_stream_trojan_state_http_in_request,
     ngx_stream_trojan_state_http_in_response,
+    ngx_stream_trojan_state_ws_handshake,
+    ngx_stream_trojan_state_ws_response,
+    ngx_stream_trojan_state_ws_closing,
     ngx_stream_trojan_state_request,
     ngx_stream_trojan_state_default_fallback,
     ngx_stream_trojan_state_resolving,
@@ -341,6 +351,28 @@ struct ngx_stream_trojan_ctx_s {
     uint16_t                    http_in_status;
     ngx_uint_t                  inbound_socks5;
     ngx_uint_t                  inbound_http_proxy;
+    ngx_uint_t                  websocket;
+    ngx_buf_t                  *ws_buffer;
+    ngx_buf_t                  *ws_raw;
+    ngx_buf_t                  *ws_out;
+    u_char                      ws_header[NGX_STREAM_TROJAN_WS_MAX_HEADER_LEN];
+    size_t                      ws_header_len;
+    ngx_stream_trojan_ws_frame_t ws_frame;
+    ngx_uint_t                  ws_frame_active;
+    uint64_t                    ws_payload_remaining;
+    uint64_t                    ws_mask_offset;
+    ngx_uint_t                  ws_fragmented;
+    uint8_t                     ws_fragment_opcode;
+    u_char                      ws_control[NGX_STREAM_TROJAN_WS_MAX_CONTROL_PAYLOAD];
+    size_t                      ws_control_len;
+    u_char                      ws_send_header[10];
+    size_t                      ws_send_header_len;
+    size_t                      ws_send_header_pos;
+    size_t                      ws_send_payload_remaining;
+    ngx_uint_t                  ws_close_code;
+    ngx_uint_t                  ws_finalize_rc;
+    uint16_t                    ws_response_status;
+    ngx_uint_t                  ws_response_is_accept;
 
     ngx_queue_t                 mux_streams;
     ngx_uint_t                  mux_cool;
@@ -398,6 +430,27 @@ static ngx_int_t ngx_stream_trojan_http_in_prepare_response(
 static ngx_int_t ngx_stream_trojan_init_udp_buffers(
     ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_process_request(ngx_stream_trojan_ctx_t *ctx);
+static void ngx_stream_trojan_process_websocket_handshake(
+    ngx_stream_trojan_ctx_t *ctx);
+static void ngx_stream_trojan_flush_websocket_response(
+    ngx_stream_trojan_ctx_t *ctx);
+static void ngx_stream_trojan_websocket_start_handshake(
+    ngx_stream_trojan_ctx_t *ctx, u_char *data, size_t len);
+static ssize_t ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx,
+    u_char *dst, size_t size);
+static ssize_t ngx_stream_trojan_client_send(ngx_stream_trojan_ctx_t *ctx,
+    u_char *src, size_t size);
+static ngx_uint_t ngx_stream_trojan_client_read_ready(
+    ngx_stream_trojan_ctx_t *ctx, ngx_connection_t *src);
+static ngx_int_t ngx_stream_trojan_websocket_flush_out(
+    ngx_stream_trojan_ctx_t *ctx);
+static ngx_int_t ngx_stream_trojan_websocket_queue_control(
+    ngx_stream_trojan_ctx_t *ctx, uint8_t opcode, const u_char *payload,
+    size_t payload_len);
+static void ngx_stream_trojan_websocket_fail(ngx_stream_trojan_ctx_t *ctx,
+    uint16_t code, ngx_uint_t rc);
+static void ngx_stream_trojan_websocket_process_closing(
+    ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_start_fallback(ngx_stream_trojan_ctx_t *ctx,
     u_char *data, size_t len);
 static void ngx_stream_trojan_start_default_fallback(
@@ -650,6 +703,10 @@ static char *ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static char *ngx_stream_trojan_on(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_stream_trojan_websocket_on(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_stream_trojan_websocket_path(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static char *ngx_stream_trojan_socks5_on(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_stream_trojan_http_proxy_on(ngx_conf_t *cf,
@@ -749,6 +806,27 @@ static ngx_command_t ngx_stream_trojan_commands[] = {
       NGX_STREAM_SRV_CONF_OFFSET,
       0,
       NULL },
+    { ngx_string("trojan_websocket"),
+      NGX_STREAM_SRV_CONF|NGX_CONF_FLAG,
+      ngx_stream_trojan_websocket_on,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_trojan_srv_conf_t, websocket_enable),
+      NULL },
+
+    { ngx_string("trojan_websocket_path"),
+      NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_stream_trojan_websocket_path,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("trojan_websocket_host"),
+      NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_trojan_srv_conf_t, websocket_host),
+      NULL },
+
 
     { ngx_string("trojan_connect_timeout"),
       NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
@@ -934,6 +1012,18 @@ ngx_stream_trojan_read_client(ngx_event_t *ev)
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
         return;
     }
+    if (ctx->websocket) {
+        switch (ngx_stream_trojan_websocket_flush_out(ctx)) {
+        case NGX_OK:
+            break;
+        case NGX_AGAIN:
+            return;
+        default:
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+            return;
+        }
+    }
+
 
     switch (ctx->state) {
     case ngx_stream_trojan_state_socks5_in_greeting:
@@ -945,6 +1035,18 @@ ngx_stream_trojan_read_client(ngx_event_t *ev)
     case ngx_stream_trojan_state_http_in_request:
     case ngx_stream_trojan_state_http_in_response:
         ngx_stream_trojan_process_http_in(ctx);
+        break;
+
+    case ngx_stream_trojan_state_ws_handshake:
+        ngx_stream_trojan_process_websocket_handshake(ctx);
+        break;
+
+    case ngx_stream_trojan_state_ws_response:
+        ngx_stream_trojan_flush_websocket_response(ctx);
+        break;
+
+    case ngx_stream_trojan_state_ws_closing:
+        ngx_stream_trojan_websocket_process_closing(ctx);
         break;
 
     case ngx_stream_trojan_state_prefix:
@@ -1687,18 +1789,37 @@ static void
 ngx_stream_trojan_process_prefix(ngx_stream_trojan_ctx_t *ctx)
 {
     ssize_t            n;
-    size_t             i;
+    size_t             i, need;
     ngx_connection_t  *c;
 
     c = ctx->session->connection;
 
     for ( ;; ) {
-        if (ctx->prefix_len == NGX_STREAM_TROJAN_PREFIX_LEN) {
-            break;
+        if (ctx->conf->websocket_enable && !ctx->websocket) {
+            if (ctx->prefix_len >= 4) {
+                if (ngx_memcmp(ctx->prefix, "GET ", 4) == 0) {
+                    ngx_stream_trojan_websocket_start_handshake(ctx,
+                                                               ctx->prefix,
+                                                               ctx->prefix_len);
+                } else {
+                    ngx_stream_trojan_start_fallback(ctx, ctx->prefix,
+                                                     ctx->prefix_len);
+                }
+                return;
+            }
+
+            need = 4 - ctx->prefix_len;
+
+        } else {
+            if (ctx->prefix_len == NGX_STREAM_TROJAN_PREFIX_LEN) {
+                break;
+            }
+
+            need = NGX_STREAM_TROJAN_PREFIX_LEN - ctx->prefix_len;
         }
 
-        n = c->recv(c, ctx->prefix + ctx->prefix_len,
-                    NGX_STREAM_TROJAN_PREFIX_LEN - ctx->prefix_len);
+        n = ngx_stream_trojan_client_recv(ctx, ctx->prefix + ctx->prefix_len,
+                                          need);
 
         if (n == NGX_AGAIN) {
             if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
@@ -1715,8 +1836,13 @@ ngx_stream_trojan_process_prefix(ngx_stream_trojan_ctx_t *ctx)
         for (i = ctx->prefix_len; i < ctx->prefix_len + (size_t) n; i++) {
             if (ctx->prefix[i] == LF && i < NGX_STREAM_TROJAN_KEY_LEN + 1) {
                 ctx->prefix_len += (size_t) n;
-                ngx_stream_trojan_start_fallback(ctx, ctx->prefix,
-                                                 ctx->prefix_len);
+                if (ctx->websocket) {
+                    ngx_stream_trojan_websocket_fail(ctx, 1008,
+                                                     NGX_STREAM_FORBIDDEN);
+                } else {
+                    ngx_stream_trojan_start_fallback(ctx, ctx->prefix,
+                                                     ctx->prefix_len);
+                }
                 return;
             }
         }
@@ -1728,7 +1854,11 @@ ngx_stream_trojan_process_prefix(ngx_stream_trojan_ctx_t *ctx)
         || ctx->prefix[NGX_STREAM_TROJAN_KEY_LEN + 1] != LF
         || ngx_stream_trojan_key_valid(ctx->conf, ctx->prefix) != NGX_OK)
     {
-        ngx_stream_trojan_start_fallback(ctx, ctx->prefix, ctx->prefix_len);
+        if (ctx->websocket) {
+            ngx_stream_trojan_websocket_fail(ctx, 1008, NGX_STREAM_FORBIDDEN);
+        } else {
+            ngx_stream_trojan_start_fallback(ctx, ctx->prefix, ctx->prefix_len);
+        }
         return;
     }
 
@@ -1813,8 +1943,9 @@ ngx_stream_trojan_process_request(ngx_stream_trojan_ctx_t *ctx)
             return;
         }
 
-        n = c->recv(c, ctx->request + ctx->request_len,
-                    needed - ctx->request_len);
+        n = ngx_stream_trojan_client_recv(ctx,
+                                          ctx->request + ctx->request_len,
+                                          needed - ctx->request_len);
 
         if (n == NGX_AGAIN) {
             if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
@@ -1911,6 +2042,885 @@ ngx_stream_trojan_create_temp_buf(ngx_pool_t *pool, size_t size)
 
     b->tag = (ngx_buf_tag_t) &ngx_stream_trojan_module;
     return b;
+}
+static ngx_uint_t
+ngx_stream_trojan_websocket_host_match(ngx_stream_trojan_ctx_t *ctx,
+    ngx_stream_trojan_ws_handshake_t *hs)
+{
+    ngx_str_t  *host;
+
+    host = &ctx->conf->websocket_host;
+    if (host->len == 0) {
+        return 1;
+    }
+
+    return hs->host_len == host->len
+           && ngx_strncasecmp((u_char *) hs->host, host->data, host->len)
+              == 0;
+}
+
+
+static void
+ngx_stream_trojan_websocket_prepare_response(ngx_stream_trojan_ctx_t *ctx,
+    uint16_t status, ngx_uint_t accept, const uint8_t *key, size_t key_len)
+{
+    size_t     written;
+    ngx_buf_t *b;
+
+    b = ctx->ws_buffer;
+    b->pos = b->start;
+    b->last = b->start;
+
+    if (accept) {
+        if (ngx_stream_trojan_ws_build_accept_response(key, key_len, b->last,
+                (size_t) (b->end - b->last), &written)
+            != 0)
+        {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+    } else {
+        if (ngx_stream_trojan_ws_build_error_response(status, b->last,
+                (size_t) (b->end - b->last), &written)
+            != 0)
+        {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+    }
+
+    b->last += written;
+    ctx->ws_response_status = status;
+    ctx->ws_response_is_accept = accept;
+    ctx->state = ngx_stream_trojan_state_ws_response;
+
+    ngx_stream_trojan_flush_websocket_response(ctx);
+}
+
+
+static void
+ngx_stream_trojan_websocket_fallback_or_error(ngx_stream_trojan_ctx_t *ctx,
+    uint16_t status)
+{
+    ngx_buf_t  *b;
+
+    b = ctx->ws_buffer;
+
+    if (ctx->conf->fallback != NULL) {
+        ngx_stream_trojan_start_fallback(ctx, b->pos, (size_t) (b->last - b->pos));
+        return;
+    }
+
+    ngx_stream_trojan_websocket_prepare_response(ctx, status, 0, NULL, 0);
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_websocket_ensure_raw(ngx_stream_trojan_ctx_t *ctx)
+{
+    size_t  raw_size;
+
+    if (ctx->ws_raw != NULL) {
+        return NGX_OK;
+    }
+
+    raw_size = ctx->conf->buffer_size;
+    if (raw_size < NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE) {
+        raw_size = NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE;
+    }
+
+    ctx->ws_raw = ngx_stream_trojan_create_temp_buf(
+        ctx->session->connection->pool, raw_size);
+    if (ctx->ws_raw == NULL) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_stream_trojan_websocket_start_handshake(ngx_stream_trojan_ctx_t *ctx,
+    u_char *data, size_t len)
+{
+
+    if (ctx->ws_buffer == NULL) {
+        ctx->ws_buffer = ngx_stream_trojan_create_temp_buf(
+            ctx->session->connection->pool,
+            NGX_STREAM_TROJAN_WS_HANDSHAKE_BUFFER_SIZE);
+        if (ctx->ws_buffer == NULL) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+    }
+
+
+    if (len > (size_t) (ctx->ws_buffer->end - ctx->ws_buffer->start)) {
+        ngx_stream_trojan_websocket_fallback_or_error(ctx, 400);
+        return;
+    }
+
+    ctx->ws_buffer->pos = ctx->ws_buffer->start;
+    ctx->ws_buffer->last = ctx->ws_buffer->start;
+    ngx_memcpy(ctx->ws_buffer->last, data, len);
+    ctx->ws_buffer->last += len;
+    ctx->prefix_len = 0;
+    ctx->state = ngx_stream_trojan_state_ws_handshake;
+
+    ngx_stream_trojan_process_websocket_handshake(ctx);
+}
+
+
+static void
+ngx_stream_trojan_process_websocket_handshake(ngx_stream_trojan_ctx_t *ctx)
+{
+    int                                rc;
+    ssize_t                            n;
+    size_t                             needed, len, extra;
+    ngx_buf_t                         *b, *raw;
+    ngx_connection_t                  *c;
+    ngx_stream_trojan_ws_handshake_t   hs;
+
+    c = ctx->session->connection;
+    b = ctx->ws_buffer;
+    raw = NULL;
+
+    for ( ;; ) {
+        len = (size_t) (b->last - b->pos);
+        rc = ngx_stream_trojan_ws_parse_handshake(b->pos, len, &needed, &hs);
+
+        if (rc == NGX_STREAM_TROJAN_WS_OK) {
+            if (hs.path_len != ctx->conf->websocket_path.len
+                || ngx_memcmp(hs.path, ctx->conf->websocket_path.data,
+                              hs.path_len)
+                   != 0)
+            {
+                ngx_stream_trojan_websocket_fallback_or_error(ctx, 404);
+                return;
+            }
+
+            if (!ngx_stream_trojan_websocket_host_match(ctx, &hs)) {
+                ngx_stream_trojan_websocket_fallback_or_error(ctx, 403);
+                return;
+            }
+
+            if (ngx_stream_trojan_websocket_ensure_raw(ctx) != NGX_OK) {
+                ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+                return;
+            }
+
+            raw = ctx->ws_raw;
+
+            extra = len - hs.header_len;
+            raw->pos = raw->start;
+            raw->last = raw->start;
+            if (extra) {
+                ngx_memcpy(raw->last, b->pos + hs.header_len, extra);
+                raw->last += extra;
+            }
+
+            ngx_stream_trojan_websocket_prepare_response(ctx, 101, 1,
+                                                         hs.key, hs.key_len);
+            return;
+        }
+
+        if (rc == NGX_STREAM_TROJAN_WS_BAD_VERSION) {
+            ngx_stream_trojan_websocket_fallback_or_error(ctx, 426);
+            return;
+        }
+
+        if (rc == NGX_STREAM_TROJAN_WS_ERROR) {
+            ngx_stream_trojan_websocket_fallback_or_error(ctx, 400);
+            return;
+        }
+
+        if (b->last == b->end) {
+            ngx_stream_trojan_websocket_fallback_or_error(ctx, 400);
+            return;
+        }
+
+        n = c->recv(c, b->last, (size_t) (b->end - b->last));
+        if (n == NGX_AGAIN) {
+            if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+                ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            }
+            return;
+        }
+
+        if (n == 0 || n == NGX_ERROR) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+            return;
+        }
+
+        b->last += n;
+    }
+}
+
+
+static void
+ngx_stream_trojan_flush_websocket_response(ngx_stream_trojan_ctx_t *ctx)
+{
+    ssize_t            n;
+    ngx_buf_t         *b;
+    ngx_connection_t  *c;
+
+    c = ctx->session->connection;
+    b = ctx->ws_buffer;
+
+    while (b->pos < b->last) {
+        n = c->send(c, b->pos, (size_t) (b->last - b->pos));
+
+        if (n == NGX_AGAIN || n == 0) {
+            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+                ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            }
+            return;
+        }
+
+        if (n == NGX_ERROR) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+            return;
+        }
+
+        b->pos += n;
+    }
+
+    b->pos = b->start;
+    b->last = b->start;
+
+    if (!ctx->ws_response_is_accept) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+        return;
+    }
+
+    if (ctx->ws_out == NULL) {
+        ctx->ws_out = ngx_stream_trojan_create_temp_buf(
+            c->pool, 2 + NGX_STREAM_TROJAN_WS_MAX_CONTROL_PAYLOAD);
+        if (ctx->ws_out == NULL) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+    }
+
+    ctx->websocket = 1;
+    ctx->state = ngx_stream_trojan_state_prefix;
+    ngx_stream_trojan_process_prefix(ctx);
+}
+
+
+static size_t
+ngx_stream_trojan_websocket_raw_pending(ngx_stream_trojan_ctx_t *ctx)
+{
+    if (ctx->ws_raw == NULL || ctx->ws_raw->pos == ctx->ws_raw->last) {
+        return 0;
+    }
+
+    return (size_t) (ctx->ws_raw->last - ctx->ws_raw->pos);
+}
+
+
+static ssize_t
+ngx_stream_trojan_websocket_read_raw(ngx_stream_trojan_ctx_t *ctx,
+    u_char *dst, size_t size)
+{
+    size_t             n;
+    ssize_t            rc;
+    ngx_buf_t         *b;
+    ngx_connection_t  *c;
+
+    if (size == 0) {
+        return NGX_AGAIN;
+    }
+
+    b = ctx->ws_raw;
+    c = ctx->session->connection;
+
+    if (b->pos == b->last) {
+        b->pos = b->start;
+        b->last = b->start;
+
+        rc = c->recv(c, b->last, (size_t) (b->end - b->last));
+        if (rc == NGX_AGAIN || rc == 0 || rc == NGX_ERROR) {
+            return rc;
+        }
+
+        b->last += rc;
+    }
+
+    n = (size_t) (b->last - b->pos);
+    if (n > size) {
+        n = size;
+    }
+
+    ngx_memcpy(dst, b->pos, n);
+    b->pos += n;
+    if (b->pos == b->last) {
+        b->pos = b->start;
+        b->last = b->start;
+    }
+
+    return (ssize_t) n;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_websocket_app_frame_pending(ngx_stream_trojan_ctx_t *ctx)
+{
+    return ctx->ws_send_header_pos < ctx->ws_send_header_len
+           || ctx->ws_send_payload_remaining != 0;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_websocket_flush_out(ngx_stream_trojan_ctx_t *ctx)
+{
+    ssize_t            n;
+    ngx_buf_t         *b;
+    ngx_connection_t  *c;
+
+    b = ctx->ws_out;
+    if (b == NULL || b->pos == b->last) {
+        return NGX_OK;
+    }
+
+    if (ngx_stream_trojan_websocket_app_frame_pending(ctx)) {
+        return NGX_OK;
+    }
+
+    c = ctx->session->connection;
+
+    while (b->pos < b->last) {
+        n = c->send(c, b->pos, (size_t) (b->last - b->pos));
+
+        if (n == NGX_AGAIN || n == 0) {
+            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+                return NGX_ERROR;
+            }
+            return NGX_AGAIN;
+        }
+
+        if (n == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+
+        b->pos += n;
+    }
+
+    b->pos = b->start;
+    b->last = b->start;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_websocket_queue_control(ngx_stream_trojan_ctx_t *ctx,
+    uint8_t opcode, const u_char *payload, size_t payload_len)
+{
+    size_t             written;
+    ngx_buf_t         *b;
+    ngx_connection_t  *c;
+
+    if (payload_len > NGX_STREAM_TROJAN_WS_MAX_CONTROL_PAYLOAD
+        || (opcode != NGX_STREAM_TROJAN_WS_OPCODE_PONG
+            && opcode != NGX_STREAM_TROJAN_WS_OPCODE_CLOSE))
+    {
+        return NGX_ERROR;
+    }
+
+    b = ctx->ws_out;
+    if (b == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (opcode == NGX_STREAM_TROJAN_WS_OPCODE_CLOSE) {
+        if (ctx->ws_close_code) {
+            return NGX_OK;
+        }
+        ctx->ws_close_code = 1;
+
+    } else if (ctx->ws_close_code) {
+        return NGX_OK;
+
+    } else if (b->pos < b->last && b->pos != b->start) {
+        return NGX_OK;
+    }
+
+    b->pos = b->start;
+    b->last = b->start;
+
+    if (ngx_stream_trojan_ws_build_frame_header(opcode, payload_len, b->last,
+            (size_t) (b->end - b->last), &written)
+        != 0)
+    {
+        return NGX_ERROR;
+    }
+
+    b->last += written;
+    if (payload_len) {
+        ngx_memcpy(b->last, payload, payload_len);
+        b->last += payload_len;
+    }
+
+    c = ctx->session->connection;
+    if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (c->write->ready
+        && !ngx_stream_trojan_websocket_app_frame_pending(ctx)
+        && ngx_stream_trojan_websocket_flush_out(ctx) == NGX_ERROR)
+    {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_stream_trojan_websocket_process_closing(ngx_stream_trojan_ctx_t *ctx)
+{
+    ngx_int_t  rc;
+
+    if (ngx_stream_trojan_websocket_app_frame_pending(ctx)) {
+        ngx_stream_trojan_finalize(ctx, ctx->ws_finalize_rc);
+        return;
+    }
+
+    rc = ngx_stream_trojan_websocket_flush_out(ctx);
+    if (rc == NGX_AGAIN) {
+        return;
+    }
+
+    if (rc == NGX_ERROR) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+        return;
+    }
+
+    ngx_stream_trojan_finalize(ctx, ctx->ws_finalize_rc);
+}
+
+
+static void
+ngx_stream_trojan_websocket_fail(ngx_stream_trojan_ctx_t *ctx, uint16_t code,
+    ngx_uint_t rc)
+{
+    u_char             payload[2];
+    ngx_connection_t  *c;
+
+    if (!ctx->websocket || ctx->state == ngx_stream_trojan_state_ws_closing) {
+        return;
+    }
+
+    payload[0] = (u_char) (code >> 8);
+    payload[1] = (u_char) code;
+
+    ctx->ws_finalize_rc = rc;
+    ctx->state = ngx_stream_trojan_state_ws_closing;
+
+    c = ctx->session->connection;
+    c->read->handler = ngx_stream_trojan_read_client;
+    c->write->handler = ngx_stream_trojan_read_client;
+
+    if (ngx_stream_trojan_websocket_queue_control(ctx,
+            NGX_STREAM_TROJAN_WS_OPCODE_CLOSE, payload, sizeof(payload))
+        != NGX_OK)
+    {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    ngx_post_event(c->write, &ngx_posted_events);
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_websocket_handle_frame_end(ngx_stream_trojan_ctx_t *ctx)
+{
+    u_char  *payload;
+    size_t   payload_len;
+
+    if (ctx->ws_frame.opcode == NGX_STREAM_TROJAN_WS_OPCODE_BINARY) {
+        if (!ctx->ws_frame.fin) {
+            ctx->ws_fragmented = 1;
+            ctx->ws_fragment_opcode = NGX_STREAM_TROJAN_WS_OPCODE_BINARY;
+        }
+        return NGX_OK;
+    }
+
+    if (ctx->ws_frame.opcode == NGX_STREAM_TROJAN_WS_OPCODE_CONT) {
+        if (ctx->ws_frame.fin) {
+            ctx->ws_fragmented = 0;
+            ctx->ws_fragment_opcode = 0;
+        }
+        return NGX_OK;
+    }
+
+    payload = ctx->ws_control;
+    payload_len = ctx->ws_control_len;
+    ctx->ws_control_len = 0;
+
+    switch (ctx->ws_frame.opcode) {
+    case NGX_STREAM_TROJAN_WS_OPCODE_PING:
+        if (ngx_stream_trojan_websocket_queue_control(ctx,
+                NGX_STREAM_TROJAN_WS_OPCODE_PONG, payload, payload_len)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+        return NGX_OK;
+
+    case NGX_STREAM_TROJAN_WS_OPCODE_PONG:
+        return NGX_OK;
+
+    case NGX_STREAM_TROJAN_WS_OPCODE_CLOSE:
+        if (payload_len == 1) {
+            ngx_stream_trojan_websocket_fail(ctx, 1002,
+                                             NGX_STREAM_BAD_REQUEST);
+            return NGX_AGAIN;
+        }
+
+        ctx->ws_finalize_rc = NGX_STREAM_OK;
+        ctx->state = ngx_stream_trojan_state_ws_closing;
+        ctx->session->connection->read->handler = ngx_stream_trojan_read_client;
+        ctx->session->connection->write->handler = ngx_stream_trojan_read_client;
+        if (ngx_stream_trojan_websocket_queue_control(ctx,
+                NGX_STREAM_TROJAN_WS_OPCODE_CLOSE, payload, payload_len)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+        ngx_post_event(ctx->session->connection->write, &ngx_posted_events);
+        return NGX_AGAIN;
+
+    default:
+        return NGX_ERROR;
+    }
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_websocket_start_frame(ngx_stream_trojan_ctx_t *ctx)
+{
+    ngx_stream_trojan_ws_frame_t *frame;
+
+    frame = &ctx->ws_frame;
+
+    if (!frame->masked) {
+        ngx_stream_trojan_websocket_fail(ctx, 1002, NGX_STREAM_BAD_REQUEST);
+        return NGX_AGAIN;
+    }
+
+    switch (frame->opcode) {
+    case NGX_STREAM_TROJAN_WS_OPCODE_BINARY:
+        if (ctx->ws_fragmented) {
+            ngx_stream_trojan_websocket_fail(ctx, 1002,
+                                             NGX_STREAM_BAD_REQUEST);
+            return NGX_AGAIN;
+        }
+        break;
+
+    case NGX_STREAM_TROJAN_WS_OPCODE_CONT:
+        if (!ctx->ws_fragmented
+            || ctx->ws_fragment_opcode != NGX_STREAM_TROJAN_WS_OPCODE_BINARY)
+        {
+            ngx_stream_trojan_websocket_fail(ctx, 1002,
+                                             NGX_STREAM_BAD_REQUEST);
+            return NGX_AGAIN;
+        }
+        break;
+
+    case NGX_STREAM_TROJAN_WS_OPCODE_TEXT:
+        ngx_stream_trojan_websocket_fail(ctx, 1003, NGX_STREAM_BAD_REQUEST);
+        return NGX_AGAIN;
+
+    case NGX_STREAM_TROJAN_WS_OPCODE_CLOSE:
+    case NGX_STREAM_TROJAN_WS_OPCODE_PING:
+    case NGX_STREAM_TROJAN_WS_OPCODE_PONG:
+        break;
+
+    default:
+        ngx_stream_trojan_websocket_fail(ctx, 1002, NGX_STREAM_BAD_REQUEST);
+        return NGX_AGAIN;
+    }
+
+    ctx->ws_frame_active = 1;
+    ctx->ws_payload_remaining = frame->payload_len;
+    ctx->ws_mask_offset = 0;
+    ctx->ws_control_len = 0;
+
+    if (ctx->ws_payload_remaining == 0) {
+        ctx->ws_frame_active = 0;
+        return ngx_stream_trojan_websocket_handle_frame_end(ctx);
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_websocket_count_frame(ngx_stream_trojan_ctx_t *ctx,
+    ngx_uint_t *frames)
+{
+    (*frames)++;
+    if (*frames < NGX_STREAM_TROJAN_WS_MAX_FRAMES_PER_RECV) {
+        return NGX_OK;
+    }
+
+    ngx_post_event(ctx->session->connection->read, &ngx_posted_events);
+    return NGX_AGAIN;
+}
+
+
+static ssize_t
+ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
+    size_t size)
+{
+    int          prc;
+    ssize_t      n;
+    size_t       needed, chunk, produced;
+    ngx_int_t    rc;
+    ngx_uint_t   frames;
+
+    if (!ctx->websocket) {
+        return ctx->session->connection->recv(ctx->session->connection, dst,
+                                              size);
+    }
+
+    if (ctx->state == ngx_stream_trojan_state_ws_closing) {
+        return NGX_AGAIN;
+    }
+
+    produced = 0;
+    frames = 0;
+
+    for ( ;; ) {
+        if (produced) {
+            return (ssize_t) produced;
+        }
+
+        if (ctx->ws_frame_active) {
+            if (ctx->ws_frame.opcode == NGX_STREAM_TROJAN_WS_OPCODE_BINARY
+                || ctx->ws_frame.opcode == NGX_STREAM_TROJAN_WS_OPCODE_CONT)
+            {
+                chunk = size - produced;
+                if (chunk > ctx->ws_payload_remaining) {
+                    chunk = (size_t) ctx->ws_payload_remaining;
+                }
+
+                n = ngx_stream_trojan_websocket_read_raw(ctx, dst + produced,
+                                                         chunk);
+                if (n == NGX_AGAIN || n == 0 || n == NGX_ERROR) {
+                    return produced ? (ssize_t) produced : n;
+                }
+
+                ngx_stream_trojan_ws_apply_mask(dst + produced, (size_t) n,
+                                                ctx->ws_frame.mask,
+                                                ctx->ws_mask_offset);
+                ctx->ws_mask_offset += (uint64_t) n;
+                ctx->ws_payload_remaining -= (uint64_t) n;
+                produced += (size_t) n;
+
+                if (ctx->ws_payload_remaining == 0) {
+                    ctx->ws_frame_active = 0;
+                    rc = ngx_stream_trojan_websocket_handle_frame_end(ctx);
+                    if (rc == NGX_ERROR) {
+                        return NGX_ERROR;
+                    }
+                    if (rc == NGX_AGAIN) {
+                        return NGX_AGAIN;
+                    }
+                }
+
+                continue;
+            }
+
+            chunk = ctx->ws_frame.payload_len - ctx->ws_control_len;
+            n = ngx_stream_trojan_websocket_read_raw(
+                ctx, ctx->ws_control + ctx->ws_control_len, chunk);
+            if (n == NGX_AGAIN || n == 0 || n == NGX_ERROR) {
+                return n;
+            }
+
+            ngx_stream_trojan_ws_apply_mask(
+                ctx->ws_control + ctx->ws_control_len, (size_t) n,
+                ctx->ws_frame.mask, ctx->ws_mask_offset);
+            ctx->ws_mask_offset += (uint64_t) n;
+            ctx->ws_control_len += (size_t) n;
+            ctx->ws_payload_remaining -= (uint64_t) n;
+
+            if (ctx->ws_payload_remaining == 0) {
+                ctx->ws_frame_active = 0;
+                rc = ngx_stream_trojan_websocket_handle_frame_end(ctx);
+                if (rc == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+                if (rc == NGX_AGAIN) {
+                    return NGX_AGAIN;
+                }
+                if (ngx_stream_trojan_websocket_count_frame(ctx, &frames)
+                    != NGX_OK)
+                {
+                    return NGX_AGAIN;
+                }
+            }
+
+            continue;
+        }
+
+        for ( ;; ) {
+            prc = ngx_stream_trojan_ws_parse_frame_header(
+                ctx->ws_header, ctx->ws_header_len, &needed, &ctx->ws_frame);
+
+            if (prc == NGX_STREAM_TROJAN_WS_OK) {
+                ctx->ws_header_len = 0;
+                rc = ngx_stream_trojan_websocket_start_frame(ctx);
+                if (rc == NGX_ERROR) {
+                    return NGX_ERROR;
+                }
+                if (rc == NGX_AGAIN) {
+                    return NGX_AGAIN;
+                }
+                if (!ctx->ws_frame_active
+                    && ngx_stream_trojan_websocket_count_frame(ctx, &frames)
+                       != NGX_OK)
+                {
+                    return NGX_AGAIN;
+                }
+                break;
+            }
+
+            if (prc == NGX_STREAM_TROJAN_WS_ERROR) {
+                ctx->ws_header_len = 0;
+                ngx_stream_trojan_websocket_fail(ctx, 1002,
+                                                 NGX_STREAM_BAD_REQUEST);
+                return NGX_AGAIN;
+            }
+
+            n = ngx_stream_trojan_websocket_read_raw(
+                ctx, ctx->ws_header + ctx->ws_header_len,
+                needed - ctx->ws_header_len);
+            if (n == NGX_AGAIN || n == 0 || n == NGX_ERROR) {
+                return n;
+            }
+
+            ctx->ws_header_len += (size_t) n;
+        }
+    }
+}
+
+
+static ssize_t
+ngx_stream_trojan_client_send(ngx_stream_trojan_ctx_t *ctx, u_char *src,
+    size_t size)
+{
+    ssize_t            n;
+    size_t             chunk;
+    ngx_int_t          rc;
+    ngx_connection_t  *c;
+
+    c = ctx->session->connection;
+
+    if (!ctx->websocket) {
+        return c->send(c, src, size);
+    }
+
+    rc = ngx_stream_trojan_websocket_flush_out(ctx);
+    if (rc == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+    if (rc == NGX_AGAIN) {
+        return NGX_AGAIN;
+    }
+
+    if (ctx->state == ngx_stream_trojan_state_ws_closing) {
+        return NGX_AGAIN;
+    }
+
+    if (ctx->ws_send_header_len == 0
+        && ctx->ws_send_payload_remaining == 0)
+    {
+        if (ngx_stream_trojan_ws_build_frame_header(
+                NGX_STREAM_TROJAN_WS_OPCODE_BINARY, size,
+                ctx->ws_send_header, sizeof(ctx->ws_send_header),
+                &ctx->ws_send_header_len)
+            != 0)
+        {
+            return NGX_ERROR;
+        }
+
+        ctx->ws_send_header_pos = 0;
+        ctx->ws_send_payload_remaining = size;
+    }
+
+    while (ctx->ws_send_header_pos < ctx->ws_send_header_len) {
+        n = c->send(c, ctx->ws_send_header + ctx->ws_send_header_pos,
+                    ctx->ws_send_header_len - ctx->ws_send_header_pos);
+
+        if (n == NGX_AGAIN || n == 0) {
+            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+                return NGX_ERROR;
+            }
+            return NGX_AGAIN;
+        }
+
+        if (n == NGX_ERROR) {
+            return NGX_ERROR;
+        }
+
+        ctx->ws_send_header_pos += (size_t) n;
+    }
+
+    chunk = size;
+    if (chunk > ctx->ws_send_payload_remaining) {
+        chunk = ctx->ws_send_payload_remaining;
+    }
+
+    n = c->send(c, src, chunk);
+    if (n == NGX_AGAIN || n == 0) {
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+        return NGX_AGAIN;
+    }
+
+    if (n == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    ctx->ws_send_payload_remaining -= (size_t) n;
+    if (ctx->ws_send_payload_remaining == 0) {
+        ctx->ws_send_header_len = 0;
+        ctx->ws_send_header_pos = 0;
+
+        if (ctx->ws_out != NULL && ctx->ws_out->pos < ctx->ws_out->last
+            && c->write->ready)
+        {
+            rc = ngx_stream_trojan_websocket_flush_out(ctx);
+            if (rc == NGX_ERROR) {
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    return n;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_client_read_ready(ngx_stream_trojan_ctx_t *ctx,
+    ngx_connection_t *src)
+{
+    if (!ctx->websocket || src != ctx->session->connection) {
+        return src->read->ready;
+    }
+
+    return src->read->ready
+           || ngx_stream_trojan_websocket_raw_pending(ctx) != 0
+           || (ctx->ws_frame_active && ctx->ws_payload_remaining > 0)
+           || ctx->ws_header_len > 0;
 }
 
 
@@ -3886,7 +4896,12 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
 
     for ( ;; ) {
         while (buf->pos < buf->last) {
-            n = dst->send(dst, buf->pos, buf->last - buf->pos);
+            if (dst == ctx->session->connection) {
+                n = ngx_stream_trojan_client_send(ctx, buf->pos,
+                                                  buf->last - buf->pos);
+            } else {
+                n = dst->send(dst, buf->pos, buf->last - buf->pos);
+            }
 
             if (n == NGX_AGAIN) {
                 return NGX_OK;
@@ -3908,7 +4923,7 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
 
         rev = src->read;
 
-        if (!rev->ready
+        if (!ngx_stream_trojan_client_read_ready(ctx, src)
             || !ngx_stream_trojan_relay_should_continue(loops, bytes, limit))
         {
             return NGX_OK;
@@ -3920,7 +4935,11 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
             return NGX_OK;
         }
 
-        n = src->recv(src, buf->last, available);
+        if (src == ctx->session->connection) {
+            n = ngx_stream_trojan_client_recv(ctx, buf->last, available);
+        } else {
+            n = src->recv(src, buf->last, available);
+        }
 
         if (n == NGX_AGAIN) {
             return NGX_OK;
@@ -3996,7 +5015,11 @@ ngx_stream_trojan_mux_send_bytes(ngx_stream_trojan_ctx_t *ctx,
     ssize_t  n;
 
     while (*pos < len) {
-        n = c->send(c, data + *pos, len - *pos);
+        if (c == ctx->session->connection) {
+            n = ngx_stream_trojan_client_send(ctx, data + *pos, len - *pos);
+        } else {
+            n = c->send(c, data + *pos, len - *pos);
+        }
 
         if (n == NGX_AGAIN || n == 0) {
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
@@ -4120,7 +5143,7 @@ ngx_stream_trojan_mux_flush_stream_to_client(
         }
 
         while (b->pos < b->last) {
-            n = c->send(c, b->pos, b->last - b->pos);
+            n = ngx_stream_trojan_client_send(ctx, b->pos, b->last - b->pos);
 
             if (n == NGX_AGAIN || n == 0) {
                 if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
@@ -4302,9 +5325,10 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
 
     for ( ;; ) {
         while (ctx->mux_header_len < NGX_STREAM_TROJAN_MUX_HEADER_LEN) {
-            n = c->recv(c, ctx->mux_header + ctx->mux_header_len,
-                        NGX_STREAM_TROJAN_MUX_HEADER_LEN
-                        - ctx->mux_header_len);
+            n = ngx_stream_trojan_client_recv(ctx,
+                    ctx->mux_header + ctx->mux_header_len,
+                    NGX_STREAM_TROJAN_MUX_HEADER_LEN
+                    - ctx->mux_header_len);
 
             if (n == NGX_AGAIN) {
                 return NGX_OK;
@@ -4365,8 +5389,9 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
         }
 
         while (ctx->mux_payload_read < ctx->mux_payload_len) {
-            n = c->recv(c, ctx->mux_payload + ctx->mux_payload_read,
-                        ctx->mux_payload_len - ctx->mux_payload_read);
+            n = ngx_stream_trojan_client_recv(ctx,
+                    ctx->mux_payload + ctx->mux_payload_read,
+                    ctx->mux_payload_len - ctx->mux_payload_read);
 
             if (n == NGX_AGAIN) {
                 return NGX_OK;
@@ -4412,9 +5437,9 @@ ngx_stream_trojan_mux_sing_read_handshake(ngx_stream_trojan_ctx_t *ctx)
     c = ctx->session->connection;
 
     while (ctx->mux_sing_handshake_len < 2) {
-        n = c->recv(c,
-                    ctx->mux_sing_handshake + ctx->mux_sing_handshake_len,
-                    2 - ctx->mux_sing_handshake_len);
+        n = ngx_stream_trojan_client_recv(ctx,
+                ctx->mux_sing_handshake + ctx->mux_sing_handshake_len,
+                2 - ctx->mux_sing_handshake_len);
 
         if (n == NGX_AGAIN) {
             return NGX_AGAIN;
@@ -4441,9 +5466,9 @@ ngx_stream_trojan_mux_sing_read_handshake(ngx_stream_trojan_ctx_t *ctx)
     }
 
     while (ctx->mux_sing_handshake_len < 3) {
-        n = c->recv(c,
-                    ctx->mux_sing_handshake + ctx->mux_sing_handshake_len,
-                    3 - ctx->mux_sing_handshake_len);
+        n = ngx_stream_trojan_client_recv(ctx,
+                ctx->mux_sing_handshake + ctx->mux_sing_handshake_len,
+                3 - ctx->mux_sing_handshake_len);
 
         if (n == NGX_AGAIN) {
             return NGX_AGAIN;
@@ -4504,8 +5529,9 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
 
     for ( ;; ) {
         while (ctx->mux_header_len < 2) {
-            n = c->recv(c, ctx->mux_header + ctx->mux_header_len,
-                        2 - ctx->mux_header_len);
+            n = ngx_stream_trojan_client_recv(ctx,
+                    ctx->mux_header + ctx->mux_header_len,
+                    2 - ctx->mux_header_len);
 
             if (n == NGX_AGAIN) {
                 return NGX_OK;
@@ -4533,8 +5559,9 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
         }
 
         while (ctx->mux_cool_meta_read < ctx->mux_cool_meta_len) {
-            n = c->recv(c, ctx->mux_cool_meta + ctx->mux_cool_meta_read,
-                        ctx->mux_cool_meta_len - ctx->mux_cool_meta_read);
+            n = ngx_stream_trojan_client_recv(ctx,
+                    ctx->mux_cool_meta + ctx->mux_cool_meta_read,
+                    ctx->mux_cool_meta_len - ctx->mux_cool_meta_read);
 
             if (n == NGX_AGAIN) {
                 return NGX_OK;
@@ -4567,10 +5594,10 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
             & NGX_STREAM_TROJAN_MUX_COOL_OPT_DATA)
         {
             while (ctx->mux_cool_data_len_read < 2) {
-                n = c->recv(c,
-                            ctx->mux_cool_data_len
-                            + ctx->mux_cool_data_len_read,
-                            2 - ctx->mux_cool_data_len_read);
+                n = ngx_stream_trojan_client_recv(ctx,
+                        ctx->mux_cool_data_len
+                        + ctx->mux_cool_data_len_read,
+                        2 - ctx->mux_cool_data_len_read);
 
                 if (n == NGX_AGAIN) {
                     return NGX_OK;
@@ -4612,8 +5639,9 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
             }
 
             while (ctx->mux_payload_read < ctx->mux_payload_len) {
-                n = c->recv(c, ctx->mux_payload + ctx->mux_payload_read,
-                            ctx->mux_payload_len - ctx->mux_payload_read);
+                n = ngx_stream_trojan_client_recv(ctx,
+                        ctx->mux_payload + ctx->mux_payload_read,
+                        ctx->mux_payload_len - ctx->mux_payload_read);
 
                 if (n == NGX_AGAIN) {
                     return NGX_OK;
@@ -6770,8 +7798,10 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
             return;
         }
 
-        n = c->recv(c, ctx->udp_in + ctx->udp_in_len,
-                    NGX_STREAM_TROJAN_UDP_BUFFER_SIZE - ctx->udp_in_len);
+        n = ngx_stream_trojan_client_recv(ctx,
+                                          ctx->udp_in + ctx->udp_in_len,
+                                          NGX_STREAM_TROJAN_UDP_BUFFER_SIZE
+                                          - ctx->udp_in_len);
 
         if (n == NGX_AGAIN) {
             if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
@@ -7211,7 +8241,7 @@ ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
     }
 
     while (b->pos < b->last) {
-        n = c->send(c, b->pos, b->last - b->pos);
+        n = ngx_stream_trojan_client_send(ctx, b->pos, b->last - b->pos);
 
         if (n == NGX_AGAIN) {
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
@@ -7249,6 +8279,18 @@ ngx_stream_trojan_udp_client_write_handler(ngx_event_t *ev)
     if (ctx == NULL) {
         ngx_stream_finalize_session(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
+    }
+
+    if (ctx->websocket) {
+        switch (ngx_stream_trojan_websocket_flush_out(ctx)) {
+        case NGX_OK:
+            break;
+        case NGX_AGAIN:
+            return;
+        default:
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+            return;
+        }
     }
 
     if (ngx_stream_trojan_flush_udp_client(ctx) == NGX_ERROR) {
@@ -8121,6 +9163,7 @@ ngx_stream_trojan_create_srv_conf(ngx_conf_t *cf)
     }
 
     conf->enable = NGX_CONF_UNSET;
+    conf->websocket_enable = NGX_CONF_UNSET;
     conf->route_enable = NGX_CONF_UNSET;
     conf->socks5_enable = NGX_CONF_UNSET;
     conf->http_proxy_enable = NGX_CONF_UNSET;
@@ -8142,6 +9185,7 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_stream_trojan_srv_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
+    ngx_conf_merge_value(conf->websocket_enable, prev->websocket_enable, 0);
     ngx_conf_merge_value(conf->route_enable, prev->route_enable, 0);
     ngx_conf_merge_value(conf->socks5_enable, prev->socks5_enable, 0);
     ngx_conf_merge_value(conf->http_proxy_enable, prev->http_proxy_enable, 0);
@@ -8161,6 +9205,14 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->fallback == NULL) {
         conf->fallback = prev->fallback;
     }
+    if (conf->websocket_path.len == 0) {
+        conf->websocket_path = prev->websocket_path;
+    }
+
+    if (conf->websocket_host.len == 0) {
+        conf->websocket_host = prev->websocket_host;
+    }
+
 
     if (conf->outbounds == NULL) {
         conf->outbounds = prev->outbounds;
@@ -8209,6 +9261,27 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
         return NGX_CONF_ERROR;
     }
 
+    if (conf->websocket_enable && !conf->enable) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "trojan_websocket requires trojan on");
+        return NGX_CONF_ERROR;
+    }
+
+    if (conf->websocket_enable && conf->websocket_path.len == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "trojan_websocket is on but no "
+                           "trojan_websocket_path is configured");
+        return NGX_CONF_ERROR;
+    }
+
+    if (conf->websocket_path.len != 0
+        && conf->websocket_path.data[0] != '/')
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "trojan_websocket_path must start with \"/\"");
+        return NGX_CONF_ERROR;
+    }
+
     if (conf->socks5_udp_enable && !conf->socks5_enable) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "socks5_udp requires socks5 on");
@@ -8233,6 +9306,49 @@ ngx_stream_trojan_on(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     cscf = ngx_stream_conf_get_module_srv_conf(cf, ngx_stream_core_module);
     cscf->handler = ngx_stream_trojan_handler;
 
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_stream_trojan_websocket_on(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    char                        *rv;
+    ngx_stream_core_srv_conf_t  *cscf;
+
+    rv = ngx_conf_set_flag_slot(cf, cmd, conf);
+    if (rv != NGX_CONF_OK) {
+        return rv;
+    }
+
+    cscf = ngx_stream_conf_get_module_srv_conf(cf, ngx_stream_core_module);
+    cscf->handler = ngx_stream_trojan_handler;
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_stream_trojan_websocket_path(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
+{
+    ngx_stream_trojan_srv_conf_t *tscf = conf;
+    ngx_str_t                   *value;
+
+    if (tscf->websocket_path.len != 0) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    if (value[1].len == 0 || value[1].data[0] != '/') {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "trojan_websocket_path must start with \"/\"");
+        return NGX_CONF_ERROR;
+    }
+
+    tscf->websocket_path = value[1];
+
+    (void) cmd;
     return NGX_CONF_OK;
 }
 
