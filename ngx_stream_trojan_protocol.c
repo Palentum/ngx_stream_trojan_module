@@ -502,12 +502,41 @@ ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uin
     uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written)
 {
     size_t pos = 0;
+    size_t addr_len;
 
     if (addr == NULL || out == NULL || written == NULL || (payload_len > 0 && payload == NULL)) {
         return -1;
     }
 
-    if (out_len < addr->wire_len + 4 + payload_len) {
+    switch (addr->type) {
+    case NGX_STREAM_TROJAN_ADDR_IPV4:
+        if (addr->host_len != 4 || addr->wire_len != 1 + 4 + 2) {
+            return -1;
+        }
+        addr_len = addr->wire_len;
+        break;
+
+    case NGX_STREAM_TROJAN_ADDR_IPV6:
+        if (addr->host_len != 16 || addr->wire_len != 1 + 16 + 2) {
+            return -1;
+        }
+        addr_len = addr->wire_len;
+        break;
+
+    case NGX_STREAM_TROJAN_ADDR_DOMAIN:
+        if (addr->host_len == 0 || addr->host_len > 255
+            || addr->wire_len != 1 + 1 + addr->host_len + 2)
+        {
+            return -1;
+        }
+        addr_len = addr->wire_len;
+        break;
+
+    default:
+        return -1;
+    }
+
+    if (out_len < addr_len + 4 + payload_len) {
         return -1;
     }
 
@@ -515,9 +544,13 @@ ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uin
 
     switch (addr->type) {
     case NGX_STREAM_TROJAN_ADDR_IPV4:
+        memcpy(out + pos, addr->host, 4);
+        pos += 4;
+        break;
+
     case NGX_STREAM_TROJAN_ADDR_IPV6:
-        memcpy(out + pos, addr->host, addr->host_len);
-        pos += addr->host_len;
+        memcpy(out + pos, addr->host, 16);
+        pos += 16;
         break;
 
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
