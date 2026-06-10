@@ -312,6 +312,9 @@ struct ngx_stream_trojan_ctx_s {
 
     ngx_peer_connection_t       peer;
     ngx_str_t                   peer_name;
+    ngx_addr_t                  *connect_addrs;
+    ngx_uint_t                   connect_naddrs;
+    ngx_uint_t                   connect_index;
     ngx_connection_t           *upstream;
 
     ngx_buf_t                  *client_buffer;
@@ -484,6 +487,8 @@ static ngx_int_t ngx_stream_trojan_start_doh_resolver(
     ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_resolve_data_t *data);
 static void ngx_stream_trojan_doh_resolve_handler(void *cb_data,
     ngx_int_t status, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
+static ngx_int_t ngx_stream_trojan_connect_next(
+    ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_connect(ngx_stream_trojan_ctx_t *ctx,
     ngx_addr_t *addr);
 static void ngx_stream_trojan_socks5_connect(ngx_stream_trojan_ctx_t *ctx,
@@ -646,6 +651,10 @@ static ngx_int_t ngx_stream_trojan_mux_socks5_prepare_greeting(
     ngx_stream_trojan_mux_stream_t *stream);
 static ngx_int_t ngx_stream_trojan_mux_socks5_prepare_auth(
     ngx_stream_trojan_mux_stream_t *stream);
+static ngx_int_t ngx_stream_trojan_resolver_addrs_to_ngx_addrs(
+    ngx_pool_t *pool, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs,
+    uint16_t port, ngx_uint_t ip_prefer, ngx_addr_t **out,
+    ngx_uint_t *nout);
 static ngx_int_t ngx_stream_trojan_mux_socks5_prepare_request(
     ngx_stream_trojan_mux_stream_t *stream);
 static ngx_int_t ngx_stream_trojan_addr_to_ngx_addr(ngx_pool_t *pool,
@@ -3542,22 +3551,24 @@ ngx_stream_trojan_resolve_complete(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_resolve_data_t *data,
     ngx_resolver_addr_t *addrs, ngx_uint_t naddrs)
 {
-    ngx_addr_t  addr;
+    ngx_addr_t   *tcp_addrs;
+    ngx_uint_t    ntcp_addrs;
 
     if (data->type == ngx_stream_trojan_resolve_tcp) {
         if (naddrs == 0
-            || ngx_stream_trojan_resolver_addr_to_ngx_addr(
-                   ctx->session->connection->pool,
-                   ngx_stream_trojan_resolver_pick_addr(
-                       addrs, naddrs, data->ip_prefer),
-                   data->port, &addr)
+            || ngx_stream_trojan_resolver_addrs_to_ngx_addrs(
+                   ctx->session->connection->pool, addrs, naddrs,
+                   data->port, data->ip_prefer, &tcp_addrs, &ntcp_addrs)
                != NGX_OK)
         {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
 
-        ngx_stream_trojan_connect(ctx, &addr);
+        ctx->connect_addrs = tcp_addrs;
+        ctx->connect_naddrs = ntcp_addrs;
+        ctx->connect_index = 0;
+        ngx_stream_trojan_connect(ctx, &ctx->connect_addrs[0]);
         return;
     }
 
@@ -3615,6 +3626,27 @@ ngx_stream_trojan_doh_resolve_handler(void *cb_data, ngx_int_t status,
     ngx_stream_trojan_resolve_complete(ctx, data, addrs, naddrs);
 }
 
+static ngx_int_t
+ngx_stream_trojan_connect_next(ngx_stream_trojan_ctx_t *ctx)
+{
+    if (ctx->connect_addrs == NULL
+        || ctx->connect_index + 1 >= ctx->connect_naddrs)
+    {
+        return NGX_DECLINED;
+    }
+
+    if (ctx->upstream) {
+        ngx_close_connection(ctx->upstream);
+        ctx->upstream = NULL;
+    }
+
+    ctx->connect_index++;
+    ngx_stream_trojan_connect(ctx, &ctx->connect_addrs[ctx->connect_index]);
+
+    return NGX_OK;
+}
+
+
 static void
 ngx_stream_trojan_connect(ngx_stream_trojan_ctx_t *ctx, ngx_addr_t *addr)
 {
@@ -3639,6 +3671,10 @@ ngx_stream_trojan_connect(ngx_stream_trojan_ctx_t *ctx, ngx_addr_t *addr)
     rc = ngx_event_connect_peer(&ctx->peer);
 
     if (rc == NGX_ERROR || rc == NGX_BUSY || rc == NGX_DECLINED) {
+        if (ngx_stream_trojan_connect_next(ctx) == NGX_OK) {
+            return;
+        }
+
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
@@ -4786,6 +4822,10 @@ ngx_stream_trojan_peer_handler(ngx_event_t *ev)
         }
 
         if (ngx_stream_trojan_test_connect(pc) != NGX_OK) {
+            if (ngx_stream_trojan_connect_next(ctx) == NGX_OK) {
+                return;
+            }
+
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
@@ -7543,6 +7583,81 @@ ngx_stream_trojan_resolver_pick_addr(ngx_resolver_addr_t *addrs,
 #endif
 
     return &addrs[0];
+}
+
+static ngx_int_t
+ngx_stream_trojan_resolver_addrs_to_ngx_addrs(ngx_pool_t *pool,
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, uint16_t port,
+    ngx_uint_t ip_prefer, ngx_addr_t **out, ngx_uint_t *nout)
+{
+    ngx_uint_t   i, n;
+    ngx_addr_t  *dst;
+
+    if (addrs == NULL || naddrs == 0 || out == NULL || nout == NULL) {
+        return NGX_ERROR;
+    }
+
+    dst = ngx_pcalloc(pool, naddrs * sizeof(ngx_addr_t));
+    if (dst == NULL) {
+        return NGX_ERROR;
+    }
+
+    n = 0;
+
+    if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV4) {
+        for (i = 0; i < naddrs; i++) {
+            if (addrs[i].sockaddr->sa_family == AF_INET
+                && ngx_stream_trojan_resolver_addr_to_ngx_addr(
+                       pool, &addrs[i], port, &dst[n])
+                   == NGX_OK)
+            {
+                n++;
+            }
+        }
+    }
+
+#if (NGX_HAVE_INET6)
+    if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV6) {
+        for (i = 0; i < naddrs; i++) {
+            if (addrs[i].sockaddr->sa_family == AF_INET6
+                && ngx_stream_trojan_resolver_addr_to_ngx_addr(
+                       pool, &addrs[i], port, &dst[n])
+                   == NGX_OK)
+            {
+                n++;
+            }
+        }
+    }
+#endif
+
+    for (i = 0; i < naddrs; i++) {
+        if ((ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV4
+             && addrs[i].sockaddr->sa_family == AF_INET)
+#if (NGX_HAVE_INET6)
+            || (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV6
+                && addrs[i].sockaddr->sa_family == AF_INET6)
+#endif
+           )
+        {
+            continue;
+        }
+
+        if (ngx_stream_trojan_resolver_addr_to_ngx_addr(pool, &addrs[i],
+                                                        port, &dst[n])
+            == NGX_OK)
+        {
+            n++;
+        }
+    }
+
+    if (n == 0) {
+        return NGX_ERROR;
+    }
+
+    *out = dst;
+    *nout = n;
+
+    return NGX_OK;
 }
 
 

@@ -774,7 +774,7 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     doh->peer.get = ngx_stream_trojan_doh_get_peer;
     doh->peer.data = doh;
     doh->peer.type = SOCK_STREAM;
-    doh->peer.tries = 1;
+    doh->peer.tries = doh_conf->naddrs;
     doh->peer.start_time = ngx_current_msec;
 
     rc = ngx_event_connect_peer(&doh->peer);
