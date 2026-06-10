@@ -429,6 +429,8 @@ static ngx_int_t ngx_stream_trojan_http_in_prepare_response(
     ngx_stream_trojan_ctx_t *ctx, uint16_t status);
 static ngx_int_t ngx_stream_trojan_init_udp_buffers(
     ngx_stream_trojan_ctx_t *ctx);
+static void ngx_stream_trojan_refresh_udp_timeout(
+    ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_process_request(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_process_websocket_handshake(
     ngx_stream_trojan_ctx_t *ctx);
@@ -1782,6 +1784,21 @@ ngx_stream_trojan_init_udp_buffers(ngx_stream_trojan_ctx_t *ctx)
     }
 
     return NGX_OK;
+}
+
+static void
+ngx_stream_trojan_refresh_udp_timeout(ngx_stream_trojan_ctx_t *ctx)
+{
+    ngx_connection_t  *c, *pc;
+
+    c = ctx->session->connection;
+    pc = ctx->upstream;
+
+    ngx_add_timer(c->read, ctx->conf->udp_timeout);
+
+    if (pc && pc->read) {
+        ngx_add_timer(pc->read, ctx->conf->udp_timeout);
+    }
 }
 
 
@@ -7815,6 +7832,7 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
         }
 
         ctx->udp_in_len += (size_t) n;
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
     }
 }
 
@@ -8091,6 +8109,7 @@ ngx_stream_trojan_forward_socks5_udp_packet(ngx_stream_trojan_ctx_t *ctx,
                       err, "sendto() to socks5 udp relay failed");
         return NGX_ERROR;
     }
+    ngx_stream_trojan_refresh_udp_timeout(ctx);
 
     return NGX_OK;
 }
@@ -8254,7 +8273,7 @@ ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
         }
 
         b->pos += n;
-    }
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
 
     b->pos = b->start;
     b->last = b->start;
@@ -8708,6 +8727,7 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
 
         if (ngx_stream_trojan_sockaddr_to_addr((struct sockaddr *) &ss,
                                                socklen, &addr)
@@ -8816,6 +8836,7 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
 
         if (ngx_stream_trojan_socks5_parse_udp_packet(ctx->udp_out,
                                                       (size_t) n, &frame)
@@ -8911,6 +8932,7 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
                           "recvfrom() socks5 udp relay failed");
             break;
         }
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
 
         if (ngx_stream_trojan_socks5_parse_udp_packet(ctx->udp_out,
                                                       (size_t) n, &frame)
@@ -9038,6 +9060,8 @@ ngx_stream_trojan_socks5_udp_control_handler(ngx_event_t *ev)
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
+
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
     }
 
     if (ngx_handle_read_event(pc->read, 0) != NGX_OK) {
@@ -9092,6 +9116,8 @@ ngx_stream_trojan_socks5_in_udp_control_handler(ngx_event_t *ev)
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
             return;
         }
+
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
     }
 
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
