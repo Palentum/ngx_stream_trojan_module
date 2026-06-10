@@ -19,6 +19,8 @@
 
 
 #define NGX_STREAM_TROJAN_DEFAULT_BUFFER_SIZE 32768
+#define NGX_STREAM_TROJAN_MIN_BUFFER_SIZE 4096
+#define NGX_STREAM_TROJAN_MAX_BUFFER_SIZE (1024 * 1024)
 #define NGX_STREAM_TROJAN_SOCKS5_BUFFER_SIZE 1024
 #define NGX_STREAM_TROJAN_UDP_BUFFER_SIZE \
     (NGX_STREAM_TROJAN_MAX_UDP_PAYLOAD + NGX_STREAM_TROJAN_MAX_ADDR_LEN + 4)
@@ -9303,6 +9305,16 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_msec_value(conf->udp_timeout, prev->udp_timeout, 600000);
     ngx_conf_merge_size_value(conf->buffer_size, prev->buffer_size,
                               NGX_STREAM_TROJAN_DEFAULT_BUFFER_SIZE);
+
+    if (conf->buffer_size < NGX_STREAM_TROJAN_MIN_BUFFER_SIZE
+        || conf->buffer_size > NGX_STREAM_TROJAN_MAX_BUFFER_SIZE)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "trojan_buffer_size must be between %uz and %uz",
+                           (size_t) NGX_STREAM_TROJAN_MIN_BUFFER_SIZE,
+                           (size_t) NGX_STREAM_TROJAN_MAX_BUFFER_SIZE);
+        return NGX_CONF_ERROR;
+    }
 
     if (conf->keys == NULL) {
         conf->keys = prev->keys;
