@@ -733,10 +733,9 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     uint16_t                      dns_id;
     size_t                        qlen;
 
-    if (ctxp == NULL) {
-        return NGX_ERROR;
+    if (ctxp == NULL || *ctxp != NULL) {
+        return NGX_BUSY;
     }
-    *ctxp = NULL;
 
     pool = ngx_create_pool(4096, log);
     if (pool == NULL) return NGX_ERROR;

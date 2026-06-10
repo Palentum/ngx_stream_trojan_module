@@ -3294,6 +3294,9 @@ ngx_stream_trojan_start_doh_resolver(ngx_stream_trojan_ctx_t *ctx,
     {
         return NGX_ERROR;
     }
+    if (ctx->doh_ctx != NULL) {
+        return NGX_BUSY;
+    }
 
     ctx->state = ngx_stream_trojan_state_resolving;
 
@@ -8050,6 +8053,7 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
 #endif
     struct sockaddr     *sa;
     socklen_t            socklen;
+    ngx_int_t           rc;
     ngx_stream_trojan_dns_rule_group_t *dns_rule;
 
     if (ngx_stream_trojan_outbound_type(ctx)
@@ -8102,9 +8106,12 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
                     return NGX_ERROR;
                 }
 
-                if (ngx_stream_trojan_start_doh_resolver(ctx, udata)
-                    != NGX_OK)
-                {
+                rc = ngx_stream_trojan_start_doh_resolver(ctx, udata);
+                if (rc == NGX_BUSY || rc == NGX_AGAIN) {
+                    return NGX_AGAIN;
+                }
+
+                if (rc != NGX_OK) {
                     return NGX_ERROR;
                 }
 
@@ -8141,8 +8148,12 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
                 return NGX_ERROR;
             }
 
-            if (ngx_stream_trojan_start_doh_resolver(ctx, udata) != NGX_OK)
-            {
+            rc = ngx_stream_trojan_start_doh_resolver(ctx, udata);
+            if (rc == NGX_BUSY || rc == NGX_AGAIN) {
+                return NGX_AGAIN;
+            }
+
+            if (rc != NGX_OK) {
                 return NGX_ERROR;
             }
 
@@ -9100,7 +9111,7 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
             continue;
         }
 
-        if (ctx->resolver_ctx != NULL) {
+        if (ctx->resolver_ctx != NULL || ctx->doh_ctx != NULL) {
             continue;
         }
 
@@ -9168,7 +9179,15 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
             continue;
         }
 
-        (void) ngx_stream_trojan_send_udp_frame(ctx, &frame);
+        rc = ngx_stream_trojan_send_udp_frame(ctx, &frame);
+        if (rc == NGX_AGAIN) {
+            break;
+        }
+
+        if (rc != NGX_OK) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            return;
+        }
     }
 
 
