@@ -318,6 +318,7 @@ struct ngx_stream_trojan_ctx_s {
     ngx_buf_t                  *upstream_buffer;
     ngx_buf_t                  *pending_to_upstream;
     ngx_buf_t                  *pending_to_client;
+    ngx_uint_t                  upstream_write_shutdown;
 
     ngx_connection_t           *udp4;
 #if (NGX_HAVE_INET6)
@@ -4874,6 +4875,15 @@ ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
     {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
+    }
+
+    if (client_eof && !ctx->upstream_write_shutdown
+        && (ctx->pending_to_upstream == NULL
+            || ctx->pending_to_upstream->pos == ctx->pending_to_upstream->last)
+        && ctx->client_buffer->pos == ctx->client_buffer->last)
+    {
+        (void) shutdown(pc->fd, SHUT_WR);
+        ctx->upstream_write_shutdown = 1;
     }
 
     if (client_eof && upstream_eof
