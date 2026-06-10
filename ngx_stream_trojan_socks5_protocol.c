@@ -187,7 +187,7 @@ ngx_stream_trojan_socks5_build_request(uint8_t command,
     const ngx_stream_trojan_addr_t *addr, uint8_t *out, size_t out_len,
     size_t *written)
 {
-    if (addr == NULL || out == NULL || written == NULL
+    if (addr == NULL || out == NULL || written == NULL || out_len < 4
         || (command != NGX_STREAM_TROJAN_SOCKS5_CMD_CONNECT
             && command != NGX_STREAM_TROJAN_SOCKS5_CMD_UDP_ASSOCIATE))
     {
@@ -309,7 +309,7 @@ ngx_stream_trojan_socks5_build_response(uint8_t status,
 {
     size_t req_len;
 
-    if (addr == NULL || out == NULL || written == NULL
+    if (addr == NULL || out == NULL || written == NULL || out_len < 4
         || out_len < 3 + addr->wire_len)
     {
         return -1;
@@ -322,7 +322,7 @@ ngx_stream_trojan_socks5_build_response(uint8_t status,
 
     switch (addr->type) {
     case NGX_STREAM_TROJAN_ADDR_IPV4:
-        if (addr->host_len != 4) {
+        if (addr->host_len != 4 || addr->wire_len != 1 + 4 + 2) {
             return -1;
         }
         memcpy(out + 4, addr->host, 4);
@@ -332,7 +332,7 @@ ngx_stream_trojan_socks5_build_response(uint8_t status,
         break;
 
     case NGX_STREAM_TROJAN_ADDR_IPV6:
-        if (addr->host_len != 16) {
+        if (addr->host_len != 16 || addr->wire_len != 1 + 16 + 2) {
             return -1;
         }
         memcpy(out + 4, addr->host, 16);
@@ -342,7 +342,9 @@ ngx_stream_trojan_socks5_build_response(uint8_t status,
         break;
 
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
-        if (addr->host_len == 0 || addr->host_len > 255) {
+        if (addr->host_len == 0 || addr->host_len > 255
+            || addr->wire_len != 1 + 1 + addr->host_len + 2)
+        {
             return -1;
         }
         out[4] = (uint8_t) addr->host_len;
@@ -420,7 +422,7 @@ ngx_stream_trojan_socks5_build_udp_packet(
 {
     size_t req_len;
 
-    if (addr == NULL || out == NULL || written == NULL
+    if (addr == NULL || out == NULL || written == NULL || out_len < 4
         || (payload_len && payload == NULL)
         || out_len < 3 + addr->wire_len + payload_len)
     {
@@ -435,7 +437,7 @@ ngx_stream_trojan_socks5_build_udp_packet(
 
     switch (addr->type) {
     case NGX_STREAM_TROJAN_ADDR_IPV4:
-        if (addr->host_len != 4) {
+        if (addr->host_len != 4 || addr->wire_len != 1 + 4 + 2) {
             return -1;
         }
         memcpy(out + 4, addr->host, 4);
@@ -445,7 +447,7 @@ ngx_stream_trojan_socks5_build_udp_packet(
         break;
 
     case NGX_STREAM_TROJAN_ADDR_IPV6:
-        if (addr->host_len != 16) {
+        if (addr->host_len != 16 || addr->wire_len != 1 + 16 + 2) {
             return -1;
         }
         memcpy(out + 4, addr->host, 16);
@@ -455,7 +457,9 @@ ngx_stream_trojan_socks5_build_udp_packet(
         break;
 
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
-        if (addr->host_len == 0 || addr->host_len > 255) {
+        if (addr->host_len == 0 || addr->host_len > 255
+            || addr->wire_len != 1 + 1 + addr->host_len + 2)
+        {
             return -1;
         }
         out[4] = (uint8_t) addr->host_len;
