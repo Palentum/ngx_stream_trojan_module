@@ -8173,7 +8173,6 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
         return NGX_ERROR;
     }
 
-send:
     return ngx_stream_trojan_send_udp_sockaddr(ctx, sa, socklen,
                                                frame->payload,
                                                frame->payload_len);
