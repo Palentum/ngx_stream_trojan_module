@@ -695,7 +695,7 @@ ngx_stream_trojan_doh_test_connect(ngx_connection_t *c)
         if (err) {
             c->write->kq_errno = 0;
             c->write->pending_eof = 0;
-            ngx_log_error(NGX_LOG_ERR, c->log, err,
+            ngx_log_error(NGX_LOG_INFO, c->log, err,
                           "DoH: connect failed");
             return NGX_ERROR;
         }
@@ -710,7 +710,7 @@ ngx_stream_trojan_doh_test_connect(ngx_connection_t *c)
         }
 
         if (err) {
-            ngx_log_error(NGX_LOG_ERR, c->log, err,
+            ngx_log_error(NGX_LOG_INFO, c->log, err,
                           "DoH: connect failed");
             return NGX_ERROR;
         }
@@ -828,7 +828,7 @@ ngx_stream_trojan_doh_event_handler(ngx_event_t *ev)
     doh = c->data;
 
     if (ev->timedout) {
-        ngx_log_error(NGX_LOG_ERR, doh->log, NGX_ETIMEDOUT,
+        ngx_log_error(NGX_LOG_INFO, doh->log, NGX_ETIMEDOUT,
                       "DoH: connect to %V timed out", &doh->conf->host);
         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
         return;
@@ -1205,7 +1205,7 @@ ngx_stream_trojan_doh_parse_done(ngx_stream_trojan_doh_ctx_t *doh)
 
     if (rc != NGX_OK) {
         if (rc != NGX_DECLINED) {
-            ngx_log_error(NGX_LOG_ERR, doh->log, 0,
+            ngx_log_error(NGX_LOG_INFO, doh->log, 0,
                           "DoH: failed to parse DNS response (id=%ud)",
                           doh->dns_id);
         }
@@ -1318,7 +1318,7 @@ parse_headers:
                     end = doh->recv_buf + doh->recv_pos;
 
                     if (doh->http_status < 200 || doh->http_status >= 300) {
-                        ngx_log_error(NGX_LOG_ERR, doh->log, 0,
+                        ngx_log_error(NGX_LOG_INFO, doh->log, 0,
                                       "DoH: HTTP status %ui",
                                       doh->http_status);
                         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);

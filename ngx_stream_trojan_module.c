@@ -3543,7 +3543,7 @@ ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx)
     ctx->resolver_ctx = NULL;
 
     if (rctx->state) {
-        ngx_log_error(NGX_LOG_ERR, ctx->session->connection->log, 0,
+        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log, 0,
                       "%V could not be resolved (%i: %s)",
                       &rctx->name, rctx->state,
                       ngx_resolver_strerror(rctx->state));
@@ -3628,7 +3628,7 @@ ngx_stream_trojan_doh_resolve_handler(void *cb_data, ngx_int_t status,
             }
         }
 
-        ngx_log_error(NGX_LOG_ERR, ctx->session->connection->log, 0,
+        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log, 0,
                       "DoH: resolution failed");
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
@@ -6552,7 +6552,7 @@ ngx_stream_trojan_mux_resolve_handler(ngx_resolver_ctx_t *rctx)
     stream->resolver_ctx = NULL;
 
     if (rctx->state) {
-        ngx_log_error(NGX_LOG_ERR, stream->ctx->session->connection->log, 0,
+        ngx_log_error(NGX_LOG_INFO, stream->ctx->session->connection->log, 0,
                       "%V could not be resolved (%i: %s)",
                       &rctx->name, rctx->state,
                       ngx_resolver_strerror(rctx->state));
@@ -6617,7 +6617,7 @@ ngx_stream_trojan_mux_doh_resolve_handler(void *cb_data, ngx_int_t status,
             }
         }
 
-        ngx_log_error(NGX_LOG_ERR, stream->ctx->session->connection->log, 0,
+        ngx_log_error(NGX_LOG_INFO, stream->ctx->session->connection->log, 0,
                       "DoH: mux resolution failed");
         ngx_stream_trojan_mux_close_stream(stream, 1);
         return;
@@ -8172,7 +8172,7 @@ ngx_stream_trojan_forward_socks5_udp_packet(ngx_stream_trojan_ctx_t *ctx,
             return NGX_OK;
         }
 
-        ngx_log_error(NGX_LOG_ERR, ctx->session->connection->log,
+        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log,
                       err, "sendto() to socks5 udp relay failed");
         return NGX_ERROR;
     }
@@ -8312,7 +8312,7 @@ ngx_stream_trojan_send_udp_sockaddr(ngx_stream_trojan_ctx_t *ctx,
             return NGX_OK;
         }
 
-        ngx_log_error(NGX_LOG_ERR, ctx->session->connection->log,
+        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log,
                       err, "sendto() failed");
         return NGX_ERROR;
     }
@@ -8827,7 +8827,7 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
                 break;
             }
 
-            ngx_log_error(NGX_LOG_ERR, c->log, err, "recvfrom() failed");
+            ngx_log_error(NGX_LOG_INFO, c->log, err, "recvfrom() failed");
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
@@ -8871,7 +8871,7 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
                        (struct sockaddr *) &ctx->socks5_udp_client,
                        ctx->socks5_udp_client_socklen);
             if (n == -1 && ngx_socket_errno != NGX_EAGAIN) {
-                ngx_log_error(NGX_LOG_ERR, c->log, ngx_socket_errno,
+                ngx_log_error(NGX_LOG_INFO, c->log, ngx_socket_errno,
                               "sendto() socks5 udp client failed");
                 ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
@@ -8932,7 +8932,7 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
                 break;
             }
 
-            ngx_log_error(NGX_LOG_ERR, c->log, err,
+            ngx_log_error(NGX_LOG_INFO, c->log, err,
                           "recvfrom() from socks5 udp relay failed");
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
@@ -8955,7 +8955,7 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
                        (struct sockaddr *) &ctx->socks5_udp_client,
                        ctx->socks5_udp_client_socklen);
             if (n == -1 && ngx_socket_errno != NGX_EAGAIN) {
-                ngx_log_error(NGX_LOG_ERR, c->log, ngx_socket_errno,
+                ngx_log_error(NGX_LOG_INFO, c->log, ngx_socket_errno,
                               "sendto() socks5 udp client failed");
                 ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
@@ -9037,7 +9037,7 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
                 break;
             }
 
-            ngx_log_error(NGX_LOG_ERR, uc->log, err,
+            ngx_log_error(NGX_LOG_INFO, uc->log, err,
                           "recvfrom() socks5 udp relay failed");
             break;
         }
@@ -9123,7 +9123,7 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
 
 
     if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
-        ngx_log_error(NGX_LOG_ERR, uc->log, 0,
+        ngx_log_error(NGX_LOG_INFO, uc->log, 0,
                       "ngx_handle_read_event() socks5 udp relay failed");
     }
 }
