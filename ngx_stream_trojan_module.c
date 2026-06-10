@@ -3,7 +3,6 @@
 #include <ngx_stream.h>
 
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <sys/socket.h>
 
 #include "ngx_stream_trojan_protocol.h"
@@ -7411,90 +7410,14 @@ static ngx_int_t
 ngx_stream_trojan_resolve_addr_prefer(ngx_pool_t *pool, ngx_log_t *log,
     ngx_stream_trojan_addr_t *addr, ngx_uint_t ip_prefer, ngx_addr_t *out)
 {
-    char                  host[256];
-    char                  service[6];
-    int                   rc;
-    struct addrinfo       hints;
-    struct addrinfo      *res, *rp, *selected;
-    struct sockaddr      *sa;
-    socklen_t             socklen;
+    (void) log;
+    (void) ip_prefer;
 
     if (addr->type != NGX_STREAM_TROJAN_ADDR_DOMAIN) {
         return ngx_stream_trojan_addr_to_ngx_addr(pool, addr, out);
     }
 
-    if (addr->host_len == 0 || addr->host_len >= sizeof(host)) {
-        return NGX_ERROR;
-    }
-
-    ngx_memcpy(host, addr->host, addr->host_len);
-    host[addr->host_len] = '\0';
-    ngx_snprintf((u_char *) service, sizeof(service), "%ui%Z",
-                 (ngx_uint_t) addr->port);
-
-    ngx_memzero(&hints, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    rc = getaddrinfo(host, service, &hints, &res);
-    if (rc != 0) {
-        ngx_log_error(NGX_LOG_ERR, log, 0,
-                      "getaddrinfo(\"%s\") failed: %s", host,
-                      gai_strerror(rc));
-        return NGX_ERROR;
-    }
-
-    selected = NULL;
-
-    for (rp = res; rp != NULL; rp = rp->ai_next) {
-        if (rp->ai_family == AF_INET || rp->ai_family == AF_INET6) {
-            if (selected == NULL) {
-                selected = rp;
-            }
-
-            if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV4
-                && rp->ai_family == AF_INET)
-            {
-                selected = rp;
-                break;
-            }
-
-#if (NGX_HAVE_INET6)
-            if (ip_prefer == NGX_STREAM_TROJAN_IP_PREFER_IPV6
-                && rp->ai_family == AF_INET6)
-            {
-                selected = rp;
-                break;
-            }
-#endif
-        }
-    }
-
-    if (selected != NULL) {
-        socklen = selected->ai_addrlen;
-        sa = ngx_pnalloc(pool, socklen);
-        if (sa == NULL) {
-            freeaddrinfo(res);
-            return NGX_ERROR;
-        }
-
-        ngx_memcpy(sa, selected->ai_addr, socklen);
-        out->sockaddr = sa;
-        out->socklen = socklen;
-        out->name.data = ngx_pnalloc(pool, NGX_SOCKADDR_STRLEN);
-        if (out->name.data == NULL) {
-            freeaddrinfo(res);
-            return NGX_ERROR;
-        }
-        out->name.len = ngx_sock_ntop(out->sockaddr, out->socklen,
-                                      out->name.data,
-                                      NGX_SOCKADDR_STRLEN, 1);
-        freeaddrinfo(res);
-        return NGX_OK;
-    }
-
-    freeaddrinfo(res);
-    return NGX_ERROR;
+    return NGX_DECLINED;
 }
 
 
@@ -7842,17 +7765,11 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_udp_frame_t *frame)
 {
     struct sockaddr_in   sin;
-    char                 host[256];
-    char                 service[6];
-    int                  rc;
-    struct addrinfo      hints;
-    struct addrinfo     *res, *rp;
 #if (NGX_HAVE_INET6)
     struct sockaddr_in6  sin6;
 #endif
     struct sockaddr     *sa;
     socklen_t            socklen;
-    ngx_uint_t           free_res;
     ngx_stream_trojan_dns_rule_group_t *dns_rule;
 
     if (ngx_stream_trojan_outbound_type(ctx)
@@ -7868,8 +7785,6 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
         return ngx_stream_trojan_send_socks5_udp_frame(ctx, frame);
     }
 
-    res = NULL;
-    free_res = 0;
 
     switch (frame->addr.type) {
     case NGX_STREAM_TROJAN_ADDR_IPV4:
@@ -7972,79 +7887,6 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
             return NGX_AGAIN;
         }
 
-        if (frame->addr.host_len == 0 || frame->addr.host_len >= sizeof(host)) {
-            return NGX_ERROR;
-        }
-
-        ngx_memcpy(host, frame->addr.host, frame->addr.host_len);
-        host[frame->addr.host_len] = '\0';
-        ngx_snprintf((u_char *) service, sizeof(service), "%ui%Z",
-                     (ngx_uint_t) frame->addr.port);
-
-        ngx_memzero(&hints, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_DGRAM;
-
-        rc = getaddrinfo(host, service, &hints, &res);
-        if (rc != 0) {
-            ngx_log_error(NGX_LOG_ERR, ctx->session->connection->log, 0,
-                          "getaddrinfo(\"%s\") failed: %s", host,
-                          gai_strerror(rc));
-            return NGX_ERROR;
-        }
-
-        rp = NULL;
-
-        if (ngx_stream_trojan_current_ip_prefer(ctx)
-            == NGX_STREAM_TROJAN_IP_PREFER_IPV4)
-        {
-            for (rp = res; rp != NULL; rp = rp->ai_next) {
-                if (rp->ai_family == AF_INET) {
-                    break;
-                }
-            }
-        }
-
-#if (NGX_HAVE_INET6)
-        if (rp == NULL
-            && ngx_stream_trojan_current_ip_prefer(ctx)
-               == NGX_STREAM_TROJAN_IP_PREFER_IPV6)
-        {
-            for (rp = res; rp != NULL; rp = rp->ai_next) {
-                if (rp->ai_family == AF_INET6) {
-                    break;
-                }
-            }
-        }
-#endif
-
-        if (rp == NULL) {
-            for (rp = res; rp != NULL; rp = rp->ai_next) {
-                if (rp->ai_family == AF_INET || rp->ai_family == AF_INET6) {
-                    break;
-                }
-            }
-        }
-
-        if (rp != NULL) {
-            if (rp->ai_family == AF_INET) {
-                sa = rp->ai_addr;
-                socklen = rp->ai_addrlen;
-                free_res = 1;
-                goto send;
-            }
-
-#if (NGX_HAVE_INET6)
-            if (rp->ai_family == AF_INET6) {
-                sa = rp->ai_addr;
-                socklen = rp->ai_addrlen;
-                free_res = 1;
-                goto send;
-            }
-#endif
-        }
-
-        freeaddrinfo(res);
         return NGX_ERROR;
 
     default:
@@ -8052,13 +7894,9 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     }
 
 send:
-    rc = ngx_stream_trojan_send_udp_sockaddr(ctx, sa, socklen, frame->payload,
-                                             frame->payload_len);
-    if (free_res) {
-        freeaddrinfo(res);
-    }
-
-    return rc;
+    return ngx_stream_trojan_send_udp_sockaddr(ctx, sa, socklen,
+                                               frame->payload,
+                                               frame->payload_len);
 }
 
 
