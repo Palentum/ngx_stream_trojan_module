@@ -4812,11 +4812,9 @@ ngx_stream_trojan_set_proxy_timeout(ngx_stream_trojan_ctx_t *ctx)
     c = ctx->session->connection;
     pc = ctx->upstream;
 
-    if (!c->read->timer_set) {
-        ngx_add_timer(c->read, ctx->conf->timeout);
-    }
+    ngx_add_timer(c->read, ctx->conf->timeout);
 
-    if (pc && !pc->read->timer_set) {
+    if (pc) {
         ngx_add_timer(pc->read, ctx->conf->timeout);
     }
 }
@@ -4912,7 +4910,7 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
             }
 
             buf->pos += n;
-        }
+            ngx_stream_trojan_set_proxy_timeout(ctx);
 
         buf->pos = buf->start;
         buf->last = buf->start;
@@ -4958,6 +4956,7 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
         }
 
         buf->last += n;
+        ngx_stream_trojan_set_proxy_timeout(ctx);
         bytes += (size_t) n;
         loops++;
     }
