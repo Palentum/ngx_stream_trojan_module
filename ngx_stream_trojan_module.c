@@ -316,6 +316,10 @@ struct ngx_stream_trojan_ctx_s {
     size_t                      request_len;
     u_char                      command;
     ngx_stream_trojan_addr_t    target;
+    ngx_stream_trojan_addr_t    route_cache_target;
+    ngx_uint_t                  route_cache_command;
+    ngx_uint_t                  route_cache_valid;
+    ngx_stream_trojan_outbound_t *route_cache_outbound;
 
     ngx_peer_connection_t       peer;
     ngx_str_t                   peer_name;
@@ -4345,6 +4349,18 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_outbound_t *outbound;
 
     if (ctx->conf->route_enable) {
+        if (ctx->route_cache_valid
+            && ctx->route_cache_command == command
+            && ctx->route_cache_target.type == target->type
+            && ctx->route_cache_target.port == target->port
+            && ctx->route_cache_target.host_len == target->host_len
+            && ngx_memcmp(ctx->route_cache_target.host, target->host,
+                          target->host_len)
+               == 0)
+        {
+            return ctx->route_cache_outbound;
+        }
+
         if (ctx->conf->routes == NULL || ctx->conf->routes->nelts == 0) {
             return NULL;
         }
@@ -4356,14 +4372,23 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
                 continue;
             }
 
-            return ngx_stream_trojan_select_route_outbound(&route[i],
-                                                           ctx->outbound,
-                                                           command, target);
+            outbound = ngx_stream_trojan_select_route_outbound(&route[i],
+                                                               ctx->outbound,
+                                                               command, target);
+            ctx->route_cache_target = *target;
+            ctx->route_cache_command = command;
+            ctx->route_cache_outbound = outbound;
+            ctx->route_cache_valid = 1;
+            return outbound;
         }
+
+        ctx->route_cache_target = *target;
+        ctx->route_cache_command = command;
+        ctx->route_cache_outbound = NULL;
+        ctx->route_cache_valid = 1;
 
         return NULL;
     }
-
     if (ctx->conf->outbounds == NULL
         || ctx->conf->outbounds->nelts == 0)
     {

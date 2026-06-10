@@ -27,6 +27,10 @@ typedef struct {
 struct ngx_stream_trojan_dns_rules_conf_s {
     ngx_array_t     *groups;
     ngx_str_t        path;
+    u_char           cache_host[256];
+    size_t           cache_host_len;
+    ngx_stream_trojan_dns_rule_group_t *cache_group;
+    ngx_uint_t       cache_valid;
 };
 
 
@@ -915,6 +919,13 @@ ngx_stream_trojan_dns_rules_match(ngx_stream_trojan_dns_rules_conf_t *rules,
     if (host_len > 1 && host[host_len - 1] == '.') {
         host_len--;
     }
+    if (rules->cache_valid
+        && rules->cache_host_len == host_len
+        && ngx_strncasecmp(rules->cache_host, (u_char *) host, host_len) == 0)
+    {
+        return rules->cache_group;
+    }
+
 
     groups = rules->groups->elts;
 
@@ -925,9 +936,23 @@ ngx_stream_trojan_dns_rules_match(ngx_stream_trojan_dns_rules_conf_t *rules,
             if (ngx_stream_trojan_dns_rules_match_rule(&rule[j], host,
                                                        host_len))
             {
+                if (host_len <= sizeof(rules->cache_host)) {
+                    ngx_memcpy(rules->cache_host, host, host_len);
+                    rules->cache_host_len = host_len;
+                    rules->cache_group = &groups[i];
+                    rules->cache_valid = 1;
+                }
+
                 return &groups[i];
             }
         }
+    }
+
+    if (host_len <= sizeof(rules->cache_host)) {
+        ngx_memcpy(rules->cache_host, host, host_len);
+        rules->cache_host_len = host_len;
+        rules->cache_group = NULL;
+        rules->cache_valid = 1;
     }
 
     return NULL;
