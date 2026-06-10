@@ -9657,6 +9657,12 @@ ngx_stream_trojan_password(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     value = cf->args->elts;
 
     for (i = 1; i < cf->args->nelts; i++) {
+        if (value[i].len == 0) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "trojan_password must not be empty");
+            return NGX_CONF_ERROR;
+        }
+
         key = ngx_array_push(tscf->keys);
         if (key == NULL) {
             return NGX_CONF_ERROR;
