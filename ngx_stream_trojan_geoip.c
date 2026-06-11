@@ -28,9 +28,18 @@ struct ngx_stream_trojan_geoip_entry_s {
 };
 
 
+typedef struct {
+    ngx_uint_t                      valid;
+    ngx_uint_t                      hash;
+    ngx_stream_trojan_geoip_entry_t *entry;
+} ngx_stream_trojan_geoip_code_index_t;
+
+
 struct ngx_stream_trojan_geoip_s {
     ngx_array_t *entries;
     ngx_str_t    path;
+    ngx_stream_trojan_geoip_code_index_t *code_index;
+    ngx_uint_t   code_index_slots;
 };
 
 
@@ -47,6 +56,10 @@ static ngx_int_t ngx_stream_trojan_geoip_validate(ngx_conf_t *cf,
 static int ngx_stream_trojan_geoip_entry_cmp(const void *one,
     const void *two);
 static int ngx_stream_trojan_geoip_code_cmp(ngx_str_t *a, ngx_str_t *b);
+static ngx_uint_t ngx_stream_trojan_geoip_code_hash(ngx_str_t *code);
+static ngx_uint_t ngx_stream_trojan_geoip_index_slots(ngx_uint_t count);
+static ngx_int_t ngx_stream_trojan_geoip_build_code_index(ngx_conf_t *cf,
+    ngx_stream_trojan_geoip_t *geoip);
 static ngx_int_t ngx_stream_trojan_geoip_read_varint(
     ngx_stream_trojan_geoip_reader_t *r, uint64_t *value);
 static ngx_int_t ngx_stream_trojan_geoip_read_bytes(
@@ -70,6 +83,37 @@ ngx_stream_trojan_geoip_lc(u_char ch)
     }
 
     return ch;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_geoip_code_hash(ngx_str_t *code)
+{
+    size_t      i;
+    ngx_uint_t hash;
+
+    hash = 2166136261u;
+
+    for (i = 0; i < code->len; i++) {
+        hash ^= code->data[i];
+        hash *= 16777619;
+    }
+
+    return hash ? hash : 1;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_geoip_index_slots(ngx_uint_t count)
+{
+    ngx_uint_t  slots;
+
+    slots = 16;
+    while (slots < count * 4) {
+        slots <<= 1;
+    }
+
+    return slots;
 }
 
 
@@ -113,6 +157,10 @@ ngx_stream_trojan_geoip_load(ngx_conf_t *cf, ngx_str_t *path,
     }
 
     if (ngx_stream_trojan_geoip_validate(cf, geoip) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_stream_trojan_geoip_build_code_index(cf, geoip) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
@@ -458,27 +506,86 @@ ngx_stream_trojan_geoip_validate(ngx_conf_t *cf,
 }
 
 
-ngx_stream_trojan_geoip_entry_t *
-ngx_stream_trojan_geoip_find(ngx_stream_trojan_geoip_t *geoip,
-    ngx_str_t *code)
+static ngx_int_t
+ngx_stream_trojan_geoip_build_code_index(ngx_conf_t *cf,
+    ngx_stream_trojan_geoip_t *geoip)
 {
-    ngx_uint_t                         i;
-    ngx_stream_trojan_geoip_entry_t   *entries;
+    ngx_uint_t                            i, j, hash, idx;
+    ngx_stream_trojan_geoip_entry_t     *entries;
+    ngx_stream_trojan_geoip_code_index_t *slot;
 
-    if (geoip == NULL || geoip->entries == NULL || code->len == 0) {
-        return NULL;
+    geoip->code_index_slots =
+        ngx_stream_trojan_geoip_index_slots(geoip->entries->nelts);
+    geoip->code_index = ngx_pcalloc(cf->pool,
+        geoip->code_index_slots * sizeof(ngx_stream_trojan_geoip_code_index_t));
+    if (geoip->code_index == NULL) {
+        return NGX_ERROR;
     }
 
     entries = geoip->entries->elts;
     for (i = 0; i < geoip->entries->nelts; i++) {
-        if (entries[i].code.len == code->len
-            && ngx_strncmp(entries[i].code.data, code->data, code->len) == 0)
+        hash = ngx_stream_trojan_geoip_code_hash(&entries[i].code);
+        idx = hash % geoip->code_index_slots;
+
+        for (j = 0; j < geoip->code_index_slots; j++) {
+            slot = &geoip->code_index[(idx + j) % geoip->code_index_slots];
+            if (!slot->valid) {
+                slot->valid = 1;
+                slot->hash = hash;
+                slot->entry = &entries[i];
+                break;
+            }
+        }
+
+        if (j == geoip->code_index_slots) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_stream_trojan_geoip_entry_t *
+ngx_stream_trojan_geoip_code_index_find(ngx_stream_trojan_geoip_t *geoip,
+    ngx_str_t *code)
+{
+    ngx_uint_t                           i, hash, idx;
+    ngx_stream_trojan_geoip_code_index_t *slot;
+
+    if (geoip->code_index == NULL || geoip->code_index_slots == 0) {
+        return NULL;
+    }
+
+    hash = ngx_stream_trojan_geoip_code_hash(code);
+    idx = hash % geoip->code_index_slots;
+
+    for (i = 0; i < geoip->code_index_slots; i++) {
+        slot = &geoip->code_index[(idx + i) % geoip->code_index_slots];
+        if (!slot->valid) {
+            return NULL;
+        }
+
+        if (slot->hash == hash
+            && ngx_stream_trojan_geoip_code_cmp(&slot->entry->code, code) == 0)
         {
-            return &entries[i];
+            return slot->entry;
         }
     }
 
     return NULL;
+}
+
+
+ngx_stream_trojan_geoip_entry_t *
+ngx_stream_trojan_geoip_find(ngx_stream_trojan_geoip_t *geoip,
+    ngx_str_t *code)
+{
+    if (geoip == NULL || geoip->entries == NULL || code->len == 0) {
+        return NULL;
+    }
+
+    return ngx_stream_trojan_geoip_code_index_find(geoip, code);
 }
 
 

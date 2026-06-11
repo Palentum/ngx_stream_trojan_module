@@ -46,6 +46,13 @@ typedef struct {
 
 
 typedef struct {
+    ngx_uint_t                         valid;
+    ngx_uint_t                         hash;
+    ngx_stream_trojan_geosite_entry_t *entry;
+} ngx_stream_trojan_geosite_code_index_t;
+
+
+typedef struct {
     ngx_uint_t   valid;
     ngx_uint_t   accessed;
     size_t       host_len;
@@ -73,6 +80,8 @@ struct ngx_stream_trojan_geosite_entry_s {
 struct ngx_stream_trojan_geosite_s {
     ngx_array_t *entries;
     ngx_str_t    path;
+    ngx_stream_trojan_geosite_code_index_t *code_index;
+    ngx_uint_t   code_index_slots;
 };
 
 
@@ -91,6 +100,8 @@ static ngx_int_t ngx_stream_trojan_geosite_validate(ngx_conf_t *cf,
 static int ngx_stream_trojan_geosite_entry_cmp(const void *one,
     const void *two);
 static int ngx_stream_trojan_geosite_code_cmp(ngx_str_t *a, ngx_str_t *b);
+static ngx_int_t ngx_stream_trojan_geosite_build_code_index(ngx_conf_t *cf,
+    ngx_stream_trojan_geosite_t *geosite);
 static ngx_int_t ngx_stream_trojan_geosite_read_varint(
     ngx_stream_trojan_geosite_reader_t *r, uint64_t *value);
 static ngx_int_t ngx_stream_trojan_geosite_read_bytes(
@@ -343,6 +354,9 @@ ngx_stream_trojan_geosite_load(ngx_conf_t *cf, ngx_str_t *path,
     }
 
     if (ngx_stream_trojan_geosite_validate(cf, geosite) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+    if (ngx_stream_trojan_geosite_build_code_index(cf, geosite) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
@@ -875,27 +889,89 @@ ngx_stream_trojan_geosite_build_indexes(ngx_conf_t *cf,
 }
 
 
-ngx_stream_trojan_geosite_entry_t *
-ngx_stream_trojan_geosite_find(ngx_stream_trojan_geosite_t *geosite,
-    ngx_str_t *code)
+static ngx_int_t
+ngx_stream_trojan_geosite_build_code_index(ngx_conf_t *cf,
+    ngx_stream_trojan_geosite_t *geosite)
 {
-    ngx_uint_t                          i;
-    ngx_stream_trojan_geosite_entry_t  *entries;
+    ngx_uint_t                               i, j, hash, idx;
+    ngx_stream_trojan_geosite_entry_t      *entries;
+    ngx_stream_trojan_geosite_code_index_t *slot;
 
-    if (geosite == NULL || geosite->entries == NULL || code->len == 0) {
-        return NULL;
+    geosite->code_index_slots =
+        ngx_stream_trojan_geosite_index_slots(geosite->entries->nelts);
+    geosite->code_index = ngx_pcalloc(cf->pool,
+        geosite->code_index_slots
+        * sizeof(ngx_stream_trojan_geosite_code_index_t));
+    if (geosite->code_index == NULL) {
+        return NGX_ERROR;
     }
 
     entries = geosite->entries->elts;
     for (i = 0; i < geosite->entries->nelts; i++) {
-        if (entries[i].code.len == code->len
-            && ngx_strncmp(entries[i].code.data, code->data, code->len) == 0)
+        hash = ngx_stream_trojan_geosite_value_hash(entries[i].code.data,
+                                                    entries[i].code.len);
+        idx = hash % geosite->code_index_slots;
+
+        for (j = 0; j < geosite->code_index_slots; j++) {
+            slot = &geosite->code_index[(idx + j) % geosite->code_index_slots];
+            if (!slot->valid) {
+                slot->valid = 1;
+                slot->hash = hash;
+                slot->entry = &entries[i];
+                break;
+            }
+        }
+
+        if (j == geosite->code_index_slots) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_stream_trojan_geosite_entry_t *
+ngx_stream_trojan_geosite_code_index_find(ngx_stream_trojan_geosite_t *geosite,
+    ngx_str_t *code)
+{
+    ngx_uint_t                              i, hash, idx;
+    ngx_stream_trojan_geosite_code_index_t *slot;
+
+    if (geosite->code_index == NULL || geosite->code_index_slots == 0) {
+        return NULL;
+    }
+
+    hash = ngx_stream_trojan_geosite_value_hash(code->data, code->len);
+    idx = hash % geosite->code_index_slots;
+
+    for (i = 0; i < geosite->code_index_slots; i++) {
+        slot = &geosite->code_index[(idx + i) % geosite->code_index_slots];
+        if (!slot->valid) {
+            return NULL;
+        }
+
+        if (slot->hash == hash
+            && ngx_stream_trojan_geosite_code_cmp(&slot->entry->code, code)
+               == 0)
         {
-            return &entries[i];
+            return slot->entry;
         }
     }
 
     return NULL;
+}
+
+
+ngx_stream_trojan_geosite_entry_t *
+ngx_stream_trojan_geosite_find(ngx_stream_trojan_geosite_t *geosite,
+    ngx_str_t *code)
+{
+    if (geosite == NULL || geosite->entries == NULL || code->len == 0) {
+        return NULL;
+    }
+
+    return ngx_stream_trojan_geosite_code_index_find(geosite, code);
 }
 
 
