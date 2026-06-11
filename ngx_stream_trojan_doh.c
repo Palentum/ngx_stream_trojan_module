@@ -521,6 +521,7 @@ struct ngx_stream_trojan_doh_ctx_s {
     } read_state;
     u_char                      *header_start;
     u_char                      *body_start;
+    size_t                       chunked_decoded_len;
     size_t                       body_len;
     size_t                       content_length;
     ngx_uint_t                   http_status;
@@ -1266,15 +1267,21 @@ ngx_stream_trojan_doh_header_has_token(u_char *p, u_char *end,
 
 
 static ngx_int_t
-ngx_stream_trojan_doh_decode_chunked(u_char *data, size_t len,
-    size_t *decoded_len)
+ngx_stream_trojan_doh_decode_chunked(ngx_stream_trojan_doh_ctx_t *doh)
 {
-    u_char     *p, *end, *line, *dst;
-    size_t      chunk_size;
+    u_char     *data, *p, *end, *line, *q, *chunk, *trailers;
+    size_t      chunk_size, decoded_len, tail_len;
     ngx_uint_t  digit, saw_digit;
 
-    p = data;
-    end = data + len;
+    data = doh->body_start;
+    decoded_len = doh->chunked_decoded_len;
+
+    if (data == NULL || decoded_len > doh->body_len) {
+        return NGX_ERROR;
+    }
+
+    p = data + decoded_len;
+    end = data + doh->body_len;
 
     for (;;) {
         line = p;
@@ -1283,19 +1290,26 @@ ngx_stream_trojan_doh_decode_chunked(u_char *data, size_t len,
         }
 
         if (p + 1 >= end) {
+            tail_len = (size_t) (end - line);
+            if (tail_len != 0 && line != data + decoded_len) {
+                ngx_memmove(data + decoded_len, line, tail_len);
+            }
+            doh->chunked_decoded_len = decoded_len;
+            doh->body_len = decoded_len + tail_len;
+            doh->recv_pos = (size_t) (data - doh->recv_buf) + doh->body_len;
             return NGX_AGAIN;
         }
 
         chunk_size = 0;
         saw_digit = 0;
 
-        while (line < p && *line != ';') {
-            if (*line >= '0' && *line <= '9') {
-                digit = *line - '0';
-            } else if (*line >= 'A' && *line <= 'F') {
-                digit = *line - 'A' + 10;
-            } else if (*line >= 'a' && *line <= 'f') {
-                digit = *line - 'a' + 10;
+        for (q = line; q < p && *q != ';'; q++) {
+            if (*q >= '0' && *q <= '9') {
+                digit = *q - '0';
+            } else if (*q >= 'A' && *q <= 'F') {
+                digit = *q - 'A' + 10;
+            } else if (*q >= 'a' && *q <= 'f') {
+                digit = *q - 'a' + 10;
             } else {
                 return NGX_ERROR;
             }
@@ -1307,85 +1321,68 @@ ngx_stream_trojan_doh_decode_chunked(u_char *data, size_t len,
                 return NGX_ERROR;
             }
             chunk_size = chunk_size * 16 + digit;
-            line++;
         }
 
         if (!saw_digit) {
             return NGX_ERROR;
         }
 
-        p += 2;
+        chunk = p + 2;
 
         if (chunk_size == 0) {
+            trailers = chunk;
+
             for (;;) {
-                line = p;
+                p = trailers;
                 while (p + 1 < end && !(p[0] == '\r' && p[1] == '\n')) {
                     p++;
                 }
 
                 if (p + 1 >= end) {
+                    tail_len = (size_t) (end - line);
+                    if (tail_len != 0 && line != data + decoded_len) {
+                        ngx_memmove(data + decoded_len, line, tail_len);
+                    }
+                    doh->chunked_decoded_len = decoded_len;
+                    doh->body_len = decoded_len + tail_len;
+                    doh->recv_pos = (size_t) (data - doh->recv_buf)
+                                    + doh->body_len;
                     return NGX_AGAIN;
                 }
 
-                if (p == line) {
-                    goto decode;
+                if (p == trailers) {
+                    doh->chunked_decoded_len = decoded_len;
+                    doh->body_len = decoded_len;
+                    doh->recv_pos = (size_t) (data - doh->recv_buf)
+                                    + decoded_len;
+                    return NGX_OK;
                 }
 
-                p += 2;
+                trailers = p + 2;
             }
         }
 
-        if ((size_t) (end - p) < chunk_size + 2) {
+        if ((size_t) (end - chunk) < chunk_size + 2) {
+            tail_len = (size_t) (end - line);
+            if (tail_len != 0 && line != data + decoded_len) {
+                ngx_memmove(data + decoded_len, line, tail_len);
+            }
+            doh->chunked_decoded_len = decoded_len;
+            doh->body_len = decoded_len + tail_len;
+            doh->recv_pos = (size_t) (data - doh->recv_buf) + doh->body_len;
             return NGX_AGAIN;
         }
 
-        if (p[chunk_size] != '\r' || p[chunk_size + 1] != '\n') {
+        if (chunk[chunk_size] != '\r' || chunk[chunk_size + 1] != '\n') {
             return NGX_ERROR;
         }
 
-        p += chunk_size + 2;
-    }
-
-decode:
-
-    p = data;
-    dst = data;
-
-    for (;;) {
-        line = p;
-        while (!(p[0] == '\r' && p[1] == '\n')) {
-            p++;
+        if (chunk != data + decoded_len) {
+            ngx_memmove(data + decoded_len, chunk, chunk_size);
         }
 
-        chunk_size = 0;
-        while (line < p && *line != ';') {
-            if (*line >= '0' && *line <= '9') {
-                digit = *line - '0';
-            } else if (*line >= 'A' && *line <= 'F') {
-                digit = *line - 'A' + 10;
-            } else {
-                digit = *line - 'a' + 10;
-            }
-
-            if (chunk_size
-                > (NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE - digit) / 16)
-            {
-                return NGX_ERROR;
-            }
-            chunk_size = chunk_size * 16 + digit;
-            line++;
-        }
-
-        p += 2;
-
-        if (chunk_size == 0) {
-            *decoded_len = (size_t) (dst - data);
-            return NGX_OK;
-        }
-
-        ngx_memmove(dst, p, chunk_size);
-        dst += chunk_size;
-        p += chunk_size + 2;
+        decoded_len += chunk_size;
+        p = chunk + chunk_size + 2;
     }
 }
 
@@ -1394,17 +1391,8 @@ static ngx_int_t
 ngx_stream_trojan_doh_body_ready(ngx_stream_trojan_doh_ctx_t *doh,
     ngx_uint_t eof)
 {
-    ngx_int_t  rc;
-    size_t     decoded_len;
-
     if (doh->chunked) {
-        rc = ngx_stream_trojan_doh_decode_chunked(doh->body_start,
-                                                  doh->body_len,
-                                                  &decoded_len);
-        if (rc == NGX_OK) {
-            doh->body_len = decoded_len;
-        }
-        return rc;
+        return ngx_stream_trojan_doh_decode_chunked(doh);
     }
 
     if (doh->content_length_set) {
