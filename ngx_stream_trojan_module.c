@@ -1296,7 +1296,7 @@ ngx_stream_trojan_prepare_keys(ngx_conf_t *cf,
 static ngx_int_t
 ngx_stream_trojan_key_valid(ngx_stream_trojan_srv_conf_t *tscf, u_char *key)
 {
-    ngx_uint_t                      i, hash, found;
+    ngx_uint_t                      i, hash, found, real;
     const u_char                   *candidate;
     ngx_stream_trojan_key_t        *keys;
     ngx_stream_trojan_key_t       **bucket_keys;
@@ -1313,9 +1313,10 @@ ngx_stream_trojan_key_valid(ngx_stream_trojan_srv_conf_t *tscf, u_char *key)
 
         found = 0;
         for (i = 0; i < tscf->key_bucket_max_nelts; i++) {
-            candidate = i < bucket->nelts ? bucket_keys[i]->data
-                                          : ngx_stream_trojan_key_dummy;
-            found |= ngx_stream_trojan_key_equal(key, candidate);
+            real = (i < bucket->nelts);
+            candidate = real ? bucket_keys[i]->data
+                             : ngx_stream_trojan_key_dummy;
+            found |= ngx_stream_trojan_key_equal(key, candidate) & real;
         }
 
         return found ? NGX_OK : NGX_DECLINED;
