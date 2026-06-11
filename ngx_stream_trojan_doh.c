@@ -1518,7 +1518,12 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
             }
 
             if (p + 1 >= end) {
-                doh->header_start = line;
+                tail_len = (size_t) (end - line);
+                if (tail_len != 0 && line != doh->recv_buf) {
+                    ngx_memmove(doh->recv_buf, line, tail_len);
+                }
+                doh->recv_pos = tail_len;
+                doh->header_start = doh->recv_buf;
                 goto need_more;
             }
 
