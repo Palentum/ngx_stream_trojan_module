@@ -92,7 +92,7 @@ load_module modules/ngx_stream_trojan_module.so;
 | `trojan_connect_timeout <time>;` | `60s` | 与目标或出站代理建立 TCP 连接的超时。 |
 | `trojan_timeout <time>;` | `10m` | TCP relay 空闲超时。 |
 | `trojan_udp_timeout <time>;` | `10m` | UDP ASSOCIATE 空闲超时。 |
-| `trojan_buffer_size <size>;` | `32k` | TCP relay 每方向缓冲区大小。 |
+| `trojan_buffer_size <size>;` | `32k` | TCP relay 每方向缓冲区大小；mux 子流内部缓冲仍按实现上限 `8k` 切片，避免单个 mux 流长期占用 worker。 |
 
 ### DNS 和数据文件
 
