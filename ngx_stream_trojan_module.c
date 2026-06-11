@@ -359,6 +359,7 @@ struct ngx_stream_trojan_ctx_s {
     ngx_resolver_ctx_t         *resolver_ctx;
     ngx_stream_trojan_doh_ctx_t *doh_ctx;
     u_char                     *udp_in;
+    size_t                      udp_in_pos;
     size_t                      udp_in_len;
     u_char                     *udp_out;
     u_char                     *udp_payload;
@@ -3262,6 +3263,37 @@ ngx_stream_trojan_post_read_if_ready(ngx_stream_trojan_ctx_t *ctx,
         ngx_post_event(c->read, &ngx_posted_next_events);
     }
 }
+static void
+ngx_stream_trojan_compact_udp_input(ngx_stream_trojan_ctx_t *ctx)
+{
+    if (ctx->udp_in_pos == 0) {
+        return;
+    }
+
+    if (ctx->udp_in_len != 0) {
+        ngx_memmove(ctx->udp_in, ctx->udp_in + ctx->udp_in_pos,
+                    ctx->udp_in_len);
+    }
+
+    ctx->udp_in_pos = 0;
+}
+
+
+static void
+ngx_stream_trojan_consume_udp_input(ngx_stream_trojan_ctx_t *ctx,
+    size_t wire_len)
+{
+    if (wire_len >= ctx->udp_in_len) {
+        ctx->udp_in_pos = 0;
+        ctx->udp_in_len = 0;
+        return;
+    }
+
+    ctx->udp_in_pos += wire_len;
+    ctx->udp_in_len -= wire_len;
+}
+
+
 
 
 static void
@@ -3514,11 +3546,7 @@ ngx_stream_trojan_create_doh_resolve_data(ngx_stream_trojan_ctx_t *ctx,
     if (type == ngx_stream_trojan_resolve_udp
         && wire_len <= ctx->udp_in_len)
     {
-        if (wire_len < ctx->udp_in_len) {
-            ngx_memmove(ctx->udp_in, ctx->udp_in + wire_len,
-                        ctx->udp_in_len - wire_len);
-        }
-        ctx->udp_in_len -= wire_len;
+        ngx_stream_trojan_consume_udp_input(ctx, wire_len);
     }
 
     return data;
@@ -3804,11 +3832,7 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     ctx->state = ngx_stream_trojan_state_resolving;
 
     if (type == ngx_stream_trojan_resolve_udp && wire_len <= ctx->udp_in_len) {
-        if (wire_len < ctx->udp_in_len) {
-            ngx_memmove(ctx->udp_in, ctx->udp_in + wire_len,
-                        ctx->udp_in_len - wire_len);
-        }
-        ctx->udp_in_len -= wire_len;
+        ngx_stream_trojan_consume_udp_input(ctx, wire_len);
     }
 
     if (ngx_resolve_name(rctx) != NGX_OK) {
@@ -8758,8 +8782,8 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
     c = ctx->session->connection;
 
     for ( ;; ) {
-        rc = ngx_stream_trojan_parse_udp_frame(ctx->udp_in, ctx->udp_in_len,
-                                               &frame);
+        rc = ngx_stream_trojan_parse_udp_frame(
+            ctx->udp_in + ctx->udp_in_pos, ctx->udp_in_len, &frame);
 
         if (rc == NGX_STREAM_TROJAN_PARSE_OK) {
             rc = ngx_stream_trojan_prepare_udp_outbound(ctx, &frame.addr);
@@ -8783,11 +8807,7 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
                 return;
             }
 
-            if (frame.wire_len < ctx->udp_in_len) {
-                ngx_memmove(ctx->udp_in, ctx->udp_in + frame.wire_len,
-                            ctx->udp_in_len - frame.wire_len);
-            }
-            ctx->udp_in_len -= frame.wire_len;
+            ngx_stream_trojan_consume_udp_input(ctx, frame.wire_len);
             continue;
         }
 
@@ -8796,16 +8816,21 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
             return;
         }
 
-        if (ctx->udp_in_len == NGX_STREAM_TROJAN_UDP_BUFFER_SIZE)
+        if (ctx->udp_in_pos + ctx->udp_in_len
+            == NGX_STREAM_TROJAN_UDP_BUFFER_SIZE)
         {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_REQUEST);
-            return;
+            if (ctx->udp_in_pos == 0) {
+                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_REQUEST);
+                return;
+            }
+
+            ngx_stream_trojan_compact_udp_input(ctx);
         }
 
-        n = ngx_stream_trojan_client_recv(ctx,
-                                          ctx->udp_in + ctx->udp_in_len,
-                                          NGX_STREAM_TROJAN_UDP_BUFFER_SIZE
-                                          - ctx->udp_in_len);
+        n = ngx_stream_trojan_client_recv(
+            ctx, ctx->udp_in + ctx->udp_in_pos + ctx->udp_in_len,
+            NGX_STREAM_TROJAN_UDP_BUFFER_SIZE - ctx->udp_in_pos
+            - ctx->udp_in_len);
 
         if (n == NGX_AGAIN) {
             if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
