@@ -22,6 +22,8 @@
 #define NGX_STREAM_TROJAN_MIN_BUFFER_SIZE 4096
 #define NGX_STREAM_TROJAN_MAX_BUFFER_SIZE (1024 * 1024)
 #define NGX_STREAM_TROJAN_SOCKS5_BUFFER_SIZE 1024
+#define NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT 32
+#define NGX_STREAM_TROJAN_UDP_MAX_BYTES_PER_EVENT (256 * 1024)
 #define NGX_STREAM_TROJAN_DEFAULT_UDP_PAYLOAD_SIZE 16384
 #define NGX_STREAM_TROJAN_UDP_BUFFER_SIZE \
     (NGX_STREAM_TROJAN_DEFAULT_UDP_PAYLOAD_SIZE \
@@ -3257,6 +3259,15 @@ ngx_stream_trojan_post_read_if_ready(ngx_stream_trojan_ctx_t *ctx,
     if (c != NULL && c->read != NULL
         && ngx_stream_trojan_client_read_ready(ctx, c))
     {
+        ngx_post_event(c->read, &ngx_posted_next_events);
+    }
+}
+
+
+static void
+ngx_stream_trojan_post_udp_read_if_ready(ngx_connection_t *c)
+{
+    if (c != NULL && c->read != NULL && c->read->ready) {
         ngx_post_event(c->read, &ngx_posted_next_events);
     }
 }
@@ -9628,7 +9639,7 @@ static void
 ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
 {
     ssize_t                    n;
-    size_t                     written;
+    size_t                     written, packets, bytes;
     ngx_connection_t          *uc, *c;
     ngx_stream_trojan_ctx_t   *ctx;
     ngx_stream_trojan_addr_t   addr;
@@ -9645,10 +9656,20 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
 
     c = ctx->session->connection;
 
+    packets = 0;
+    bytes = 0;
+
     for ( ;; ) {
         if (ngx_stream_trojan_flush_udp_client(ctx) != NGX_OK) {
             return;
         }
+        if (packets >= NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT
+            || bytes >= NGX_STREAM_TROJAN_UDP_MAX_BYTES_PER_EVENT)
+        {
+            ngx_stream_trojan_post_udp_read_if_ready(uc);
+            return;
+        }
+
 
         socklen = sizeof(ss);
         n = recvfrom(uc->fd,
@@ -9666,6 +9687,8 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
+        packets++;
+        bytes += (size_t) n;
         ngx_stream_trojan_refresh_udp_timeout(ctx);
 
         if (ngx_stream_trojan_sockaddr_to_addr((struct sockaddr *) &ss,
@@ -9728,6 +9751,7 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
         }
     }
 
+
     if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
     }
@@ -9738,7 +9762,7 @@ static void
 ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
 {
     ssize_t                         n;
-    size_t                          written;
+    size_t                          written, packets, bytes;
     ngx_connection_t               *uc, *c;
     ngx_stream_trojan_ctx_t        *ctx;
     ngx_stream_trojan_udp_frame_t   frame;
@@ -9753,10 +9777,20 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
 
     c = ctx->session->connection;
 
+    packets = 0;
+    bytes = 0;
+
     for ( ;; ) {
         if (ngx_stream_trojan_flush_udp_client(ctx) != NGX_OK) {
             return;
         }
+        if (packets >= NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT
+            || bytes >= NGX_STREAM_TROJAN_UDP_MAX_BYTES_PER_EVENT)
+        {
+            ngx_stream_trojan_post_udp_read_if_ready(uc);
+            return;
+        }
+
 
         n = recvfrom(uc->fd, ctx->udp_out,
                      NGX_STREAM_TROJAN_SOCKS5_UDP_BUFFER_SIZE, 0, NULL, NULL);
@@ -9772,6 +9806,8 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
+        packets++;
+        bytes += (size_t) n;
         ngx_stream_trojan_refresh_udp_timeout(ctx);
 
         if (ngx_stream_trojan_socks5_parse_udp_packet(ctx->udp_out,
@@ -9823,6 +9859,7 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
         }
     }
 
+
     if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
     }
@@ -9833,6 +9870,7 @@ static void
 ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
 {
     ssize_t                         n;
+    size_t                          packets, bytes;
     ngx_int_t                       rc;
     ngx_connection_t               *uc;
     ngx_stream_trojan_ctx_t        *ctx;
@@ -9850,6 +9888,9 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
     }
 
 
+    packets = 0;
+    bytes = 0;
+
     for ( ;; ) {
         if (ctx->resolver_ctx != NULL || ctx->doh_ctx != NULL
             || ((ctx->socks5_udp == NULL
@@ -9860,6 +9901,13 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
         {
             break;
         }
+        if (packets >= NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT
+            || bytes >= NGX_STREAM_TROJAN_UDP_MAX_BYTES_PER_EVENT)
+        {
+            ngx_stream_trojan_post_udp_read_if_ready(uc);
+            return;
+        }
+
 
         socklen = sizeof(ss);
         n = recvfrom(uc->fd, ctx->udp_out,
@@ -9876,6 +9924,8 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
                           "recvfrom() socks5 udp relay failed");
             break;
         }
+        packets++;
+        bytes += (size_t) n;
         ngx_stream_trojan_refresh_udp_timeout(ctx);
 
         if (ngx_stream_trojan_socks5_parse_udp_packet(ctx->udp_out,
@@ -9963,6 +10013,7 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
             return;
         }
     }
+
 
 
     if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
