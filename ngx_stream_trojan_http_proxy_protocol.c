@@ -27,11 +27,8 @@ ngx_stream_trojan_http_find_header_end(const uint8_t *buf, size_t len)
 
 static int
 ngx_stream_trojan_http_has_prefix(const uint8_t *buf, size_t len,
-    const char *prefix)
+    const char *prefix, size_t prefix_len)
 {
-    size_t prefix_len;
-
-    prefix_len = strlen(prefix);
     if (len > prefix_len) {
         return memcmp(buf, prefix, prefix_len) == 0;
     }
@@ -47,15 +44,24 @@ ngx_stream_trojan_http_proxy_looks_like_http(const uint8_t *buf, size_t len)
         return 0;
     }
 
-    return ngx_stream_trojan_http_has_prefix(buf, len, "CONNECT ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "GET ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "POST ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "HEAD ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "PUT ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "DELETE ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "OPTIONS ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "PATCH ")
-           || ngx_stream_trojan_http_has_prefix(buf, len, "TRACE ");
+    return ngx_stream_trojan_http_has_prefix(buf, len, "CONNECT ",
+                                             sizeof("CONNECT ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "GET ",
+                                                sizeof("GET ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "POST ",
+                                                sizeof("POST ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "HEAD ",
+                                                sizeof("HEAD ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "PUT ",
+                                                sizeof("PUT ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "DELETE ",
+                                                sizeof("DELETE ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "OPTIONS ",
+                                                sizeof("OPTIONS ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "PATCH ",
+                                                sizeof("PATCH ") - 1)
+           || ngx_stream_trojan_http_has_prefix(buf, len, "TRACE ",
+                                                sizeof("TRACE ") - 1);
 }
 
 
@@ -104,6 +110,43 @@ ngx_stream_trojan_http_parse_port(const uint8_t *p, const uint8_t *last,
 
 
 static int
+ngx_stream_trojan_http_maybe_ipv4(const uint8_t *host, size_t host_len)
+{
+    size_t  i;
+    int     dot;
+
+    dot = 0;
+    for (i = 0; i < host_len; i++) {
+        if (host[i] == '.') {
+            dot = 1;
+            continue;
+        }
+
+        if (host[i] < '0' || host[i] > '9') {
+            return 0;
+        }
+    }
+
+    return dot;
+}
+
+
+static int
+ngx_stream_trojan_http_maybe_ipv6(const uint8_t *host, size_t host_len)
+{
+    size_t  i;
+
+    for (i = 0; i < host_len; i++) {
+        if (host[i] == ':') {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static int
 ngx_stream_trojan_http_fill_host(const uint8_t *host, size_t host_len,
     uint16_t port, ngx_stream_trojan_addr_t *addr)
 {
@@ -112,6 +155,7 @@ ngx_stream_trojan_http_fill_host(const uint8_t *host, size_t host_len,
     }
 
     if (host_len <= INET_ADDRSTRLEN
+        && ngx_stream_trojan_http_maybe_ipv4(host, host_len)
         && inet_pton(AF_INET, (const char *) host, addr->host) == 1)
     {
         addr->type = NGX_STREAM_TROJAN_ADDR_IPV4;
@@ -122,6 +166,7 @@ ngx_stream_trojan_http_fill_host(const uint8_t *host, size_t host_len,
     }
 
     if (host_len <= INET6_ADDRSTRLEN
+        && ngx_stream_trojan_http_maybe_ipv6(host, host_len)
         && inet_pton(AF_INET6, (const char *) host, addr->host) == 1)
     {
         addr->type = NGX_STREAM_TROJAN_ADDR_IPV6;
@@ -256,22 +301,26 @@ ngx_stream_trojan_http_proxy_build_response(uint16_t status,
     switch (status) {
     case 200:
         response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        len = sizeof("HTTP/1.1 200 Connection Established\r\n\r\n") - 1;
         break;
     case 403:
         response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n") - 1;
         break;
     case 405:
         response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n") - 1;
         break;
     case 502:
         response = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n") - 1;
         break;
     default:
         response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n") - 1;
         break;
     }
 
-    len = strlen(response);
     if (out_len < len) {
         return -1;
     }

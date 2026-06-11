@@ -204,11 +204,10 @@ ngx_stream_trojan_ws_ascii_lower(int c)
 
 static int
 ngx_stream_trojan_ws_ascii_casecmp(const uint8_t *a, size_t a_len,
-    const char *b)
+    const char *b, size_t b_len)
 {
-    size_t i, b_len;
+    size_t i;
 
-    b_len = strlen(b);
     if (a_len != b_len) {
         return -1;
     }
@@ -294,7 +293,8 @@ ngx_stream_trojan_ws_connection_has_upgrade(const uint8_t *p,
 
         if (ngx_stream_trojan_ws_ascii_casecmp(token,
                                                (size_t) (token_last - token),
-                                               "upgrade") == 0)
+                                               "upgrade",
+                                               sizeof("upgrade") - 1) == 0)
         {
             return 1;
         }
@@ -526,16 +526,19 @@ ngx_stream_trojan_ws_parse_handshake(const uint8_t *buf, size_t len,
 
         if (ngx_stream_trojan_ws_ascii_casecmp(name,
                                                (size_t) (name_end - name),
-                                               "upgrade") == 0)
+                                               "upgrade",
+                                               sizeof("upgrade") - 1) == 0)
         {
             if (ngx_stream_trojan_ws_ascii_casecmp(value,
-                    (size_t) (value_end - value), "websocket") == 0)
+                    (size_t) (value_end - value), "websocket",
+                    sizeof("websocket") - 1) == 0)
             {
                 has_upgrade = 1;
             }
 
         } else if (ngx_stream_trojan_ws_ascii_casecmp(name,
-                   (size_t) (name_end - name), "connection") == 0)
+                   (size_t) (name_end - name), "connection",
+                   sizeof("connection") - 1) == 0)
         {
             if (ngx_stream_trojan_ws_connection_has_upgrade(value,
                                                             value_end))
@@ -544,7 +547,8 @@ ngx_stream_trojan_ws_parse_handshake(const uint8_t *buf, size_t len,
             }
 
         } else if (ngx_stream_trojan_ws_ascii_casecmp(name,
-                   (size_t) (name_end - name), "sec-websocket-version") == 0)
+                   (size_t) (name_end - name), "sec-websocket-version",
+                   sizeof("sec-websocket-version") - 1) == 0)
         {
             has_version = 1;
             if ((size_t) (value_end - value) != 2
@@ -554,7 +558,8 @@ ngx_stream_trojan_ws_parse_handshake(const uint8_t *buf, size_t len,
             }
 
         } else if (ngx_stream_trojan_ws_ascii_casecmp(name,
-                   (size_t) (name_end - name), "sec-websocket-key") == 0)
+                   (size_t) (name_end - name), "sec-websocket-key",
+                   sizeof("sec-websocket-key") - 1) == 0)
         {
             if (ngx_stream_trojan_ws_base64_decode_len(value,
                     (size_t) (value_end - value), &decoded_len) != 0
@@ -568,7 +573,8 @@ ngx_stream_trojan_ws_parse_handshake(const uint8_t *buf, size_t len,
             has_key = 1;
 
         } else if (ngx_stream_trojan_ws_ascii_casecmp(name,
-                   (size_t) (name_end - name), "host") == 0)
+                   (size_t) (name_end - name), "host",
+                   sizeof("host") - 1) == 0)
         {
             hs->host = value;
             has_host = 1;
@@ -666,21 +672,26 @@ ngx_stream_trojan_ws_build_error_response(uint16_t status,
     switch (status) {
     case 403:
         response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n") - 1;
         break;
     case 404:
         response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n") - 1;
         break;
     case 426:
         response = "HTTP/1.1 426 Upgrade Required\r\n"
                    "Sec-WebSocket-Version: 13\r\n"
                    "Content-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 426 Upgrade Required\r\n"
+                     "Sec-WebSocket-Version: 13\r\n"
+                     "Content-Length: 0\r\n\r\n") - 1;
         break;
     default:
         response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        len = sizeof("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n") - 1;
         break;
     }
 
-    len = strlen(response);
     if (out_len < len) {
         return -1;
     }
