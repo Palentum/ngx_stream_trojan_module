@@ -9025,6 +9025,18 @@ ngx_stream_trojan_forward_socks5_udp_packet(ngx_stream_trojan_ctx_t *ctx,
 }
 
 
+static ngx_uint_t
+ngx_stream_trojan_socks5_in_udp_pending_blocked(
+    ngx_stream_trojan_ctx_t *ctx)
+{
+    return (ctx->socks5_udp == NULL
+            || ctx->socks5_udp_relay.sockaddr == NULL)
+           && ctx->udp_pending_to_upstream != NULL
+           && ctx->udp_pending_to_upstream->pos
+              < ctx->udp_pending_to_upstream->last;
+}
+
+
 static void
 ngx_stream_trojan_post_socks5_in_udp_read(ngx_stream_trojan_ctx_t *ctx)
 {
@@ -9893,11 +9905,7 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
 
     for ( ;; ) {
         if (ctx->resolver_ctx != NULL || ctx->doh_ctx != NULL
-            || ((ctx->socks5_udp == NULL
-                 || ctx->socks5_udp_relay.sockaddr == NULL)
-                && ctx->udp_pending_to_upstream != NULL
-                && ctx->udp_pending_to_upstream->pos
-                   < ctx->udp_pending_to_upstream->last))
+            || ngx_stream_trojan_socks5_in_udp_pending_blocked(ctx))
         {
             break;
         }
@@ -10015,6 +10023,15 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
     }
 
 
+
+    if (ngx_stream_trojan_socks5_in_udp_pending_blocked(ctx)) {
+        if (ngx_stream_trojan_update_read_event(uc, 1) != NGX_OK) {
+            ngx_log_error(NGX_LOG_INFO, uc->log, 0,
+                          "ngx_del_event() socks5 udp relay failed");
+        }
+
+        return;
+    }
 
     if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
         ngx_log_error(NGX_LOG_INFO, uc->log, 0,
