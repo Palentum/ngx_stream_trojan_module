@@ -40,6 +40,7 @@
     (NGX_STREAM_TROJAN_MUX_MAX_STREAMS * 2)
 #define NGX_STREAM_TROJAN_MUX_STREAM_POOL_SIZE 2048
 #define NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES 64
+#define NGX_STREAM_TROJAN_KEY_BUCKETS 256
 
 
 
@@ -144,6 +145,12 @@ typedef struct {
 
 
 typedef struct {
+    ngx_stream_trojan_key_t  **elts;
+    ngx_uint_t                 nelts;
+} ngx_stream_trojan_key_bucket_t;
+
+
+typedef struct {
     ngx_str_t    host;
     in_port_t    port;
     ngx_uint_t   set;
@@ -179,6 +186,7 @@ struct ngx_stream_trojan_srv_conf_s {
     ngx_uint_t   local_proxy_type;
     ngx_uint_t   socks5_ref_set;
     ngx_array_t *keys;
+    ngx_stream_trojan_key_bucket_t *key_buckets;
     ngx_addr_t  *fallback;
     ngx_uint_t   fallback_naddrs;
     ngx_msec_t   connect_timeout;
@@ -795,6 +803,9 @@ static void ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_finalize(ngx_stream_trojan_ctx_t *ctx,
     ngx_uint_t rc);
 
+static ngx_uint_t ngx_stream_trojan_key_hash(const u_char *key);
+static ngx_int_t ngx_stream_trojan_prepare_keys(ngx_conf_t *cf,
+    ngx_stream_trojan_srv_conf_t *conf);
 static void *ngx_stream_trojan_create_srv_conf(ngx_conf_t *cf);
 static char *ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent,
     void *child);
@@ -1198,11 +1209,106 @@ ngx_stream_trojan_read_client(ngx_event_t *ev)
 }
 
 
+static ngx_uint_t
+ngx_stream_trojan_key_hash(const u_char *key)
+{
+    ngx_uint_t  i, hash;
+
+    hash = 2166136261u;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_KEY_LEN; i++) {
+        hash ^= key[i];
+        hash *= 16777619;
+    }
+
+    return hash;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_prepare_keys(ngx_conf_t *cf,
+    ngx_stream_trojan_srv_conf_t *conf)
+{
+    ngx_uint_t                     i, idx, offset, hash;
+    ngx_uint_t                     counts[NGX_STREAM_TROJAN_KEY_BUCKETS];
+    ngx_stream_trojan_key_t       *keys;
+    ngx_stream_trojan_key_t      **elts;
+    ngx_stream_trojan_key_bucket_t *buckets;
+
+    if (conf->key_buckets != NULL
+        || conf->keys == NULL || conf->keys->nelts == 0)
+    {
+        return NGX_OK;
+    }
+
+    ngx_memzero(counts, sizeof(counts));
+
+    keys = conf->keys->elts;
+    for (i = 0; i < conf->keys->nelts; i++) {
+        hash = ngx_stream_trojan_key_hash(keys[i].data);
+        counts[hash % NGX_STREAM_TROJAN_KEY_BUCKETS]++;
+    }
+
+    buckets = ngx_pcalloc(cf->pool,
+                          NGX_STREAM_TROJAN_KEY_BUCKETS
+                          * sizeof(ngx_stream_trojan_key_bucket_t));
+    if (buckets == NULL) {
+        return NGX_ERROR;
+    }
+
+    elts = ngx_palloc(cf->pool,
+                      conf->keys->nelts * sizeof(ngx_stream_trojan_key_t *));
+    if (elts == NULL) {
+        return NGX_ERROR;
+    }
+
+    offset = 0;
+    for (i = 0; i < NGX_STREAM_TROJAN_KEY_BUCKETS; i++) {
+        if (counts[i] != 0) {
+            buckets[i].elts = elts + offset;
+            buckets[i].nelts = counts[i];
+            offset += counts[i];
+        }
+        counts[i] = 0;
+    }
+
+    for (i = 0; i < conf->keys->nelts; i++) {
+        hash = ngx_stream_trojan_key_hash(keys[i].data);
+        idx = hash % NGX_STREAM_TROJAN_KEY_BUCKETS;
+        buckets[idx].elts[counts[idx]++] = &keys[i];
+    }
+
+    conf->key_buckets = buckets;
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_stream_trojan_key_valid(ngx_stream_trojan_srv_conf_t *tscf, u_char *key)
 {
-    ngx_uint_t                i;
-    ngx_stream_trojan_key_t  *keys;
+    ngx_uint_t                      i, hash;
+    ngx_stream_trojan_key_t        *keys;
+    ngx_stream_trojan_key_t       **bucket_keys;
+    ngx_stream_trojan_key_bucket_t *bucket;
+
+    if (tscf == NULL || tscf->keys == NULL || key == NULL) {
+        return NGX_DECLINED;
+    }
+
+    if (tscf->key_buckets != NULL) {
+        hash = ngx_stream_trojan_key_hash(key);
+        bucket = &tscf->key_buckets[hash % NGX_STREAM_TROJAN_KEY_BUCKETS];
+        bucket_keys = bucket->elts;
+
+        for (i = 0; i < bucket->nelts; i++) {
+            if (ngx_stream_trojan_key_equal(key, bucket_keys[i]->data)) {
+                return NGX_OK;
+            }
+        }
+
+        return NGX_DECLINED;
+    }
 
     keys = tscf->keys->elts;
 
@@ -10864,6 +10970,7 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->keys == NULL) {
         conf->keys = prev->keys;
+        conf->key_buckets = prev->key_buckets;
     }
 
     if (conf->fallback == NULL) {
@@ -10934,6 +11041,9 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->enable && (conf->keys == NULL || conf->keys->nelts == 0)) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "trojan is on but no trojan_password is configured");
+        return NGX_CONF_ERROR;
+    }
+    if (conf->enable && ngx_stream_trojan_prepare_keys(cf, conf) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
