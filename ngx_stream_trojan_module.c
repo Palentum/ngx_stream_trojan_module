@@ -6574,6 +6574,10 @@ ngx_stream_trojan_mux_stream_can_accept(
 
     b = stream->client_buffer;
 
+    if ((size_t) (b->end - b->last) >= len) {
+        return NGX_OK;
+    }
+
     ngx_stream_trojan_mux_compact_buf(b);
 
     if ((size_t) (b->end - b->last) < len) {
