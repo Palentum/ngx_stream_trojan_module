@@ -8952,7 +8952,6 @@ ngx_stream_trojan_addr_to_ngx_addr(ngx_pool_t *pool,
 #if (NGX_HAVE_INET6)
     struct sockaddr_in6  *sin6;
 #endif
-    u_char               *p;
 
     ngx_memzero(out, sizeof(ngx_addr_t));
 
@@ -9000,13 +8999,6 @@ ngx_stream_trojan_addr_to_ngx_addr(ngx_pool_t *pool,
 #endif
 
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
-        p = ngx_pnalloc(pool, addr->host_len + 1);
-        if (p == NULL) {
-            return NGX_ERROR;
-        }
-        ngx_memcpy(p, addr->host, addr->host_len);
-        p[addr->host_len] = '\0';
-        (void) p;
         return NGX_DECLINED;
 
     default:
