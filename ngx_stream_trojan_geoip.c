@@ -24,6 +24,7 @@ struct ngx_stream_trojan_geoip_entry_s {
 #if (NGX_HAVE_INET6)
     ngx_radix_tree_t *tree6;
 #endif
+    ngx_uint_t   prepared;
 };
 
 
@@ -401,12 +402,6 @@ ngx_stream_trojan_geoip_validate(ngx_conf_t *cf,
             }
         }
 
-        if (ngx_stream_trojan_geoip_build_entry(cf, &entries[i]) != NGX_OK) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "could not index geoip entry \"%V\" in \"%V\"",
-                               &entries[i].code, &geoip->path);
-            return NGX_ERROR;
-        }
     }
 
     return NGX_OK;
@@ -474,6 +469,27 @@ ngx_stream_trojan_geoip_ipv6_mask(u_char *mask, ngx_uint_t prefix)
     }
 }
 #endif
+
+
+ngx_int_t
+ngx_stream_trojan_geoip_prepare_entry(ngx_conf_t *cf,
+    ngx_stream_trojan_geoip_entry_t *entry)
+{
+    if (entry == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (entry->prepared) {
+        return NGX_OK;
+    }
+
+    if (ngx_stream_trojan_geoip_build_entry(cf, entry) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    entry->prepared = 1;
+    return NGX_OK;
+}
 
 
 static ngx_int_t

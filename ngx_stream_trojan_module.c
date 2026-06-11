@@ -11674,6 +11674,15 @@ ngx_stream_trojan_route_prepare(ngx_conf_t *cf,
                                        "trojan_geoip", &rule[j].value);
                     return NGX_ERROR;
                 }
+
+                if (ngx_stream_trojan_geoip_prepare_entry(cf, rule[j].geoip)
+                    != NGX_OK)
+                {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                       "could not index geoip \"%V\" in "
+                                       "trojan_geoip", &rule[j].value);
+                    return NGX_ERROR;
+                }
             }
         }
     }
