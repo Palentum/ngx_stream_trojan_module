@@ -847,17 +847,53 @@ ngx_stream_trojan_ws_build_frame_header(uint8_t opcode,
 }
 
 
+static uint64_t
+ngx_stream_trojan_ws_mask64(const uint8_t mask[4], uint64_t offset)
+{
+    uint8_t   bytes[8];
+    uint64_t  v;
+    size_t    i;
+
+    for (i = 0; i < sizeof(bytes); i++) {
+        bytes[i] = mask[(offset + i) & 3];
+    }
+
+    memcpy(&v, bytes, sizeof(v));
+
+    return v;
+}
+
+
 void
 ngx_stream_trojan_ws_apply_mask(uint8_t *data, size_t len,
     const uint8_t mask[4], uint64_t offset)
 {
-    size_t i;
+    size_t    i;
+    uint64_t  m, v;
 
     if (data == NULL || mask == NULL) {
         return;
     }
 
-    for (i = 0; i < len; i++) {
+    i = 0;
+    while (i < len && ((uintptr_t) (data + i) & (sizeof(uint64_t) - 1))) {
         data[i] ^= mask[(offset + i) & 3];
+        i++;
+    }
+
+    if (len - i >= sizeof(uint64_t)) {
+        m = ngx_stream_trojan_ws_mask64(mask, offset + i);
+
+        while (len - i >= sizeof(uint64_t)) {
+            memcpy(&v, data + i, sizeof(v));
+            v ^= m;
+            memcpy(data + i, &v, sizeof(v));
+            i += sizeof(uint64_t);
+        }
+    }
+
+    while (i < len) {
+        data[i] ^= mask[(offset + i) & 3];
+        i++;
     }
 }
