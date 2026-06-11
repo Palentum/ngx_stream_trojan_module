@@ -149,6 +149,8 @@ typedef struct {
     ngx_uint_t                 nelts;
 } ngx_stream_trojan_key_bucket_t;
 
+static const u_char ngx_stream_trojan_key_dummy[NGX_STREAM_TROJAN_KEY_LEN];
+
 
 typedef struct {
     ngx_str_t    host;
@@ -187,6 +189,7 @@ struct ngx_stream_trojan_srv_conf_s {
     ngx_uint_t   socks5_ref_set;
     ngx_array_t *keys;
     ngx_stream_trojan_key_bucket_t *key_buckets;
+    ngx_uint_t   key_bucket_max_nelts;
     ngx_addr_t  *fallback;
     ngx_uint_t   fallback_naddrs;
     ngx_msec_t   connect_timeout;
@@ -1229,7 +1232,7 @@ static ngx_int_t
 ngx_stream_trojan_prepare_keys(ngx_conf_t *cf,
     ngx_stream_trojan_srv_conf_t *conf)
 {
-    ngx_uint_t                     i, idx, offset, hash;
+    ngx_uint_t                     i, idx, offset, hash, max_nelts;
     ngx_uint_t                     counts[NGX_STREAM_TROJAN_KEY_BUCKETS];
     ngx_stream_trojan_key_t       *keys;
     ngx_stream_trojan_key_t      **elts;
@@ -1262,8 +1265,13 @@ ngx_stream_trojan_prepare_keys(ngx_conf_t *cf,
         return NGX_ERROR;
     }
 
+    max_nelts = 0;
     offset = 0;
     for (i = 0; i < NGX_STREAM_TROJAN_KEY_BUCKETS; i++) {
+        if (counts[i] > max_nelts) {
+            max_nelts = counts[i];
+        }
+
         if (counts[i] != 0) {
             buckets[i].elts = elts + offset;
             buckets[i].nelts = counts[i];
@@ -1278,6 +1286,7 @@ ngx_stream_trojan_prepare_keys(ngx_conf_t *cf,
         buckets[idx].elts[counts[idx]++] = &keys[i];
     }
 
+    conf->key_bucket_max_nelts = max_nelts;
     conf->key_buckets = buckets;
 
     return NGX_OK;
@@ -1287,7 +1296,8 @@ ngx_stream_trojan_prepare_keys(ngx_conf_t *cf,
 static ngx_int_t
 ngx_stream_trojan_key_valid(ngx_stream_trojan_srv_conf_t *tscf, u_char *key)
 {
-    ngx_uint_t                      i, hash;
+    ngx_uint_t                      i, hash, found;
+    const u_char                   *candidate;
     ngx_stream_trojan_key_t        *keys;
     ngx_stream_trojan_key_t       **bucket_keys;
     ngx_stream_trojan_key_bucket_t *bucket;
@@ -1301,13 +1311,14 @@ ngx_stream_trojan_key_valid(ngx_stream_trojan_srv_conf_t *tscf, u_char *key)
         bucket = &tscf->key_buckets[hash % NGX_STREAM_TROJAN_KEY_BUCKETS];
         bucket_keys = bucket->elts;
 
-        for (i = 0; i < bucket->nelts; i++) {
-            if (ngx_stream_trojan_key_equal(key, bucket_keys[i]->data)) {
-                return NGX_OK;
-            }
+        found = 0;
+        for (i = 0; i < tscf->key_bucket_max_nelts; i++) {
+            candidate = i < bucket->nelts ? bucket_keys[i]->data
+                                          : ngx_stream_trojan_key_dummy;
+            found |= ngx_stream_trojan_key_equal(key, candidate);
         }
 
-        return NGX_DECLINED;
+        return found ? NGX_OK : NGX_DECLINED;
     }
 
     keys = tscf->keys->elts;
@@ -10963,6 +10974,7 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->keys == NULL) {
         conf->keys = prev->keys;
         conf->key_buckets = prev->key_buckets;
+        conf->key_bucket_max_nelts = prev->key_bucket_max_nelts;
     }
 
     if (conf->fallback == NULL) {
