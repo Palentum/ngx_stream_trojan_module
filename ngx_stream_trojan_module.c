@@ -3248,19 +3248,6 @@ ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
 }
 
 
-static ssize_t
-ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
-    size_t size, size_t frame_size)
-{
-    if (!ctx->websocket) {
-        return ctx->session->connection->send(ctx->session->connection, src,
-                                              size);
-    }
-
-    return ngx_stream_trojan_websocket_send_parts(ctx, src, size, NULL, 0,
-                                                  frame_size, NULL, NULL);
-}
-
 
 static ssize_t
 ngx_stream_trojan_client_send_parts(ngx_stream_trojan_ctx_t *ctx, u_char *src,
