@@ -4952,13 +4952,23 @@ ngx_stream_trojan_route_cache_copy_target(ngx_stream_trojan_addr_t *dst,
 {
     size_t  i;
 
-    *dst = *src;
+    dst->type = src->type;
+    dst->host_len = src->host_len;
+    dst->port = src->port;
+    dst->wire_len = src->wire_len;
+
+    if (src->host_len == 0) {
+        return;
+    }
 
     if (src->type == NGX_STREAM_TROJAN_ADDR_DOMAIN) {
         for (i = 0; i < src->host_len; i++) {
             dst->host[i] = ngx_stream_trojan_route_lc(src->host[i]);
         }
+        return;
     }
+
+    ngx_memcpy(dst->host, src->host, src->host_len);
 }
 
 
@@ -5062,7 +5072,8 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
                                                             &cache_found);
         if (cache_found) {
             if (cached_route == NULL) {
-                ctx->route_cache_target = *target;
+                ngx_stream_trojan_route_cache_copy_target(
+                    &ctx->route_cache_target, target);
                 ctx->route_cache_command = command;
                 ctx->route_cache_outbound = NULL;
                 ctx->route_cache_valid = 1;
@@ -5072,7 +5083,8 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
             outbound = ngx_stream_trojan_select_route_outbound(cached_route,
                                                                ctx->outbound,
                                                                command, target);
-            ctx->route_cache_target = *target;
+            ngx_stream_trojan_route_cache_copy_target(
+                &ctx->route_cache_target, target);
             ctx->route_cache_command = command;
             ctx->route_cache_outbound = outbound;
             ctx->route_cache_valid = 1;
@@ -5089,7 +5101,8 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
             outbound = ngx_stream_trojan_select_route_outbound(&route[i],
                                                                ctx->outbound,
                                                                command, target);
-            ctx->route_cache_target = *target;
+            ngx_stream_trojan_route_cache_copy_target(
+                &ctx->route_cache_target, target);
             ctx->route_cache_command = command;
             ctx->route_cache_outbound = outbound;
             ctx->route_cache_valid = 1;
@@ -5097,7 +5110,8 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
         }
 
         ngx_stream_trojan_route_cache_store(ctx->conf, target, NULL);
-        ctx->route_cache_target = *target;
+        ngx_stream_trojan_route_cache_copy_target(&ctx->route_cache_target,
+                                                  target);
         ctx->route_cache_command = command;
         ctx->route_cache_outbound = NULL;
         ctx->route_cache_valid = 1;
