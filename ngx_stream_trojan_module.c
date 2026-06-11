@@ -5447,8 +5447,17 @@ static void
 ngx_stream_trojan_mux_refresh_read_timeout(ngx_stream_trojan_ctx_t *ctx,
     ngx_connection_t *c)
 {
+    ngx_msec_int_t  remaining;
+
     if (ctx == NULL || c == NULL || c->read == NULL) {
         return;
+    }
+
+    if (c->read->timer_set) {
+        remaining = (ngx_msec_int_t) (c->read->timer.key - ngx_current_msec);
+        if (remaining > (ngx_msec_int_t) (ctx->conf->timeout / 2)) {
+            return;
+        }
     }
 
     ngx_add_timer(c->read, ctx->conf->timeout);
