@@ -8942,10 +8942,13 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
 {
     ssize_t                         n;
     ngx_int_t                       rc;
+    size_t                          packets, bytes;
     ngx_connection_t               *c;
     ngx_stream_trojan_udp_frame_t   frame;
 
     c = ctx->session->connection;
+    packets = 0;
+    bytes = 0;
 
     rc = ngx_stream_trojan_flush_udp_client(ctx);
     if (rc == NGX_AGAIN) {
@@ -8958,6 +8961,17 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
     }
 
     for ( ;; ) {
+        if (packets >= NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT
+            || bytes >= NGX_STREAM_TROJAN_UDP_MAX_BYTES_PER_EVENT)
+        {
+            if (ctx->udp_in_len != 0
+                || ngx_stream_trojan_client_read_ready(ctx, c))
+            {
+                ngx_post_event(c->read, &ngx_posted_next_events);
+            }
+            return;
+        }
+
         rc = ngx_stream_trojan_parse_udp_frame(
             ctx->udp_in + ctx->udp_in_pos, ctx->udp_in_len, &frame);
 
@@ -8983,6 +8997,8 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
                 return;
             }
 
+            packets++;
+            bytes += frame.wire_len;
             ngx_stream_trojan_consume_udp_input(ctx, frame.wire_len);
             continue;
         }
