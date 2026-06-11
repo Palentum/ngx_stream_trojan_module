@@ -526,35 +526,41 @@ int
 ngx_stream_trojan_build_udp_header(const ngx_stream_trojan_addr_t *addr,
     uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written)
 {
-    size_t pos = 0;
-    size_t addr_len;
+    size_t     pos = 0;
+    size_t     addr_len;
+    size_t     host_len;
+    ngx_uint_t domain;
 
     if (addr == NULL || out == NULL || written == NULL) {
         return -1;
     }
 
+    domain = 0;
+
     switch (addr->type) {
     case NGX_STREAM_TROJAN_ADDR_IPV4:
-        if (addr->host_len != 4 || addr->wire_len != 1 + 4 + 2) {
+        host_len = 4;
+        addr_len = 1 + host_len + 2;
+        if (addr->host_len != host_len || addr->wire_len != addr_len) {
             return -1;
         }
-        addr_len = addr->wire_len;
         break;
 
     case NGX_STREAM_TROJAN_ADDR_IPV6:
-        if (addr->host_len != 16 || addr->wire_len != 1 + 16 + 2) {
+        host_len = 16;
+        addr_len = 1 + host_len + 2;
+        if (addr->host_len != host_len || addr->wire_len != addr_len) {
             return -1;
         }
-        addr_len = addr->wire_len;
         break;
 
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
-        if (addr->host_len == 0 || addr->host_len > 255
-            || addr->wire_len != 1 + 1 + addr->host_len + 2)
-        {
+        host_len = addr->host_len;
+        addr_len = 1 + 1 + host_len + 2;
+        if (host_len == 0 || host_len > 255 || addr->wire_len != addr_len) {
             return -1;
         }
-        addr_len = addr->wire_len;
+        domain = 1;
         break;
 
     default:
@@ -567,23 +573,12 @@ ngx_stream_trojan_build_udp_header(const ngx_stream_trojan_addr_t *addr,
 
     out[pos++] = addr->type;
 
-    switch (addr->type) {
-    case NGX_STREAM_TROJAN_ADDR_IPV4:
-        memcpy(out + pos, addr->host, 4);
-        pos += 4;
-        break;
-
-    case NGX_STREAM_TROJAN_ADDR_IPV6:
-        memcpy(out + pos, addr->host, 16);
-        pos += 16;
-        break;
-
-    case NGX_STREAM_TROJAN_ADDR_DOMAIN:
-        out[pos++] = (uint8_t) addr->host_len;
-        memcpy(out + pos, addr->host, addr->host_len);
-        pos += addr->host_len;
-        break;
+    if (domain) {
+        out[pos++] = (uint8_t) host_len;
     }
+
+    memcpy(out + pos, addr->host, host_len);
+    pos += host_len;
 
     out[pos++] = (uint8_t) (addr->port >> 8);
     out[pos++] = (uint8_t) addr->port;
