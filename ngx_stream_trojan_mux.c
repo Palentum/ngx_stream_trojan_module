@@ -268,7 +268,6 @@ ngx_stream_trojan_mux_cool_parse_metadata(const uint8_t *buf, size_t len,
         return NGX_STREAM_TROJAN_MUX_ERROR;
     }
 
-    memset(frame, 0, sizeof(*frame));
 
     frame->session_id = ngx_stream_trojan_mux_get16be(buf);
     frame->status = buf[2];
@@ -277,6 +276,7 @@ ngx_stream_trojan_mux_cool_parse_metadata(const uint8_t *buf, size_t len,
 
     switch (frame->status) {
     case NGX_STREAM_TROJAN_MUX_COOL_STATUS_NEW:
+        memset(&frame->target, 0, sizeof(frame->target));
         if (len < pos + 4) {
             return NGX_STREAM_TROJAN_MUX_ERROR;
         }
