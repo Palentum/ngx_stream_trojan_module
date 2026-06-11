@@ -2924,11 +2924,15 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
         return NGX_AGAIN;
     }
 
+    if (size == 0) {
+        return NGX_AGAIN;
+    }
+
     produced = 0;
     frames = 0;
 
     for ( ;; ) {
-        if (produced) {
+        if (produced == size) {
             return (ssize_t) produced;
         }
 
@@ -2958,10 +2962,15 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
                     ctx->ws_frame_active = 0;
                     rc = ngx_stream_trojan_websocket_handle_frame_end(ctx);
                     if (rc == NGX_ERROR) {
-                        return NGX_ERROR;
+                        return produced ? (ssize_t) produced : NGX_ERROR;
                     }
                     if (rc == NGX_AGAIN) {
-                        return NGX_AGAIN;
+                        return produced ? (ssize_t) produced : NGX_AGAIN;
+                    }
+                    if (ngx_stream_trojan_websocket_count_frame(ctx, &frames)
+                        != NGX_OK)
+                    {
+                        return produced ? (ssize_t) produced : NGX_AGAIN;
                     }
                 }
 
@@ -2972,7 +2981,7 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
             n = ngx_stream_trojan_websocket_read_raw(
                 ctx, ctx->ws_control + ctx->ws_control_len, chunk);
             if (n == NGX_AGAIN || n == 0 || n == NGX_ERROR) {
-                return n;
+                return produced ? (ssize_t) produced : n;
             }
 
             ngx_stream_trojan_ws_apply_mask(
@@ -2986,15 +2995,15 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
                 ctx->ws_frame_active = 0;
                 rc = ngx_stream_trojan_websocket_handle_frame_end(ctx);
                 if (rc == NGX_ERROR) {
-                    return NGX_ERROR;
+                    return produced ? (ssize_t) produced : NGX_ERROR;
                 }
                 if (rc == NGX_AGAIN) {
-                    return NGX_AGAIN;
+                    return produced ? (ssize_t) produced : NGX_AGAIN;
                 }
                 if (ngx_stream_trojan_websocket_count_frame(ctx, &frames)
                     != NGX_OK)
                 {
-                    return NGX_AGAIN;
+                    return produced ? (ssize_t) produced : NGX_AGAIN;
                 }
             }
 
@@ -3009,16 +3018,16 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
                 ctx->ws_header_len = 0;
                 rc = ngx_stream_trojan_websocket_start_frame(ctx);
                 if (rc == NGX_ERROR) {
-                    return NGX_ERROR;
+                    return produced ? (ssize_t) produced : NGX_ERROR;
                 }
                 if (rc == NGX_AGAIN) {
-                    return NGX_AGAIN;
+                    return produced ? (ssize_t) produced : NGX_AGAIN;
                 }
                 if (!ctx->ws_frame_active
                     && ngx_stream_trojan_websocket_count_frame(ctx, &frames)
                        != NGX_OK)
                 {
-                    return NGX_AGAIN;
+                    return produced ? (ssize_t) produced : NGX_AGAIN;
                 }
                 break;
             }
@@ -3027,14 +3036,14 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
                 ctx->ws_header_len = 0;
                 ngx_stream_trojan_websocket_fail(ctx, 1002,
                                                  NGX_STREAM_BAD_REQUEST);
-                return NGX_AGAIN;
+                return produced ? (ssize_t) produced : NGX_AGAIN;
             }
 
             n = ngx_stream_trojan_websocket_read_raw(
                 ctx, ctx->ws_header + ctx->ws_header_len,
                 needed - ctx->ws_header_len);
             if (n == NGX_AGAIN || n == 0 || n == NGX_ERROR) {
-                return n;
+                return produced ? (ssize_t) produced : n;
             }
 
             ctx->ws_header_len += (size_t) n;
