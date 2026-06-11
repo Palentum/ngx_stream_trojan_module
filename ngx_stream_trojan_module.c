@@ -3250,6 +3250,27 @@ ngx_stream_trojan_client_read_ready(ngx_stream_trojan_ctx_t *ctx,
 }
 
 
+static void
+ngx_stream_trojan_post_read_if_ready(ngx_stream_trojan_ctx_t *ctx,
+    ngx_connection_t *c)
+{
+    if (c != NULL && c->read != NULL
+        && ngx_stream_trojan_client_read_ready(ctx, c))
+    {
+        ngx_post_event(c->read, &ngx_posted_next_events);
+    }
+}
+
+
+static void
+ngx_stream_trojan_post_write_if_ready(ngx_connection_t *c)
+{
+    if (c != NULL && c->write != NULL && c->write->ready) {
+        ngx_post_event(c->write, &ngx_posted_next_events);
+    }
+}
+
+
 static ngx_int_t
 ngx_stream_trojan_set_pending(ngx_stream_trojan_ctx_t *ctx, u_char *data,
     size_t len)
@@ -5405,9 +5426,12 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
 
         rev = src->read;
 
-        if (!ngx_stream_trojan_client_read_ready(ctx, src)
-            || !ngx_stream_trojan_relay_should_continue(loops, bytes, limit))
-        {
+        if (!ngx_stream_trojan_client_read_ready(ctx, src)) {
+            return NGX_OK;
+        }
+
+        if (!ngx_stream_trojan_relay_should_continue(loops, bytes, limit)) {
+            ngx_stream_trojan_post_read_if_ready(ctx, src);
             return NGX_OK;
         }
 
@@ -5871,6 +5895,9 @@ ngx_stream_trojan_mux_flush_stream_to_client(
         }
 
         ngx_stream_trojan_mux_reset_buf(b);
+        if (!stream->upstream_eof) {
+            ngx_stream_trojan_post_read_if_ready(ctx, stream->upstream);
+        }
         stream->frame_header_len = 0;
         stream->frame_header_pos = 0;
     }
@@ -6134,6 +6161,7 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
         }
 
         if (!ngx_stream_trojan_relay_should_continue(loops, bytes, limit)) {
+            ngx_stream_trojan_post_read_if_ready(ctx, c);
             return NGX_OK;
         }
     }
@@ -6399,6 +6427,7 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
         }
 
         if (!ngx_stream_trojan_relay_should_continue(loops, bytes, limit)) {
+            ngx_stream_trojan_post_read_if_ready(ctx, c);
             return NGX_OK;
         }
     }
@@ -6456,6 +6485,7 @@ ngx_stream_trojan_mux_flush_client(ngx_stream_trojan_ctx_t *ctx)
 
         if (rc == NGX_AGAIN) {
             ngx_stream_trojan_mux_queue_flush(stream);
+            ngx_stream_trojan_post_write_if_ready(c);
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
@@ -6465,6 +6495,7 @@ ngx_stream_trojan_mux_flush_client(ngx_stream_trojan_ctx_t *ctx)
         ngx_stream_trojan_mux_cleanup_stream(stream);
 
         if (limit && sent >= limit) {
+            ngx_stream_trojan_post_write_if_ready(c);
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
                 return NGX_ERROR;
             }
