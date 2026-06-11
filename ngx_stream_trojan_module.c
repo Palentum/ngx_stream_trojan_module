@@ -415,6 +415,7 @@ struct ngx_stream_trojan_ctx_s {
     ngx_stream_trojan_mux_stream_t *mux_payload_stream;
     ngx_uint_t                  mux_payload_direct;
     ngx_uint_t                  mux_payload_accept_checked;
+    ngx_uint_t                  mux_payload_blocked;
     u_char                      mux_nop_header[NGX_STREAM_TROJAN_MUX_HEADER_LEN];
     size_t                      mux_nop_header_pos;
     ngx_uint_t                  mux_nop_pending;
@@ -5372,8 +5373,7 @@ ngx_stream_trojan_mux_read_client_payload(ngx_stream_trojan_ctx_t *ctx,
     ngx_connection_t *c)
 {
     ssize_t                          n;
-    size_t                           remaining;
-    ngx_int_t                        rc;
+    size_t                           available, remaining;
     ngx_buf_t                       *b;
     ngx_stream_trojan_mux_stream_t  *stream;
 
@@ -5386,17 +5386,28 @@ ngx_stream_trojan_mux_read_client_payload(ngx_stream_trojan_ctx_t *ctx,
         {
             stream = ctx->mux_payload_stream;
 
-            if (!ctx->mux_payload_accept_checked) {
-                rc = ngx_stream_trojan_mux_stream_can_accept(stream,
-                                                             remaining);
-                if (rc != NGX_OK) {
-                    return rc;
-                }
-                ctx->mux_payload_accept_checked = 1;
+            if (ngx_stream_trojan_mux_ensure_client_buffer(stream, 1)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
             }
 
             b = stream->client_buffer;
-            n = ngx_stream_trojan_client_recv(ctx, b->last, remaining);
+            if (b->last == b->end) {
+                ngx_stream_trojan_mux_compact_buf(b);
+                if (b->last == b->end) {
+                    ctx->mux_payload_blocked = 1;
+                    return NGX_AGAIN;
+                }
+            }
+
+            available = b->end - b->last;
+            if (available > remaining) {
+                available = remaining;
+            }
+
+            ctx->mux_payload_blocked = 0;
+            n = ngx_stream_trojan_client_recv(ctx, b->last, available);
 
         } else {
             ctx->mux_payload_direct = 0;
@@ -5405,11 +5416,13 @@ ngx_stream_trojan_mux_read_client_payload(ngx_stream_trojan_ctx_t *ctx,
                 return NGX_ERROR;
             }
 
+            ctx->mux_payload_blocked = 0;
             n = ngx_stream_trojan_client_recv(ctx,
                     ctx->mux_payload + ctx->mux_payload_read, remaining);
         }
 
         if (n == NGX_AGAIN) {
+            ctx->mux_payload_blocked = 0;
             return NGX_OK;
         }
 
@@ -5419,6 +5432,7 @@ ngx_stream_trojan_mux_read_client_payload(ngx_stream_trojan_ctx_t *ctx,
 
         if (ctx->mux_payload_direct) {
             b->last += n;
+            ngx_stream_trojan_mux_queue_process(ctx->mux_payload_stream);
         }
 
         ctx->mux_payload_read += (size_t) n;
@@ -5917,6 +5931,7 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
             ctx->mux_payload_stream = NULL;
             ctx->mux_payload_direct = 0;
             ctx->mux_payload_accept_checked = 0;
+            ctx->mux_payload_blocked = 0;
             ctx->mux_frame_parsed = 1;
 
             if (ctx->mux_frame.command == NGX_STREAM_TROJAN_MUX_CMD_PSH) {
@@ -5924,23 +5939,25 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
                     ctx, ctx->mux_frame.stream_id);
 
                 if (stream != NULL) {
-                    rc = ngx_stream_trojan_mux_stream_can_accept(
-                        stream, ctx->mux_payload_len);
-                    if (rc == NGX_ERROR) {
-                        return NGX_ERROR;
-                    }
-                    if (rc == NGX_AGAIN) {
-                        ctx->mux_payload_stream = stream;
-                        return NGX_AGAIN;
-                    }
-
-                    ctx->mux_payload_accept_checked = 1;
                     if (stream->state
                         != ngx_stream_trojan_mux_stream_request
                         && stream->state
                            != ngx_stream_trojan_mux_stream_closing)
                     {
                         ctx->mux_payload_direct = 1;
+                    } else {
+                        rc = ngx_stream_trojan_mux_stream_can_accept(
+                            stream, ctx->mux_payload_len);
+                        if (rc == NGX_ERROR) {
+                            return NGX_ERROR;
+                        }
+                        if (rc == NGX_AGAIN) {
+                            ctx->mux_payload_stream = stream;
+                            ctx->mux_payload_blocked = 1;
+                            return NGX_AGAIN;
+                        }
+
+                        ctx->mux_payload_accept_checked = 1;
                     }
                 }
 
@@ -5950,6 +5967,7 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
 
         if (ctx->mux_frame.command == NGX_STREAM_TROJAN_MUX_CMD_PSH
             && ctx->mux_payload_stream != NULL
+            && !ctx->mux_payload_direct
             && !ctx->mux_payload_accept_checked)
         {
             rc = ngx_stream_trojan_mux_stream_can_accept(
@@ -5958,6 +5976,7 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
                 return NGX_ERROR;
             }
             if (rc == NGX_AGAIN) {
+                ctx->mux_payload_blocked = 1;
                 return NGX_AGAIN;
             }
             ctx->mux_payload_accept_checked = 1;
@@ -5978,6 +5997,7 @@ ngx_stream_trojan_mux_read_client(ngx_stream_trojan_ctx_t *ctx)
         ctx->mux_payload_stream = NULL;
         ctx->mux_payload_direct = 0;
         ctx->mux_payload_accept_checked = 0;
+        ctx->mux_payload_blocked = 0;
 
         loops++;
         bytes += frame_bytes;
@@ -6153,6 +6173,7 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
             ctx->mux_payload_stream = NULL;
             ctx->mux_payload_direct = 0;
             ctx->mux_payload_accept_checked = 0;
+            ctx->mux_payload_blocked = 0;
             ctx->mux_payload_len = 0;
             ctx->mux_payload_read = 0;
         }
@@ -6197,19 +6218,23 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
                     ctx, ctx->mux_cool_frame.session_id);
                 if (stream != NULL) {
                     ctx->mux_payload_stream = stream;
-                    rc = ngx_stream_trojan_mux_stream_can_accept(
-                        stream, ctx->mux_payload_len);
-                    if (rc != NGX_OK) {
-                        return rc;
-                    }
-
-                    ctx->mux_payload_accept_checked = 1;
                     if (stream->state
                         != ngx_stream_trojan_mux_stream_request
                         && stream->state
                            != ngx_stream_trojan_mux_stream_closing)
                     {
                         ctx->mux_payload_direct = 1;
+                    } else {
+                        rc = ngx_stream_trojan_mux_stream_can_accept(
+                            stream, ctx->mux_payload_len);
+                        if (rc != NGX_OK) {
+                            if (rc == NGX_AGAIN) {
+                                ctx->mux_payload_blocked = 1;
+                            }
+                            return rc;
+                        }
+
+                        ctx->mux_payload_accept_checked = 1;
                     }
                 }
             }
@@ -6237,6 +6262,7 @@ ngx_stream_trojan_mux_cool_read_client(ngx_stream_trojan_ctx_t *ctx)
         ctx->mux_payload_stream = NULL;
         ctx->mux_payload_direct = 0;
         ctx->mux_payload_accept_checked = 0;
+        ctx->mux_payload_blocked = 0;
 
         loops++;
         bytes += frame_bytes;
@@ -6766,7 +6792,7 @@ ngx_stream_trojan_mux_client_blocked_on(ngx_stream_trojan_ctx_t *ctx,
            && ctx->mux_payload_stream == stream
            && ctx->mux_frame_parsed
            && ctx->mux_payload_len != 0
-           && ctx->mux_payload_read < ctx->mux_payload_len;
+           && ctx->mux_payload_blocked;
 }
 
 
@@ -7497,6 +7523,14 @@ ngx_stream_trojan_mux_process_stream(ngx_stream_trojan_mux_stream_t *stream)
         return;
     }
 
+    if (ngx_stream_trojan_mux_client_blocked_on(stream->ctx, stream)
+        && (stream->client_buffer == NULL
+            || stream->client_buffer->last < stream->client_buffer->end
+            || stream->client_buffer->pos > stream->client_buffer->start))
+    {
+        ngx_stream_trojan_mux_post_client_read(stream->ctx);
+    }
+
     if (ngx_stream_trojan_mux_read_upstream(stream) != NGX_OK) {
         ngx_stream_trojan_mux_close_stream(stream, 1);
         return;
@@ -7622,6 +7656,7 @@ ngx_stream_trojan_mux_cleanup_stream(ngx_stream_trojan_mux_stream_t *stream)
         ctx->mux_payload_stream = NULL;
         ctx->mux_payload_direct = 0;
         ctx->mux_payload_accept_checked = 0;
+        ctx->mux_payload_blocked = 0;
         ngx_stream_trojan_mux_post_client_read(ctx);
     }
     ngx_stream_trojan_mux_remove_stream(ctx, stream);
