@@ -45,6 +45,8 @@ int ngx_stream_trojan_key_equal(const uint8_t *a, const uint8_t *b);
 int ngx_stream_trojan_parse_addr(const uint8_t *buf, size_t len, ngx_stream_trojan_addr_t *addr);
 int ngx_stream_trojan_addr_to_text(const ngx_stream_trojan_addr_t *addr, char *out, size_t out_len);
 int ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len, ngx_stream_trojan_udp_frame_t *frame);
+int ngx_stream_trojan_build_udp_header(const ngx_stream_trojan_addr_t *addr,
+    uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written);
 int ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uint8_t *payload,
     uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written);
 int ngx_stream_trojan_use_nginx_resolver(uint8_t addr_type, int resolver_configured);

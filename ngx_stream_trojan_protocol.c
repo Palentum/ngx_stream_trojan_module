@@ -498,13 +498,13 @@ ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len,
 }
 
 int
-ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uint8_t *payload,
+ngx_stream_trojan_build_udp_header(const ngx_stream_trojan_addr_t *addr,
     uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written)
 {
     size_t pos = 0;
     size_t addr_len;
 
-    if (addr == NULL || out == NULL || written == NULL || (payload_len > 0 && payload == NULL)) {
+    if (addr == NULL || out == NULL || written == NULL) {
         return -1;
     }
 
@@ -536,7 +536,7 @@ ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uin
         return -1;
     }
 
-    if (out_len < addr_len + 4 + payload_len) {
+    if (out_len < addr_len + 4) {
         return -1;
     }
 
@@ -558,9 +558,6 @@ ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uin
         memcpy(out + pos, addr->host, addr->host_len);
         pos += addr->host_len;
         break;
-
-    default:
-        return -1;
     }
 
     out[pos++] = (uint8_t) (addr->port >> 8);
@@ -569,6 +566,32 @@ ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uin
     out[pos++] = (uint8_t) payload_len;
     out[pos++] = '\r';
     out[pos++] = '\n';
+
+    *written = pos;
+    return 0;
+}
+
+
+int
+ngx_stream_trojan_pack_udp_frame(const ngx_stream_trojan_addr_t *addr, const uint8_t *payload,
+    uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written)
+{
+    size_t pos;
+
+    if (payload_len > 0 && payload == NULL) {
+        return -1;
+    }
+
+    if (ngx_stream_trojan_build_udp_header(addr, payload_len, out, out_len,
+                                           &pos)
+        != 0)
+    {
+        return -1;
+    }
+
+    if (out_len - pos < payload_len) {
+        return -1;
+    }
 
     if (payload_len > 0) {
         memcpy(out + pos, payload, payload_len);

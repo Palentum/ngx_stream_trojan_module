@@ -46,6 +46,9 @@ int ngx_stream_trojan_socks5_response_len(const uint8_t *buf, size_t len,
     size_t *needed);
 int ngx_stream_trojan_socks5_parse_response(const uint8_t *buf, size_t len,
     ngx_stream_trojan_addr_t *addr);
+int ngx_stream_trojan_socks5_build_udp_header(
+    const ngx_stream_trojan_addr_t *addr, uint8_t *out, size_t out_len,
+    size_t *written);
 int ngx_stream_trojan_socks5_build_udp_packet(
     const ngx_stream_trojan_addr_t *addr, const uint8_t *payload,
     uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written);

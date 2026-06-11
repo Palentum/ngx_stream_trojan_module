@@ -4,6 +4,7 @@
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 #include "ngx_stream_trojan_protocol.h"
 #include "ngx_stream_trojan_http_proxy_protocol.h"
@@ -8998,23 +8999,69 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
 
 
 static ngx_int_t
+ngx_stream_trojan_send_udp_iov(ngx_stream_trojan_ctx_t *ctx,
+    ngx_connection_t *uc, u_char *header, size_t header_len,
+    const u_char *payload, size_t payload_len, struct sockaddr *sockaddr,
+    socklen_t socklen, const char *message)
+{
+    ssize_t        n;
+    struct iovec   iov[2];
+    struct msghdr  msg;
+
+    iov[0].iov_base = header;
+    iov[0].iov_len = header_len;
+    iov[1].iov_base = (void *) payload;
+    iov[1].iov_len = payload_len;
+
+    ngx_memzero(&msg, sizeof(struct msghdr));
+    msg.msg_name = sockaddr;
+    msg.msg_namelen = socklen;
+    msg.msg_iov = iov;
+    msg.msg_iovlen = payload_len == 0 ? 1 : 2;
+
+    n = sendmsg(uc->fd, &msg, 0);
+
+    if (n == -1) {
+        ngx_err_t err = ngx_socket_errno;
+        if (err == NGX_EAGAIN) {
+            return NGX_OK;
+        }
+
+        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log,
+                      err, "%s", message);
+        return NGX_ERROR;
+    }
+
+    if ((size_t) n != header_len + payload_len) {
+        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log, 0,
+                      "short UDP sendmsg() while sending %s", message);
+        return NGX_ERROR;
+    }
+
+    ngx_stream_trojan_refresh_udp_timeout(ctx);
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_stream_trojan_send_socks5_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_udp_frame_t *frame)
 {
-    size_t            written;
+    size_t            header_len;
 
-    if (ngx_stream_trojan_socks5_build_udp_packet(
-            &frame->addr, frame->payload, frame->payload_len,
-            ctx->udp_out,
-            NGX_STREAM_TROJAN_SOCKS5_UDP_BUFFER_SIZE,
-            &written)
+    if (ngx_stream_trojan_socks5_build_udp_header(
+            &frame->addr, ctx->udp_out,
+            NGX_STREAM_TROJAN_SOCKS5_UDP_BUFFER_SIZE, &header_len)
         != 0)
     {
         return NGX_ERROR;
     }
 
-    return ngx_stream_trojan_forward_socks5_udp_packet(ctx, ctx->udp_out,
-                                                       written);
+    return ngx_stream_trojan_send_udp_iov(
+        ctx, ctx->socks5_udp, ctx->udp_out, header_len, frame->payload,
+        frame->payload_len, ctx->socks5_udp_relay.sockaddr,
+        ctx->socks5_udp_relay.socklen, "sendmsg() to socks5 udp relay failed");
 }
 
 
@@ -9754,20 +9801,22 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
                 continue;
             }
 
-            if (ngx_stream_trojan_socks5_build_udp_packet(
-                    &addr, ctx->udp_payload, (uint16_t) n, ctx->udp_out,
+            if (ngx_stream_trojan_socks5_build_udp_header(
+                    &addr, ctx->udp_out,
                     NGX_STREAM_TROJAN_SOCKS5_UDP_BUFFER_SIZE, &written)
                 != 0)
             {
                 continue;
             }
 
-            n = sendto(ctx->socks5_in_udp->fd, ctx->udp_out, written, 0,
-                       (struct sockaddr *) &ctx->socks5_udp_client,
-                       ctx->socks5_udp_client_socklen);
-            if (n == -1 && ngx_socket_errno != NGX_EAGAIN) {
-                ngx_log_error(NGX_LOG_INFO, c->log, ngx_socket_errno,
-                              "sendto() socks5 udp client failed");
+            if (ngx_stream_trojan_send_udp_iov(
+                    ctx, ctx->socks5_in_udp, ctx->udp_out, written,
+                    ctx->udp_payload, (size_t) n,
+                    (struct sockaddr *) &ctx->socks5_udp_client,
+                    ctx->socks5_udp_client_socklen,
+                    "sendmsg() socks5 udp client failed")
+                != NGX_OK)
+            {
                 ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
                 return;
             }

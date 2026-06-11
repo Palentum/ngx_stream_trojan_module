@@ -416,15 +416,14 @@ ngx_stream_trojan_socks5_parse_response(const uint8_t *buf, size_t len,
 
 
 int
-ngx_stream_trojan_socks5_build_udp_packet(
-    const ngx_stream_trojan_addr_t *addr, const uint8_t *payload,
-    uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written)
+ngx_stream_trojan_socks5_build_udp_header(
+    const ngx_stream_trojan_addr_t *addr, uint8_t *out, size_t out_len,
+    size_t *written)
 {
     size_t req_len;
 
     if (addr == NULL || out == NULL || written == NULL || out_len < 4
-        || (payload_len && payload == NULL)
-        || out_len < 3 + addr->wire_len + payload_len)
+        || out_len < 3 + addr->wire_len)
     {
         return -1;
     }
@@ -432,7 +431,6 @@ ngx_stream_trojan_socks5_build_udp_packet(
     out[0] = 0;
     out[1] = 0;
     out[2] = 0;
-
     out[3] = addr->type;
 
     switch (addr->type) {
@@ -470,6 +468,33 @@ ngx_stream_trojan_socks5_build_udp_packet(
         break;
 
     default:
+        return -1;
+    }
+
+    *written = req_len;
+    return 0;
+}
+
+
+int
+ngx_stream_trojan_socks5_build_udp_packet(
+    const ngx_stream_trojan_addr_t *addr, const uint8_t *payload,
+    uint16_t payload_len, uint8_t *out, size_t out_len, size_t *written)
+{
+    size_t req_len;
+
+    if (payload_len && payload == NULL) {
+        return -1;
+    }
+
+    if (ngx_stream_trojan_socks5_build_udp_header(addr, out, out_len,
+                                                  &req_len)
+        != 0)
+    {
+        return -1;
+    }
+
+    if (out_len - req_len < payload_len) {
         return -1;
     }
 
