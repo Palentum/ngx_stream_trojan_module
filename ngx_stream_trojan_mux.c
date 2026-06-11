@@ -2,14 +2,14 @@
 #include <string.h>
 
 
-static uint16_t
+static inline uint16_t
 ngx_stream_trojan_mux_get16le(const uint8_t *p)
 {
     return (uint16_t) (p[0] | (p[1] << 8));
 }
 
 
-static uint32_t
+static inline uint32_t
 ngx_stream_trojan_mux_get32le(const uint8_t *p)
 {
     return (uint32_t) p[0]
@@ -19,7 +19,7 @@ ngx_stream_trojan_mux_get32le(const uint8_t *p)
 }
 
 
-static void
+static inline void
 ngx_stream_trojan_mux_put16le(uint8_t *p, uint16_t value)
 {
     p[0] = (uint8_t) value;
@@ -27,7 +27,7 @@ ngx_stream_trojan_mux_put16le(uint8_t *p, uint16_t value)
 }
 
 
-static void
+static inline void
 ngx_stream_trojan_mux_put32le(uint8_t *p, uint32_t value)
 {
     p[0] = (uint8_t) value;
@@ -36,14 +36,14 @@ ngx_stream_trojan_mux_put32le(uint8_t *p, uint32_t value)
     p[3] = (uint8_t) (value >> 24);
 }
 
-static uint16_t
+static inline uint16_t
 ngx_stream_trojan_mux_get16be(const uint8_t *p)
 {
     return (uint16_t) ((p[0] << 8) | p[1]);
 }
 
 
-static void
+static inline void
 ngx_stream_trojan_mux_put16be(uint8_t *p, uint16_t value)
 {
     p[0] = (uint8_t) (value >> 8);
