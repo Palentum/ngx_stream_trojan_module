@@ -170,7 +170,7 @@ outbounds socks5 {
 trojan_route on;
 
 trojan_routes {
-    rules geosite:netflix domain:google.com geoip:cn ip:10.0.0.0/8 port:443;
+    rules geosite:netflix domain:google.com geoip:cn ip:10.0.0.0/8;
     outbounds_socks5 127.0.0.1:1080 username=user password=pass block=h3;
     outbounds_direct ip_prefer=ipv4 block=none;
 }
@@ -196,7 +196,7 @@ trojan_routes {
 | `outbounds_socks5 <server> [username=<string>] [password=<string>] [block=<none\|h3\|udp>];` | 添加 SOCKS5 出站。 |
 | `outbounds socks5 <server> ...;` | `outbounds_socks5` 的别名形式。 |
 
-路由规则是“路由块内任一规则命中即命中该路由块”。模块按路由块配置顺序匹配，第一个命中的路由块生效，并从该路由块中未被 `block` 阻断的出站里随机选择一个。启用 `trojan_route` 后，如果没有路由命中或命中路由没有可用出站，请求会被拒绝；不会回退到 server 级出站或隐式直连。
+路由规则是“路由块内任一规则命中即命中该路由块”，同一 `rules` 行中的多个表达式是 OR，不是 AND；例如不要把 `domain:example.com port:443` 理解为“域名且端口同时匹配”。模块按路由块配置顺序匹配，第一个命中的路由块生效，并从该路由块中未被 `block` 阻断的出站里随机选择一个。启用 `trojan_route` 后，如果没有路由命中或命中路由没有可用出站，请求会被拒绝；不会回退到 server 级出站或隐式直连。
 
 规则表达式：
 
