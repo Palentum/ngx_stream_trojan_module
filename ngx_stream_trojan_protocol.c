@@ -529,7 +529,7 @@ ngx_stream_trojan_build_udp_header(const ngx_stream_trojan_addr_t *addr,
     size_t     pos = 0;
     size_t     addr_len;
     size_t     host_len;
-    ngx_uint_t domain;
+    int        domain;
 
     if (addr == NULL || out == NULL || written == NULL) {
         return -1;
