@@ -1486,7 +1486,7 @@ static void
 ngx_stream_trojan_process_http_in(ngx_stream_trojan_ctx_t *ctx)
 {
     int                          rc;
-    size_t                       needed, len;
+    size_t                       needed = 0, len;
     ngx_stream_trojan_srv_conf_t *effective, *proxy_conf;
 
     if (ctx->http_buffer == NULL) {
