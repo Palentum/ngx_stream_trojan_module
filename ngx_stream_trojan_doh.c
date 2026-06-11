@@ -160,7 +160,7 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
     uint16_t              dns_id, flags, qdcount, ancount;
     uint16_t              rtype, rdlength;
     uint32_t              ttl, min_ttl;
-    ngx_uint_t            i, n;
+    ngx_uint_t            i, n, max_addrs;
     ngx_resolver_addr_t  *addrs;
     struct sockaddr_storage  sa_buf;
     socklen_t             socklen;
@@ -200,58 +200,25 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
 
     if (ancount == 0) return NGX_DECLINED;
 
-    /* pre-scan answers */
-    {
-        u_char  *scan;
-        uint16_t an, rdlen;
-
-        n = 0;
-        min_ttl = 0xffffffff;
-        scan = p;
-        for (an = 0; an < ancount; an++) {
-            scan = ngx_stream_trojan_doh_skip_name(scan, start, end);
-            if (scan == NULL || (size_t) (end - scan) < 10) return NGX_ERROR;
-
-            rtype = ((uint16_t) scan[0] << 8) | scan[1];
-            ttl = ((uint32_t) scan[4] << 24) | ((uint32_t) scan[5] << 16)
-                  | ((uint32_t) scan[6] << 8) | scan[7];
-            rdlen = ((uint16_t) scan[8] << 8) | scan[9];
-            scan += 10;
-
-            if ((size_t) (end - scan) < rdlen) return NGX_ERROR;
-
-            if ((rtype == 1 && rdlen == 4)
-#if (NGX_HAVE_INET6)
-                || (rtype == 28 && rdlen == 16)
-#endif
-                )
-            {
-                n++;
-                if (ttl < min_ttl) {
-                    min_ttl = ttl;
-                }
-            } else if (rtype == 5) {
-                if (ttl < min_ttl) {
-                    min_ttl = ttl;
-                }
-            }
-
-            scan += rdlen;
-        }
+    max_addrs = ancount;
+    n = (ngx_uint_t) (len / (2 + 10 + 4) + 1);
+    if (max_addrs > n) {
+        max_addrs = n;
     }
 
-    if (n == 0) return NGX_DECLINED;
-
-    addrs = ngx_pcalloc(pool, n * sizeof(ngx_resolver_addr_t));
+    addrs = ngx_pcalloc(pool, max_addrs * sizeof(ngx_resolver_addr_t));
     if (addrs == NULL) return NGX_ERROR;
 
     n = 0;
+    min_ttl = 0xffffffff;
 
     for (i = 0; i < ancount; i++) {
         p = ngx_stream_trojan_doh_skip_name(p, start, end);
         if (p == NULL || (size_t) (end - p) < 10) return NGX_ERROR;
 
         rtype    = ((uint16_t) p[0] << 8) | p[1];
+        ttl = ((uint32_t) p[4] << 24) | ((uint32_t) p[5] << 16)
+              | ((uint32_t) p[6] << 8) | p[7];
         rdlength = ((uint16_t) p[8] << 8) | p[9];
         p += 10;
 
@@ -262,15 +229,30 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
                                                 &socklen)
             == NGX_OK)
         {
+            if (n == max_addrs) {
+                return NGX_ERROR;
+            }
+
             addrs[n].sockaddr = ngx_palloc(pool, socklen);
             if (addrs[n].sockaddr == NULL) return NGX_ERROR;
             ngx_memcpy(addrs[n].sockaddr, &sa_buf, socklen);
             addrs[n].socklen = socklen;
             n++;
+
+            if (ttl < min_ttl) {
+                min_ttl = ttl;
+            }
+
+        } else if (rtype == 5) {
+            if (ttl < min_ttl) {
+                min_ttl = ttl;
+            }
         }
 
         p += rdlength;
     }
+
+    if (n == 0) return NGX_DECLINED;
 
     *addrs_p = addrs;
     *naddrs_p = n;
