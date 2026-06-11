@@ -424,9 +424,11 @@ int
 ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len,
     ngx_stream_trojan_udp_frame_t *frame)
 {
-    size_t host_len;
-    size_t pos;
-    size_t wire_len;
+    size_t         host_len;
+    size_t         pos;
+    size_t         wire_len;
+    uint16_t       port;
+    const uint8_t *host;
 
     if (buf == NULL || frame == NULL) {
         return NGX_STREAM_TROJAN_PARSE_ERROR;
@@ -438,12 +440,18 @@ ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len,
         return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
     }
 
-    switch (buf[0]) {
+    frame->addr.type = buf[0];
+
+    switch (frame->addr.type) {
     case NGX_STREAM_TROJAN_ADDR_IPV4:
-        wire_len = 1 + 4 + 2;
+        host_len = 4;
+        wire_len = 1 + host_len + 2;
         if (len < wire_len) {
             return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
         }
+        host = buf + 1;
+        port = (uint16_t) ((buf[1 + host_len] << 8)
+                           | buf[1 + host_len + 1]);
         break;
 
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
@@ -460,24 +468,41 @@ ngx_stream_trojan_parse_udp_frame(const uint8_t *buf, size_t len,
         if (len < wire_len) {
             return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
         }
+
+        host = buf + 2;
+        if (!ngx_stream_trojan_valid_domain(host, host_len)) {
+            return NGX_STREAM_TROJAN_PARSE_ERROR;
+        }
+
+        port = (uint16_t) ((buf[2 + host_len] << 8)
+                           | buf[2 + host_len + 1]);
         break;
 
     case NGX_STREAM_TROJAN_ADDR_IPV6:
-        wire_len = 1 + 16 + 2;
+        host_len = 16;
+        wire_len = 1 + host_len + 2;
         if (len < wire_len) {
             return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
         }
+        host = buf + 1;
+        port = (uint16_t) ((buf[1 + host_len] << 8)
+                           | buf[1 + host_len + 1]);
         break;
 
     default:
         return NGX_STREAM_TROJAN_PARSE_ERROR;
     }
 
-    if (ngx_stream_trojan_parse_addr(buf, wire_len, &frame->addr) != 0) {
+    if (port == 0) {
         return NGX_STREAM_TROJAN_PARSE_ERROR;
     }
 
-    pos = frame->addr.wire_len;
+    memcpy(frame->addr.host, host, host_len);
+    frame->addr.host_len = host_len;
+    frame->addr.port = port;
+    frame->addr.wire_len = wire_len;
+
+    pos = wire_len;
     if (len < pos + 4) {
         return NGX_STREAM_TROJAN_PARSE_NEED_MORE;
     }
