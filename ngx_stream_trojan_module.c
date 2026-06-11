@@ -729,6 +729,8 @@ static ngx_int_t ngx_stream_trojan_resolver_addr_to_ngx_addr(ngx_pool_t *pool,
     ngx_resolver_addr_t *resolved, uint16_t port, ngx_addr_t *out);
 static ngx_uint_t ngx_stream_trojan_current_ip_prefer(
     ngx_stream_trojan_ctx_t *ctx);
+static ngx_uint_t ngx_stream_trojan_header_end_seen(u_char *buf, size_t len,
+    size_t *scan);
 static ngx_stream_trojan_dns_rule_group_t *ngx_stream_trojan_match_dns_rule(
     ngx_stream_trojan_srv_conf_t *conf, ngx_stream_trojan_addr_t *addr);
 static ngx_int_t ngx_stream_trojan_parse_ip_prefer(ngx_str_t *value,
@@ -9461,10 +9463,8 @@ static ngx_int_t
 ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
 {
     ssize_t            n;
-    ngx_connection_t  *c;
     ngx_buf_t         *b;
 
-    c = ctx->session->connection;
     b = ctx->udp_pending_to_client;
 
     if (b == NULL) {
