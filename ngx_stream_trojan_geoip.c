@@ -44,6 +44,9 @@ static ngx_int_t ngx_stream_trojan_geoip_parse_cidr(ngx_conf_t *cf,
     ngx_stream_trojan_geoip_entry_t *entry, u_char *data, size_t len);
 static ngx_int_t ngx_stream_trojan_geoip_validate(ngx_conf_t *cf,
     ngx_stream_trojan_geoip_t *geoip);
+static int ngx_stream_trojan_geoip_entry_cmp(const void *one,
+    const void *two);
+static int ngx_stream_trojan_geoip_code_cmp(ngx_str_t *a, ngx_str_t *b);
 static ngx_int_t ngx_stream_trojan_geoip_read_varint(
     ngx_stream_trojan_geoip_reader_t *r, uint64_t *value);
 static ngx_int_t ngx_stream_trojan_geoip_read_bytes(
@@ -365,12 +368,49 @@ ngx_stream_trojan_geoip_parse_cidr(ngx_conf_t *cf,
 }
 
 
+static int
+ngx_stream_trojan_geoip_code_cmp(ngx_str_t *a, ngx_str_t *b)
+{
+    int     rc;
+    size_t  len;
+
+    len = a->len < b->len ? a->len : b->len;
+    rc = ngx_memcmp(a->data, b->data, len);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (a->len < b->len) {
+        return -1;
+    }
+
+    if (a->len > b->len) {
+        return 1;
+    }
+
+    return 0;
+}
+
+
+static int
+ngx_stream_trojan_geoip_entry_cmp(const void *one, const void *two)
+{
+    ngx_stream_trojan_geoip_entry_t *a, *b;
+
+    a = *(ngx_stream_trojan_geoip_entry_t **) one;
+    b = *(ngx_stream_trojan_geoip_entry_t **) two;
+
+    return ngx_stream_trojan_geoip_code_cmp(&a->code, &b->code);
+}
+
+
 static ngx_int_t
 ngx_stream_trojan_geoip_validate(ngx_conf_t *cf,
     ngx_stream_trojan_geoip_t *geoip)
 {
-    ngx_uint_t                         i, j;
+    ngx_uint_t                         i;
     ngx_stream_trojan_geoip_entry_t   *entries;
+    ngx_stream_trojan_geoip_entry_t  **sorted;
 
     if (geoip->entries->nelts == 0) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -380,6 +420,12 @@ ngx_stream_trojan_geoip_validate(ngx_conf_t *cf,
     }
 
     entries = geoip->entries->elts;
+    sorted = ngx_palloc(cf->pool, geoip->entries->nelts
+                                  * sizeof(ngx_stream_trojan_geoip_entry_t *));
+    if (sorted == NULL) {
+        return NGX_ERROR;
+    }
+
     for (i = 0; i < geoip->entries->nelts; i++) {
         if (entries[i].cidrs == NULL || entries[i].cidrs->nelts == 0) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -389,19 +435,23 @@ ngx_stream_trojan_geoip_validate(ngx_conf_t *cf,
             return NGX_ERROR;
         }
 
-        for (j = i + 1; j < geoip->entries->nelts; j++) {
-            if (entries[i].code.len == entries[j].code.len
-                && ngx_strncmp(entries[i].code.data, entries[j].code.data,
-                               entries[i].code.len)
-                   == 0)
-            {
-                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                                   "duplicate geoip entry \"%V\" in \"%V\"",
-                                   &entries[i].code, &geoip->path);
-                return NGX_ERROR;
-            }
-        }
+        sorted[i] = &entries[i];
+    }
 
+    qsort(sorted, geoip->entries->nelts,
+          sizeof(ngx_stream_trojan_geoip_entry_t *),
+          ngx_stream_trojan_geoip_entry_cmp);
+
+    for (i = 1; i < geoip->entries->nelts; i++) {
+        if (ngx_stream_trojan_geoip_code_cmp(&sorted[i - 1]->code,
+                                             &sorted[i]->code)
+            == 0)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "duplicate geoip entry \"%V\" in \"%V\"",
+                               &sorted[i]->code, &geoip->path);
+            return NGX_ERROR;
+        }
     }
 
     return NGX_OK;
