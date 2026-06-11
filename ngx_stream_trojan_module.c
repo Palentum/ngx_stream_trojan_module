@@ -2318,10 +2318,7 @@ ngx_stream_trojan_websocket_ensure_raw(ngx_stream_trojan_ctx_t *ctx)
         return NGX_OK;
     }
 
-    raw_size = ctx->conf->buffer_size;
-    if (raw_size < NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE) {
-        raw_size = NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE;
-    }
+    raw_size = NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE;
 
     ctx->ws_raw = ngx_stream_trojan_create_temp_buf(
         ctx->session->connection->pool, raw_size);
@@ -2398,17 +2395,17 @@ ngx_stream_trojan_process_websocket_handshake(ngx_stream_trojan_ctx_t *ctx)
                 return;
             }
 
-            if (ngx_stream_trojan_websocket_ensure_raw(ctx) != NGX_OK) {
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
-                return;
-            }
-
-            raw = ctx->ws_raw;
-
             extra = len - hs.header_len;
-            raw->pos = raw->start;
-            raw->last = raw->start;
             if (extra) {
+                if (ngx_stream_trojan_websocket_ensure_raw(ctx) != NGX_OK) {
+                    ngx_stream_trojan_finalize(ctx,
+                                                NGX_STREAM_INTERNAL_SERVER_ERROR);
+                    return;
+                }
+
+                raw = ctx->ws_raw;
+                raw->pos = raw->start;
+                raw->last = raw->start;
                 ngx_memcpy(raw->last, b->pos + hs.header_len, extra);
                 raw->last += extra;
             }
@@ -2487,14 +2484,7 @@ ngx_stream_trojan_flush_websocket_response(ngx_stream_trojan_ctx_t *ctx)
         return;
     }
 
-    if (ctx->ws_out == NULL) {
-        ctx->ws_out = ngx_stream_trojan_create_temp_buf(
-            c->pool, 2 + NGX_STREAM_TROJAN_WS_MAX_CONTROL_PAYLOAD);
-        if (ctx->ws_out == NULL) {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
-            return;
-        }
-    }
+    ctx->ws_out = b;
 
     ctx->websocket = 1;
     ctx->state = ngx_stream_trojan_state_prefix;
@@ -2524,6 +2514,10 @@ ngx_stream_trojan_websocket_read_raw(ngx_stream_trojan_ctx_t *ctx,
 
     if (size == 0) {
         return NGX_AGAIN;
+    }
+
+    if (ngx_stream_trojan_websocket_ensure_raw(ctx) != NGX_OK) {
+        return NGX_ERROR;
     }
 
     b = ctx->ws_raw;
@@ -2571,7 +2565,7 @@ ngx_stream_trojan_websocket_read_payload(ngx_stream_trojan_ctx_t *ctx,
 
     b = ctx->ws_raw;
 
-    if (b->pos < b->last) {
+    if (b != NULL && b->pos < b->last) {
         n = (size_t) (b->last - b->pos);
         if (n > size) {
             n = size;
@@ -2587,8 +2581,10 @@ ngx_stream_trojan_websocket_read_payload(ngx_stream_trojan_ctx_t *ctx,
         return (ssize_t) n;
     }
 
-    b->pos = b->start;
-    b->last = b->start;
+    if (b != NULL) {
+        b->pos = b->start;
+        b->last = b->start;
+    }
 
     c = ctx->session->connection;
     return c->recv(c, dst, size);
