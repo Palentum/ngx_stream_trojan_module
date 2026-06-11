@@ -1144,7 +1144,7 @@ ngx_stream_trojan_read_client(ngx_event_t *ev)
     case ngx_stream_trojan_state_connecting:
     case ngx_stream_trojan_state_socks5_tcp:
     case ngx_stream_trojan_state_socks5_udp:
-        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        if (ngx_stream_trojan_update_read_event(c, 1) != NGX_OK) {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
         }
         break;
