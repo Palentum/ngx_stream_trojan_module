@@ -253,6 +253,9 @@ typedef enum {
 } ngx_stream_trojan_peer_e;
 
 typedef struct ngx_stream_trojan_mux_stream_s ngx_stream_trojan_mux_stream_t;
+#define NGX_STREAM_TROJAN_MUX_TOMBSTONE \
+    ((ngx_stream_trojan_mux_stream_t *) (uintptr_t) 1)
+
 
 
 typedef enum {
@@ -7020,26 +7023,39 @@ static ngx_int_t
 ngx_stream_trojan_mux_insert_stream(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_mux_stream_t *stream)
 {
-    ngx_uint_t                       i, n;
+    ngx_uint_t                       i, n, tombstone;
     ngx_stream_trojan_mux_stream_t  *entry;
 
     i = ngx_stream_trojan_mux_stream_slot(stream->id);
+    tombstone = NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE;
 
     for (n = 0; n < NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE; n++) {
         entry = ctx->mux_stream_table[i];
 
         if (entry == NULL) {
-            ctx->mux_stream_table[i] = stream;
+            ctx->mux_stream_table[
+                tombstone == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE
+                    ? i : tombstone] = stream;
             return NGX_OK;
         }
 
-        if (entry->id == stream->id) {
+        if (entry == NGX_STREAM_TROJAN_MUX_TOMBSTONE) {
+            if (tombstone == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
+                tombstone = i;
+            }
+
+        } else if (entry->id == stream->id) {
             return NGX_ERROR;
         }
 
         if (++i == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
             i = 0;
         }
+    }
+
+    if (tombstone != NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
+        ctx->mux_stream_table[tombstone] = stream;
+        return NGX_OK;
     }
 
     return NGX_ERROR;
@@ -7063,20 +7079,8 @@ ngx_stream_trojan_mux_remove_stream(ngx_stream_trojan_ctx_t *ctx,
         }
 
         if (entry == stream) {
-            ctx->mux_stream_table[i] = NULL;
-
-            for ( ;; ) {
-                if (++i == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
-                    i = 0;
-                }
-
-                entry = ctx->mux_stream_table[i];
-                if (entry == NULL) {
-                    return;
-                }
-                ctx->mux_stream_table[i] = NULL;
-                (void) ngx_stream_trojan_mux_insert_stream(ctx, entry);
-            }
+            ctx->mux_stream_table[i] = NGX_STREAM_TROJAN_MUX_TOMBSTONE;
+            return;
         }
 
         if (++i == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
@@ -7101,7 +7105,9 @@ ngx_stream_trojan_mux_find_stream(ngx_stream_trojan_ctx_t *ctx, uint32_t id)
             return NULL;
         }
 
-        if (stream->id == id) {
+        if (stream != NGX_STREAM_TROJAN_MUX_TOMBSTONE
+            && stream->id == id)
+        {
             return stream;
         }
 
