@@ -154,11 +154,12 @@ ngx_stream_trojan_doh_extract_rdata(uint16_t rtype, u_char *rdata,
 ngx_int_t
 ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
     uint16_t expected_id, ngx_resolver_addr_t **addrs_p,
-    ngx_uint_t *naddrs_p, ngx_pool_t *pool)
+    ngx_uint_t *naddrs_p, ngx_pool_t *pool, uint32_t *ttl_p)
 {
     u_char               *p, *end, *start;
     uint16_t              dns_id, flags, qdcount, ancount;
     uint16_t              rtype, rdlength;
+    uint32_t              ttl, min_ttl;
     ngx_uint_t            i, n;
     ngx_resolver_addr_t  *addrs;
     struct sockaddr_storage  sa_buf;
@@ -166,6 +167,10 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
 
     *addrs_p = NULL;
     *naddrs_p = 0;
+
+    if (ttl_p) {
+        *ttl_p = 0;
+    }
 
     if (len < 12) return NGX_ERROR;
 
@@ -201,12 +206,15 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
         uint16_t an, rdlen;
 
         n = 0;
+        min_ttl = 0xffffffff;
         scan = p;
         for (an = 0; an < ancount; an++) {
             scan = ngx_stream_trojan_doh_skip_name(scan, start, end);
             if (scan == NULL || (size_t) (end - scan) < 10) return NGX_ERROR;
 
             rtype = ((uint16_t) scan[0] << 8) | scan[1];
+            ttl = ((uint32_t) scan[4] << 24) | ((uint32_t) scan[5] << 16)
+                  | ((uint32_t) scan[6] << 8) | scan[7];
             rdlen = ((uint16_t) scan[8] << 8) | scan[9];
             scan += 10;
 
@@ -219,6 +227,9 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
                 )
             {
                 n++;
+                if (ttl < min_ttl) {
+                    min_ttl = ttl;
+                }
             }
 
             scan += rdlen;
@@ -259,6 +270,9 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
 
     *addrs_p = addrs;
     *naddrs_p = n;
+    if (ttl_p && n > 0) {
+        *ttl_p = min_ttl == 0xffffffff ? 0 : min_ttl;
+    }
 
     return n > 0 ? NGX_OK : NGX_ERROR;
 }
@@ -279,6 +293,7 @@ ngx_stream_trojan_doh_parse_url(ngx_str_t *url,
 #endif
 
     ngx_memzero(doh_conf, sizeof(ngx_stream_trojan_doh_conf_t));
+    ngx_queue_init(&doh_conf->pending);
     doh_conf->port = 443;
     doh_conf->https = 1;
     doh_conf->timeout = NGX_STREAM_TROJAN_DOH_DEFAULT_TIMEOUT;
@@ -473,11 +488,17 @@ struct ngx_stream_trojan_doh_ctx_s {
 
     u_char                       query[NGX_STREAM_TROJAN_DOH_MAX_QUERY_SIZE];
     size_t                       query_len;
+    u_char                       name[255];
+    size_t                       name_len;
+    uint16_t                     qtype;
     uint16_t                     dns_id;
 
     ngx_peer_connection_t        peer;
     ngx_stream_trojan_doh_ctx_t **owner;
+    ngx_queue_t                  queue;
     unsigned                     peer_initialized:1;
+    unsigned                     queued:1;
+    unsigned                     active:1;
     ngx_uint_t                   addr_idx;
 
 
@@ -503,7 +524,7 @@ struct ngx_stream_trojan_doh_ctx_s {
 
     ngx_resolver_addr_t         *addrs;
     ngx_uint_t                   naddrs;
-    ngx_pool_t                  *parse_pool;
+    uint32_t                     answer_ttl;
 
     void                        *cb_data;
     ngx_stream_trojan_doh_handler_pt cb_handler;
@@ -512,6 +533,17 @@ struct ngx_stream_trojan_doh_ctx_s {
 };
 
 
+static ngx_stream_trojan_doh_cache_entry_t *
+    ngx_stream_trojan_doh_cache_lookup(ngx_stream_trojan_doh_conf_t *conf,
+    u_char *name, size_t name_len, uint16_t qtype);
+static void ngx_stream_trojan_doh_cache_store(
+    ngx_stream_trojan_doh_conf_t *conf, u_char *name, size_t name_len,
+    uint16_t qtype, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs,
+    uint32_t ttl);
+static ngx_int_t ngx_stream_trojan_doh_start_request(
+    ngx_stream_trojan_doh_ctx_t *doh);
+static void ngx_stream_trojan_doh_run_pending(
+    ngx_stream_trojan_doh_conf_t *conf);
 static ngx_int_t ngx_stream_trojan_doh_get_peer(
     ngx_peer_connection_t *pc, void *data);
 static void ngx_stream_trojan_doh_connected(ngx_stream_trojan_doh_ctx_t *doh);
@@ -526,6 +558,145 @@ static void ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
 #if (NGX_SSL)
 static void ngx_stream_trojan_doh_ssl_handshake_handler(ngx_connection_t *c);
 #endif
+
+
+static u_char
+ngx_stream_trojan_doh_lc(u_char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') ? (u_char) (ch | 0x20) : ch;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_doh_name_eq(ngx_stream_trojan_doh_cache_entry_t *e,
+    u_char *name, size_t name_len)
+{
+    size_t  i;
+
+    if (e->name_len != name_len) {
+        return 0;
+    }
+
+    for (i = 0; i < name_len; i++) {
+        if (e->name[i] != ngx_stream_trojan_doh_lc(name[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static ngx_stream_trojan_doh_cache_entry_t *
+ngx_stream_trojan_doh_cache_lookup(ngx_stream_trojan_doh_conf_t *conf,
+    u_char *name, size_t name_len, uint16_t qtype)
+{
+    ngx_uint_t                             i;
+    ngx_msec_t                            now;
+    ngx_stream_trojan_doh_cache_entry_t  *e;
+
+    if (name_len == 0 || name_len > 255) {
+        return NULL;
+    }
+
+    now = ngx_current_msec;
+    e = conf->cache;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES; i++) {
+        if (!e[i].valid) {
+            continue;
+        }
+
+        if ((ngx_msec_int_t) (e[i].expire - now) <= 0) {
+            e[i].valid = 0;
+            continue;
+        }
+
+        if (e[i].qtype == qtype
+            && ngx_stream_trojan_doh_name_eq(&e[i], name, name_len))
+        {
+            e[i].accessed = ++conf->cache_generation;
+            return &e[i];
+        }
+    }
+
+    return NULL;
+}
+
+
+static void
+ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
+    u_char *name, size_t name_len, uint16_t qtype,
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, uint32_t ttl)
+{
+    ngx_uint_t                             i, oldest;
+    ngx_msec_t                            now, ttl_ms;
+    ngx_stream_trojan_doh_cache_entry_t  *e, *slot;
+
+    if (ttl == 0 || name_len == 0 || name_len > 255
+        || naddrs == 0 || naddrs > NGX_STREAM_TROJAN_DOH_CACHE_ADDRS)
+    {
+        return;
+    }
+
+    if (ttl > NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL) {
+        ttl = NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL;
+    }
+
+    ttl_ms = (ngx_msec_t) ttl * 1000;
+    now = ngx_current_msec;
+    e = conf->cache;
+    slot = NULL;
+    oldest = 0;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES; i++) {
+        if (e[i].valid
+            && e[i].qtype == qtype
+            && ngx_stream_trojan_doh_name_eq(&e[i], name, name_len))
+        {
+            slot = &e[i];
+            break;
+        }
+
+        if (!e[i].valid
+            || (ngx_msec_int_t) (e[i].expire - now) <= 0)
+        {
+            slot = &e[i];
+            break;
+        }
+
+        if (e[i].accessed < e[oldest].accessed) {
+            oldest = i;
+        }
+    }
+
+    if (slot == NULL) {
+        slot = &e[oldest];
+    }
+
+    slot->valid = 0;
+    slot->qtype = qtype;
+    slot->name_len = name_len;
+    for (i = 0; i < name_len; i++) {
+        slot->name[i] = ngx_stream_trojan_doh_lc(name[i]);
+    }
+
+    slot->naddrs = naddrs;
+    for (i = 0; i < naddrs; i++) {
+        if (addrs[i].socklen > (socklen_t) sizeof(struct sockaddr_storage)) {
+            return;
+        }
+
+        ngx_memzero(&slot->addrs[i], sizeof(ngx_resolver_addr_t));
+        ngx_memcpy(&slot->sockaddr[i], addrs[i].sockaddr, addrs[i].socklen);
+        slot->addrs[i].sockaddr = (struct sockaddr *) &slot->sockaddr[i];
+        slot->addrs[i].socklen = addrs[i].socklen;
+    }
+
+    slot->expire = now + ttl_ms;
+    slot->accessed = ++conf->cache_generation;
+    slot->valid = 1;
+}
 
 
 static ngx_int_t
@@ -720,21 +891,106 @@ ngx_stream_trojan_doh_test_connect(ngx_connection_t *c)
 }
 
 
+static ngx_int_t
+ngx_stream_trojan_doh_start_request(ngx_stream_trojan_doh_ctx_t *doh)
+{
+    ngx_connection_t             *c;
+    ngx_stream_trojan_doh_conf_t *conf;
+    ngx_int_t                     rc;
+
+    conf = doh->conf;
+
+    ngx_memzero(&doh->peer, sizeof(ngx_peer_connection_t));
+    doh->peer.log = doh->log;
+    doh->peer.log_error = NGX_ERROR_ERR;
+    doh->peer.get = ngx_stream_trojan_doh_get_peer;
+    doh->peer.data = doh;
+    doh->peer.type = SOCK_STREAM;
+    doh->peer.tries = conf->naddrs;
+    doh->peer.start_time = ngx_current_msec;
+
+    rc = ngx_event_connect_peer(&doh->peer);
+    if (rc == NGX_ERROR || rc == NGX_BUSY || rc == NGX_DECLINED) {
+        if (doh->peer.connection) {
+            ngx_close_connection(doh->peer.connection);
+            doh->peer.connection = NULL;
+        }
+        return NGX_ERROR;
+    }
+
+    doh->peer_initialized = 1;
+
+    c = doh->peer.connection;
+    if (c == NULL) {
+        return NGX_ERROR;
+    }
+
+    doh->active = 1;
+    conf->active++;
+
+    c->data = doh;
+    c->pool = doh->pool;
+    c->log = doh->log;
+    c->read->log = doh->log;
+    c->write->log = doh->log;
+
+    if (rc == NGX_AGAIN) {
+        c->write->handler = ngx_stream_trojan_doh_event_handler;
+        c->read->handler = ngx_stream_trojan_doh_event_handler;
+        ngx_add_timer(c->write, conf->timeout);
+        return NGX_OK;
+    }
+
+    ngx_stream_trojan_doh_connected(doh);
+    return NGX_OK;
+}
+
+
+static void
+ngx_stream_trojan_doh_run_pending(ngx_stream_trojan_doh_conf_t *conf)
+{
+    ngx_queue_t                  *q;
+    ngx_stream_trojan_doh_ctx_t  *doh;
+
+    if (conf->active >= NGX_STREAM_TROJAN_DOH_MAX_ACTIVE
+        || ngx_queue_empty(&conf->pending))
+    {
+        return;
+    }
+
+    q = ngx_queue_head(&conf->pending);
+    ngx_queue_remove(q);
+    conf->pending_n--;
+
+    doh = ngx_queue_data(q, ngx_stream_trojan_doh_ctx_t, queue);
+    doh->queued = 0;
+
+    if (ngx_stream_trojan_doh_start_request(doh) != NGX_OK) {
+        ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+    }
+}
+
+
 ngx_int_t
 ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     u_char *name, size_t name_len, uint16_t qtype,
     ngx_log_t *log, void *data, ngx_stream_trojan_doh_handler_pt handler,
     ngx_stream_trojan_doh_ctx_t **ctxp)
 {
-    ngx_stream_trojan_doh_ctx_t  *doh;
-    ngx_connection_t             *c;
-    ngx_pool_t                   *pool;
-    ngx_int_t                     rc;
-    uint16_t                      dns_id;
-    size_t                        qlen;
+    ngx_stream_trojan_doh_ctx_t         *doh;
+    ngx_stream_trojan_doh_cache_entry_t *ce;
+    ngx_pool_t                          *pool;
+    uint16_t                             dns_id;
+    size_t                               qlen;
 
     if (ctxp == NULL || *ctxp != NULL) {
         return NGX_BUSY;
+    }
+
+    ce = ngx_stream_trojan_doh_cache_lookup(doh_conf, name, name_len, qtype);
+    if (ce != NULL) {
+        handler(data, NGX_OK, ce->addrs, ce->naddrs);
+        return NGX_OK;
     }
 
     pool = ngx_create_pool(4096, log);
@@ -751,6 +1007,8 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     doh->log = log;
     doh->cb_data = data;
     doh->cb_handler = handler;
+    doh->owner = ctxp;
+    ngx_queue_init(&doh->queue);
 
     dns_id = (uint16_t) ngx_random();
 
@@ -763,58 +1021,35 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     }
 
     doh->query_len = qlen;
+    ngx_memcpy(doh->name, name, name_len);
+    doh->name_len = name_len;
+    doh->qtype = qtype;
     doh->dns_id = dns_id;
 
-
-
-    ngx_memzero(&doh->peer, sizeof(ngx_peer_connection_t));
-    doh->peer.log = log;
-    doh->peer.log_error = NGX_ERROR_ERR;
-    doh->peer.get = ngx_stream_trojan_doh_get_peer;
-    doh->peer.data = doh;
-    doh->peer.type = SOCK_STREAM;
-    doh->peer.tries = doh_conf->naddrs;
-    doh->peer.start_time = ngx_current_msec;
-
-    rc = ngx_event_connect_peer(&doh->peer);
-    if (rc == NGX_ERROR || rc == NGX_BUSY || rc == NGX_DECLINED) {
-        goto fail;
-    }
-
-    doh->peer_initialized = 1;
-
-    c = doh->peer.connection;
-    if (c == NULL) {
-        goto fail;
-    }
-
-    c->data = doh;
-    c->pool = pool;
-    c->log = log;
-    c->read->log = log;
-    c->write->log = log;
-
-    doh->owner = ctxp;
     *ctxp = doh;
 
-    if (rc == NGX_AGAIN) {
-        c->write->handler = ngx_stream_trojan_doh_event_handler;
-        c->read->handler = ngx_stream_trojan_doh_event_handler;
-        ngx_add_timer(c->write, doh_conf->timeout);
+    if (doh_conf->active >= NGX_STREAM_TROJAN_DOH_MAX_ACTIVE) {
+        if (doh_conf->pending_n >= NGX_STREAM_TROJAN_DOH_MAX_PENDING) {
+            *ctxp = NULL;
+            ngx_destroy_pool(pool);
+            return NGX_BUSY;
+        }
+
+        doh->queued = 1;
+        doh_conf->pending_n++;
+        ngx_queue_insert_tail(&doh_conf->pending, &doh->queue);
         return NGX_OK;
     }
 
-    ngx_stream_trojan_doh_connected(doh);
-    return NGX_OK;
-
-fail:
-    if (doh->peer.connection) {
-        ngx_close_connection(doh->peer.connection);
-        doh->peer.connection = NULL;
+    if (ngx_stream_trojan_doh_start_request(doh) != NGX_OK) {
+        *ctxp = NULL;
+        ngx_destroy_pool(pool);
+        return NGX_ERROR;
     }
-    ngx_destroy_pool(pool);
-    return NGX_ERROR;
+
+    return NGX_OK;
 }
+
 
 
 static void
@@ -1190,17 +1425,10 @@ static void
 ngx_stream_trojan_doh_parse_done(ngx_stream_trojan_doh_ctx_t *doh)
 {
     ngx_int_t   rc;
-    ngx_pool_t *pp;
-
-    pp = ngx_create_pool(512, doh->log);
-    if (pp == NULL) {
-        ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
-        return;
-    }
-    doh->parse_pool = pp;
 
     rc = ngx_stream_trojan_doh_parse_response(doh->body_start,
-        doh->body_len, doh->dns_id, &doh->addrs, &doh->naddrs, pp);
+        doh->body_len, doh->dns_id, &doh->addrs, &doh->naddrs, doh->pool,
+        &doh->answer_ttl);
 
     if (rc != NGX_OK) {
         if (rc != NGX_DECLINED) {
@@ -1213,6 +1441,9 @@ ngx_stream_trojan_doh_parse_done(ngx_stream_trojan_doh_ctx_t *doh)
         return;
     }
 
+    ngx_stream_trojan_doh_cache_store(doh->conf, doh->name, doh->name_len,
+                                      doh->qtype, doh->addrs, doh->naddrs,
+                                      doh->answer_ttl);
     ngx_stream_trojan_doh_finish(doh, NGX_OK);
 }
 
@@ -1434,23 +1665,43 @@ ngx_stream_trojan_doh_close(ngx_stream_trojan_doh_ctx_t *doh)
 void
 ngx_stream_trojan_doh_cancel(ngx_stream_trojan_doh_ctx_t *doh)
 {
-    ngx_pool_t  *pool;
+    ngx_pool_t                     *pool;
+    ngx_stream_trojan_doh_conf_t   *conf;
+    ngx_uint_t                      run_pending;
 
     if (doh == NULL || doh->read_state == DOH_DONE) {
         return;
     }
 
+    conf = doh->conf;
+    run_pending = 0;
+
+    if (doh->queued) {
+        ngx_queue_remove(&doh->queue);
+        doh->queued = 0;
+        if (conf->pending_n) {
+            conf->pending_n--;
+        }
+    }
+
+    if (doh->active) {
+        doh->active = 0;
+        if (conf->active) {
+            conf->active--;
+        }
+        run_pending = 1;
+    }
+
     doh->read_state = DOH_DONE;
     ngx_stream_trojan_doh_close(doh);
-
-    if (doh->parse_pool) {
-        ngx_destroy_pool(doh->parse_pool);
-        doh->parse_pool = NULL;
-    }
 
     pool = doh->pool;
     if (pool) {
         ngx_destroy_pool(pool);
+    }
+
+    if (run_pending) {
+        ngx_stream_trojan_doh_run_pending(conf);
     }
 }
 
@@ -1459,14 +1710,34 @@ static void
 ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
     ngx_int_t status)
 {
-    ngx_pool_t                      *pool;
-    void                            *cb_data;
-    ngx_stream_trojan_doh_handler_pt cb_handler;
-    ngx_resolver_addr_t             *addrs;
-    ngx_uint_t                       naddrs;
+    ngx_pool_t                       *pool;
+    void                             *cb_data;
+    ngx_stream_trojan_doh_handler_pt  cb_handler;
+    ngx_resolver_addr_t              *addrs;
+    ngx_uint_t                        naddrs, run_pending;
+    ngx_stream_trojan_doh_conf_t     *conf;
 
     if (doh->read_state == DOH_DONE) return;
     doh->read_state = DOH_DONE;
+
+    conf = doh->conf;
+    run_pending = 0;
+
+    if (doh->queued) {
+        ngx_queue_remove(&doh->queue);
+        doh->queued = 0;
+        if (conf->pending_n) {
+            conf->pending_n--;
+        }
+    }
+
+    if (doh->active) {
+        doh->active = 0;
+        if (conf->active) {
+            conf->active--;
+        }
+        run_pending = 1;
+    }
 
     ngx_stream_trojan_doh_close(doh);
 
@@ -1481,13 +1752,12 @@ ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
         cb_handler(cb_data, status, NULL, 0);
     }
 
-    if (doh->parse_pool) {
-        ngx_destroy_pool(doh->parse_pool);
-        doh->parse_pool = NULL;
-    }
-
     pool = doh->pool;
     if (pool) {
         ngx_destroy_pool(pool);
+    }
+
+    if (run_pending) {
+        ngx_stream_trojan_doh_run_pending(conf);
     }
 }
