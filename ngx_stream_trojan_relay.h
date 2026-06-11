@@ -3,9 +3,9 @@
 
 #include <stddef.h>
 
-#define NGX_STREAM_TROJAN_RELAY_MAX_LOOPS 16
-#define NGX_STREAM_TROJAN_RELAY_MIN_BYTES (1024 * 1024)
-#define NGX_STREAM_TROJAN_RELAY_MAX_BYTES (4 * 1024 * 1024)
+#define NGX_STREAM_TROJAN_RELAY_MAX_LOOPS 8
+#define NGX_STREAM_TROJAN_RELAY_MIN_BYTES (64 * 1024)
+#define NGX_STREAM_TROJAN_RELAY_MAX_BYTES (256 * 1024)
 
 static inline int
 ngx_stream_trojan_relay_should_continue(size_t loops, size_t bytes,
@@ -20,11 +20,11 @@ ngx_stream_trojan_relay_limit(size_t buffer_size)
 {
     size_t limit;
 
-    if (buffer_size > NGX_STREAM_TROJAN_RELAY_MAX_BYTES / 32) {
+    if (buffer_size > NGX_STREAM_TROJAN_RELAY_MAX_BYTES / 4) {
         return NGX_STREAM_TROJAN_RELAY_MAX_BYTES;
     }
 
-    limit = buffer_size * 32;
+    limit = buffer_size * 4;
 
     if (limit < NGX_STREAM_TROJAN_RELAY_MIN_BYTES) {
         return NGX_STREAM_TROJAN_RELAY_MIN_BYTES;
