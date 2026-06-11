@@ -8945,6 +8945,16 @@ ngx_stream_trojan_process_udp_client(ngx_stream_trojan_ctx_t *ctx)
 
     c = ctx->session->connection;
 
+    rc = ngx_stream_trojan_flush_udp_client(ctx);
+    if (rc == NGX_AGAIN) {
+        return;
+    }
+
+    if (rc != NGX_OK) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        return;
+    }
+
     for ( ;; ) {
         rc = ngx_stream_trojan_parse_udp_frame(
             ctx->udp_in + ctx->udp_in_pos, ctx->udp_in_len, &frame);
