@@ -5503,6 +5503,9 @@ ngx_stream_trojan_mux_read_client_payload(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_mux_stream_t  *stream;
 
     while (ctx->mux_payload_read < ctx->mux_payload_len) {
+        b = NULL;
+        stream = NULL;
+
         remaining = ctx->mux_payload_len - ctx->mux_payload_read;
 
         if (ctx->mux_payload_direct && ctx->mux_payload_stream != NULL
@@ -5555,15 +5558,14 @@ ngx_stream_trojan_mux_read_client_payload(ngx_stream_trojan_ctx_t *ctx,
             return NGX_DONE;
         }
 
-        if (ctx->mux_payload_direct) {
+        if (b != NULL) {
             b->last += n;
-            ngx_stream_trojan_mux_queue_process(ctx->mux_payload_stream);
+            ngx_stream_trojan_mux_queue_process(stream);
         }
 
         ctx->mux_payload_read += (size_t) n;
         ngx_stream_trojan_mux_refresh_read_timeout(ctx, c);
     }
-
     return NGX_OK;
 }
 
