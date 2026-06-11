@@ -502,6 +502,7 @@ struct ngx_stream_trojan_doh_ctx_s {
         DOH_DONE
     } read_state;
     u_char                      *header_start;
+    size_t                       header_bytes;
     u_char                      *body_start;
     size_t                       chunked_decoded_len;
     size_t                       body_len;
@@ -1427,7 +1428,7 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
     ngx_connection_t            *c;
     ngx_stream_trojan_doh_ctx_t *doh;
     ssize_t                      n;
-    size_t                       avail;
+    size_t                       avail, line_len, tail_len;
     u_char                      *p, *end, *line, *sp, *vp;
     ngx_int_t                    status, cl, rc;
 
@@ -1496,6 +1497,12 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
                 }
 
                 doh->http_status = (ngx_uint_t) status;
+                line_len = (size_t) (p + 2 - doh->recv_buf);
+                if (line_len > NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE) {
+                    ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+                    return;
+                }
+                doh->header_bytes = line_len;
                 doh->header_start = p + 2;
                 doh->read_state = DOH_READ_HEADERS;
                 break;
@@ -1526,6 +1533,14 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
                 doh->header_start = doh->recv_buf;
                 goto need_more;
             }
+            line_len = (size_t) (p + 2 - line);
+            if (doh->header_bytes
+                > NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE - line_len)
+            {
+                ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+                return;
+            }
+            doh->header_bytes += line_len;
 
             if (p == line) {
                 p += 2;
