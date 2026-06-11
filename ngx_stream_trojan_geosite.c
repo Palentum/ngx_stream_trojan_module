@@ -3,6 +3,8 @@
 
 #define NGX_STREAM_TROJAN_GEOSITE_MAX_FILE_SIZE   (64 * 1024 * 1024)
 #define NGX_STREAM_TROJAN_GEOSITE_MAX_VALUE_LEN   4096
+#define NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES 64
+
 
 
 typedef enum {
@@ -43,6 +45,15 @@ typedef struct {
 } ngx_stream_trojan_geosite_domain_index_t;
 
 
+typedef struct {
+    ngx_uint_t   valid;
+    ngx_uint_t   accessed;
+    size_t       host_len;
+    u_char       host[256];
+    ngx_uint_t   result;
+} ngx_stream_trojan_geosite_cache_entry_t;
+
+
 struct ngx_stream_trojan_geosite_entry_s {
     ngx_str_t    code;
     ngx_array_t *domains;
@@ -51,11 +62,12 @@ struct ngx_stream_trojan_geosite_entry_s {
     ngx_stream_trojan_geosite_domain_index_t *domain_index;
     ngx_uint_t   domain_index_slots;
     ngx_stream_trojan_geosite_domain_t *plain_index[256];
+    ngx_stream_trojan_geosite_domain_t **regex_domains;
+    ngx_uint_t   regex_domains_n;
     ngx_uint_t   indexes_ready;
-    u_char       cache_host[256];
-    size_t       cache_host_len;
-    ngx_uint_t   cache_result;
-    ngx_uint_t   cache_valid;
+    ngx_stream_trojan_geosite_cache_entry_t
+                 cache[NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES];
+    ngx_uint_t   cache_generation;
 };
 
 
@@ -105,6 +117,82 @@ ngx_stream_trojan_geosite_lc(u_char ch)
 
     return ch;
 }
+
+static ngx_int_t
+ngx_stream_trojan_geosite_cache_lookup(
+    ngx_stream_trojan_geosite_entry_t *entry, const u_char *host,
+    size_t host_len, ngx_uint_t *result)
+{
+    ngx_uint_t                                i;
+    ngx_stream_trojan_geosite_cache_entry_t *e;
+
+    if (host_len > 256) {
+        return 0;
+    }
+
+    e = entry->cache;
+    for (i = 0; i < NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES; i++) {
+        if (!e[i].valid || e[i].host_len != host_len) {
+            continue;
+        }
+
+        if (ngx_strncasecmp(e[i].host, (u_char *) host, host_len) == 0) {
+            e[i].accessed = ++entry->cache_generation;
+            *result = e[i].result;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+static void
+ngx_stream_trojan_geosite_cache_store(
+    ngx_stream_trojan_geosite_entry_t *entry, const u_char *host,
+    size_t host_len, ngx_uint_t result)
+{
+    ngx_uint_t                                i, oldest;
+    ngx_stream_trojan_geosite_cache_entry_t *e, *slot;
+
+    if (host_len > 256) {
+        return;
+    }
+
+    e = entry->cache;
+    slot = NULL;
+    oldest = 0;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES; i++) {
+        if (e[i].valid && e[i].host_len == host_len
+            && ngx_strncasecmp(e[i].host, (u_char *) host, host_len) == 0)
+        {
+            slot = &e[i];
+            break;
+        }
+
+        if (!e[i].valid) {
+            slot = &e[i];
+            break;
+        }
+
+        if (e[i].accessed < e[oldest].accessed) {
+            oldest = i;
+        }
+    }
+
+    if (slot == NULL) {
+        slot = &e[oldest];
+    }
+
+    slot->valid = 0;
+    slot->host_len = host_len;
+    ngx_memcpy(slot->host, host, host_len);
+    slot->result = result;
+    slot->accessed = ++entry->cache_generation;
+    slot->valid = 1;
+}
+
 static ngx_uint_t
 ngx_stream_trojan_geosite_value_hash(const u_char *data, size_t len)
 {
@@ -629,6 +717,7 @@ ngx_stream_trojan_geosite_build_indexes(ngx_conf_t *cf,
     ngx_stream_trojan_geosite_entry_t *entry)
 {
     ngx_uint_t                           i, full_count, domain_count;
+    ngx_uint_t                           regex_count;
     ngx_stream_trojan_geosite_domain_t  *domains, *tail[256];
     u_char                               ch;
 
@@ -638,6 +727,7 @@ ngx_stream_trojan_geosite_build_indexes(ngx_conf_t *cf,
 
     full_count = 0;
     domain_count = 0;
+    regex_count = 0;
     ngx_memzero(tail, sizeof(tail));
 
     domains = entry->domains->elts;
@@ -652,6 +742,10 @@ ngx_stream_trojan_geosite_build_indexes(ngx_conf_t *cf,
 
         case ngx_stream_trojan_geosite_domain:
             domain_count++;
+            break;
+
+        case ngx_stream_trojan_geosite_regex:
+            regex_count++;
             break;
 
         case ngx_stream_trojan_geosite_plain:
@@ -690,6 +784,14 @@ ngx_stream_trojan_geosite_build_indexes(ngx_conf_t *cf,
         }
     }
 
+    if (regex_count != 0) {
+        entry->regex_domains = ngx_pcalloc(cf->pool,
+            regex_count * sizeof(ngx_stream_trojan_geosite_domain_t *));
+        if (entry->regex_domains == NULL) {
+            return NGX_ERROR;
+        }
+    }
+
     for (i = 0; i < entry->domains->nelts; i++) {
         switch (domains[i].type) {
         case ngx_stream_trojan_geosite_full:
@@ -710,6 +812,10 @@ ngx_stream_trojan_geosite_build_indexes(ngx_conf_t *cf,
             {
                 return NGX_ERROR;
             }
+            break;
+
+        case ngx_stream_trojan_geosite_regex:
+            entry->regex_domains[entry->regex_domains_n++] = &domains[i];
             break;
         }
     }
@@ -910,8 +1016,10 @@ ngx_stream_trojan_geosite_match(ngx_stream_trojan_geosite_entry_t *entry,
     u_char                              key[256];
     size_t                              key_len, i;
     ngx_uint_t                          indexed_order, indexed_match;
+    ngx_uint_t                          cacheable, cached;
     ngx_stream_trojan_geosite_domain_t *domains;
 #if (NGX_PCRE)
+    ngx_stream_trojan_geosite_domain_t *domain;
     ngx_str_t                           name;
 #endif
 
@@ -921,12 +1029,12 @@ ngx_stream_trojan_geosite_match(ngx_stream_trojan_geosite_entry_t *entry,
         return 0;
     }
 
-    if ((attr == NULL || attr->len == 0) && !attr_not
-        && entry->cache_valid
-        && entry->cache_host_len == host_len
-        && ngx_strncasecmp(entry->cache_host, (u_char *) host, host_len) == 0)
+    cacheable = (attr == NULL || attr->len == 0) && !attr_not;
+    if (cacheable
+        && ngx_stream_trojan_geosite_cache_lookup(entry, host, host_len,
+                                                  &cached))
     {
-        return entry->cache_result;
+        return cached;
     }
 
     indexed_match = 0;
@@ -945,29 +1053,57 @@ ngx_stream_trojan_geosite_match(ngx_stream_trojan_geosite_entry_t *entry,
         }
     }
 
-    domains = entry->domains->elts;
-    for (i = 0; i < entry->domains->nelts; i++) {
-        if (indexed_match && domains[i].order > indexed_order) {
-            if ((attr == NULL || attr->len == 0) && !attr_not
-                && host_len <= sizeof(entry->cache_host))
-            {
-                ngx_memcpy(entry->cache_host, host, host_len);
-                entry->cache_host_len = host_len;
-                entry->cache_result = 1;
-                entry->cache_valid = 1;
+    if (key_len != 0 && entry->indexes_ready) {
+#if (NGX_PCRE)
+        name.data = key;
+        name.len = key_len;
+
+        for (i = 0; i < entry->regex_domains_n; i++) {
+            domain = entry->regex_domains[i];
+
+            if (indexed_match && domain->order > indexed_order) {
+                if (cacheable) {
+                    ngx_stream_trojan_geosite_cache_store(entry, host,
+                                                          host_len, 1);
+                }
+                return 1;
             }
 
+            if (domain->regex == NULL
+                || !ngx_stream_trojan_geosite_domain_attr_match(domain, attr,
+                                                                attr_not))
+            {
+                continue;
+            }
+
+            if (ngx_regex_exec(domain->regex, &name, NULL, 0) >= 0) {
+                if (cacheable) {
+                    ngx_stream_trojan_geosite_cache_store(entry, host,
+                                                          host_len, 1);
+                }
+                return 1;
+            }
+        }
+#endif
+
+        if (indexed_match) {
+            if (cacheable) {
+                ngx_stream_trojan_geosite_cache_store(entry, host, host_len,
+                                                      1);
+            }
             return 1;
         }
 
+        if (cacheable) {
+            ngx_stream_trojan_geosite_cache_store(entry, host, host_len, 0);
+        }
+        return 0;
+    }
+
+    domains = entry->domains->elts;
+    for (i = 0; i < entry->domains->nelts; i++) {
         if (!ngx_stream_trojan_geosite_domain_attr_match(&domains[i], attr,
                                                          attr_not))
-        {
-            continue;
-        }
-
-        if (key_len != 0 && entry->indexes_ready
-            && domains[i].type != ngx_stream_trojan_geosite_regex)
         {
             continue;
         }
@@ -977,15 +1113,10 @@ ngx_stream_trojan_geosite_match(ngx_stream_trojan_geosite_entry_t *entry,
             if (ngx_stream_trojan_geosite_match_plain(host, host_len,
                                                       &domains[i].value))
             {
-                if ((attr == NULL || attr->len == 0) && !attr_not
-                    && host_len <= sizeof(entry->cache_host))
-                {
-                    ngx_memcpy(entry->cache_host, host, host_len);
-                    entry->cache_host_len = host_len;
-                    entry->cache_result = 1;
-                    entry->cache_valid = 1;
+                if (cacheable) {
+                    ngx_stream_trojan_geosite_cache_store(entry, host,
+                                                          host_len, 1);
                 }
-
                 return 1;
             }
             break;
@@ -999,15 +1130,10 @@ ngx_stream_trojan_geosite_match(ngx_stream_trojan_geosite_entry_t *entry,
             name.data = key_len != 0 ? key : (u_char *) host;
             name.len = key_len != 0 ? key_len : host_len;
             if (ngx_regex_exec(domains[i].regex, &name, NULL, 0) >= 0) {
-                if ((attr == NULL || attr->len == 0) && !attr_not
-                    && host_len <= sizeof(entry->cache_host))
-                {
-                    ngx_memcpy(entry->cache_host, host, host_len);
-                    entry->cache_host_len = host_len;
-                    entry->cache_result = 1;
-                    entry->cache_valid = 1;
+                if (cacheable) {
+                    ngx_stream_trojan_geosite_cache_store(entry, host,
+                                                          host_len, 1);
                 }
-
                 return 1;
             }
 #endif
@@ -1017,15 +1143,10 @@ ngx_stream_trojan_geosite_match(ngx_stream_trojan_geosite_entry_t *entry,
             if (ngx_stream_trojan_geosite_match_domain(host, host_len,
                                                        &domains[i].value))
             {
-                if ((attr == NULL || attr->len == 0) && !attr_not
-                    && host_len <= sizeof(entry->cache_host))
-                {
-                    ngx_memcpy(entry->cache_host, host, host_len);
-                    entry->cache_host_len = host_len;
-                    entry->cache_result = 1;
-                    entry->cache_valid = 1;
+                if (cacheable) {
+                    ngx_stream_trojan_geosite_cache_store(entry, host,
+                                                          host_len, 1);
                 }
-
                 return 1;
             }
             break;
@@ -1034,41 +1155,18 @@ ngx_stream_trojan_geosite_match(ngx_stream_trojan_geosite_entry_t *entry,
             if (host_len == domains[i].value.len
                 && ngx_stream_trojan_geosite_equal_ci(host, &domains[i].value))
             {
-                if ((attr == NULL || attr->len == 0) && !attr_not
-                    && host_len <= sizeof(entry->cache_host))
-                {
-                    ngx_memcpy(entry->cache_host, host, host_len);
-                    entry->cache_host_len = host_len;
-                    entry->cache_result = 1;
-                    entry->cache_valid = 1;
+                if (cacheable) {
+                    ngx_stream_trojan_geosite_cache_store(entry, host,
+                                                          host_len, 1);
                 }
-
                 return 1;
             }
             break;
         }
     }
 
-    if (indexed_match) {
-        if ((attr == NULL || attr->len == 0) && !attr_not
-            && host_len <= sizeof(entry->cache_host))
-        {
-            ngx_memcpy(entry->cache_host, host, host_len);
-            entry->cache_host_len = host_len;
-            entry->cache_result = 1;
-            entry->cache_valid = 1;
-        }
-
-        return 1;
-    }
-
-    if ((attr == NULL || attr->len == 0) && !attr_not
-        && host_len <= sizeof(entry->cache_host))
-    {
-        ngx_memcpy(entry->cache_host, host, host_len);
-        entry->cache_host_len = host_len;
-        entry->cache_result = 0;
-        entry->cache_valid = 1;
+    if (cacheable) {
+        ngx_stream_trojan_geosite_cache_store(entry, host, host_len, 0);
     }
 
     return 0;

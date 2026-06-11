@@ -3,6 +3,8 @@
 
 
 #define NGX_STREAM_TROJAN_DNS_RULES_MAX_FILE_SIZE  (1024 * 1024)
+#define NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES 64
+
 
 
 typedef enum {
@@ -24,13 +26,21 @@ typedef struct {
 } ngx_stream_trojan_dns_rule_t;
 
 
+typedef struct {
+    ngx_uint_t       valid;
+    ngx_uint_t       accessed;
+    size_t           host_len;
+    u_char           host[256];
+    ngx_stream_trojan_dns_rule_group_t *group;
+} ngx_stream_trojan_dns_rules_cache_entry_t;
+
+
 struct ngx_stream_trojan_dns_rules_conf_s {
     ngx_array_t     *groups;
     ngx_str_t        path;
-    u_char           cache_host[256];
-    size_t           cache_host_len;
-    ngx_stream_trojan_dns_rule_group_t *cache_group;
-    ngx_uint_t       cache_valid;
+    ngx_stream_trojan_dns_rules_cache_entry_t
+                     cache[NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES];
+    ngx_uint_t       cache_generation;
 };
 
 
@@ -75,6 +85,101 @@ ngx_stream_trojan_dns_rules_lc(u_char ch)
 }
 
 
+
+static ngx_int_t
+ngx_stream_trojan_dns_rules_host_eq(u_char *cached, const u_char *host,
+    size_t host_len)
+{
+    size_t  i;
+
+    for (i = 0; i < host_len; i++) {
+        if (cached[i] != ngx_stream_trojan_dns_rules_lc(host[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static ngx_stream_trojan_dns_rule_group_t *
+ngx_stream_trojan_dns_rules_cache_lookup(
+    ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *host,
+    size_t host_len, ngx_uint_t *found)
+{
+    ngx_uint_t                                  i;
+    ngx_stream_trojan_dns_rules_cache_entry_t *e;
+
+    *found = 0;
+
+    if (host_len > 256) {
+        return NULL;
+    }
+
+    e = rules->cache;
+    for (i = 0; i < NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES; i++) {
+        if (!e[i].valid || e[i].host_len != host_len) {
+            continue;
+        }
+
+        if (ngx_stream_trojan_dns_rules_host_eq(e[i].host, host, host_len)) {
+            e[i].accessed = ++rules->cache_generation;
+            *found = 1;
+            return e[i].group;
+        }
+    }
+
+    return NULL;
+}
+
+
+static void
+ngx_stream_trojan_dns_rules_cache_store(
+    ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *host,
+    size_t host_len, ngx_stream_trojan_dns_rule_group_t *group)
+{
+    ngx_uint_t                                  i, oldest;
+    ngx_stream_trojan_dns_rules_cache_entry_t *e, *slot;
+
+    if (host_len > 256) {
+        return;
+    }
+
+    e = rules->cache;
+    slot = NULL;
+    oldest = 0;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES; i++) {
+        if (e[i].valid && e[i].host_len == host_len
+            && ngx_stream_trojan_dns_rules_host_eq(e[i].host, host, host_len))
+        {
+            slot = &e[i];
+            break;
+        }
+
+        if (!e[i].valid) {
+            slot = &e[i];
+            break;
+        }
+
+        if (e[i].accessed < e[oldest].accessed) {
+            oldest = i;
+        }
+    }
+
+    if (slot == NULL) {
+        slot = &e[oldest];
+    }
+
+    slot->valid = 0;
+    slot->host_len = host_len;
+    for (i = 0; i < host_len; i++) {
+        slot->host[i] = ngx_stream_trojan_dns_rules_lc(host[i]);
+    }
+    slot->group = group;
+    slot->accessed = ++rules->cache_generation;
+    slot->valid = 1;
+}
 static ngx_uint_t
 ngx_stream_trojan_dns_rules_space(u_char ch)
 {
@@ -906,8 +1011,8 @@ ngx_stream_trojan_dns_rule_group_t *
 ngx_stream_trojan_dns_rules_match(ngx_stream_trojan_dns_rules_conf_t *rules,
     const u_char *host, size_t host_len)
 {
-    ngx_uint_t                             i, j;
-    ngx_stream_trojan_dns_rule_group_t    *groups;
+    ngx_uint_t                             i, j, cache_found;
+    ngx_stream_trojan_dns_rule_group_t    *groups, *cached;
     ngx_stream_trojan_dns_rule_t          *rule;
 
     if (rules == NULL || rules->groups == NULL
@@ -919,11 +1024,10 @@ ngx_stream_trojan_dns_rules_match(ngx_stream_trojan_dns_rules_conf_t *rules,
     if (host_len > 1 && host[host_len - 1] == '.') {
         host_len--;
     }
-    if (rules->cache_valid
-        && rules->cache_host_len == host_len
-        && ngx_strncasecmp(rules->cache_host, (u_char *) host, host_len) == 0)
-    {
-        return rules->cache_group;
+    cached = ngx_stream_trojan_dns_rules_cache_lookup(rules, host, host_len,
+                                                      &cache_found);
+    if (cache_found) {
+        return cached;
     }
 
 
@@ -936,24 +1040,15 @@ ngx_stream_trojan_dns_rules_match(ngx_stream_trojan_dns_rules_conf_t *rules,
             if (ngx_stream_trojan_dns_rules_match_rule(&rule[j], host,
                                                        host_len))
             {
-                if (host_len <= sizeof(rules->cache_host)) {
-                    ngx_memcpy(rules->cache_host, host, host_len);
-                    rules->cache_host_len = host_len;
-                    rules->cache_group = &groups[i];
-                    rules->cache_valid = 1;
-                }
+                ngx_stream_trojan_dns_rules_cache_store(rules, host,
+                                                        host_len, &groups[i]);
 
                 return &groups[i];
             }
         }
     }
 
-    if (host_len <= sizeof(rules->cache_host)) {
-        ngx_memcpy(rules->cache_host, host, host_len);
-        rules->cache_host_len = host_len;
-        rules->cache_group = NULL;
-        rules->cache_valid = 1;
-    }
+    ngx_stream_trojan_dns_rules_cache_store(rules, host, host_len, NULL);
 
     return NULL;
 }

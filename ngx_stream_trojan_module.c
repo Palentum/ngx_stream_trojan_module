@@ -39,6 +39,8 @@
 #define NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE \
     (NGX_STREAM_TROJAN_MUX_MAX_STREAMS * 2)
 #define NGX_STREAM_TROJAN_MUX_STREAM_POOL_SIZE 2048
+#define NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES 64
+
 
 
 typedef enum {
@@ -101,6 +103,14 @@ typedef struct {
     ngx_array_t *rules;
     ngx_array_t *outbounds;
 } ngx_stream_trojan_route_t;
+typedef struct {
+    ngx_uint_t                  valid;
+    ngx_uint_t                  accessed;
+    ngx_stream_trojan_addr_t    target;
+    ngx_stream_trojan_route_t  *route;
+} ngx_stream_trojan_route_cache_entry_t;
+
+
 
 
 
@@ -177,6 +187,9 @@ struct ngx_stream_trojan_srv_conf_s {
     size_t       buffer_size;
     ngx_array_t *outbounds;
     ngx_array_t *routes;
+    ngx_stream_trojan_route_cache_entry_t
+                 route_cache[NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES];
+    ngx_uint_t   route_cache_generation;
     ngx_stream_trojan_doh_conf_t *doh_conf;
     ngx_stream_trojan_dns_rules_conf_t *dns_rules;
     ngx_stream_trojan_geosite_t *geosite;
@@ -578,6 +591,7 @@ static ngx_int_t ngx_stream_trojan_route_match(
     ngx_stream_trojan_route_t *route, ngx_stream_trojan_addr_t *target);
 static ngx_int_t ngx_stream_trojan_route_rule_match(
     ngx_stream_trojan_route_rule_t *rule, ngx_stream_trojan_addr_t *target);
+static u_char ngx_stream_trojan_route_lc(u_char ch);
 static ngx_int_t ngx_stream_trojan_route_prepare(ngx_conf_t *cf,
     ngx_stream_trojan_srv_conf_t *conf);
 static ngx_int_t ngx_stream_trojan_route_validate(ngx_conf_t *cf,
@@ -4864,6 +4878,8 @@ ngx_stream_trojan_select_route_outbound(ngx_stream_trojan_route_t *route,
     for (i = 0; i < route->outbounds->nelts; i++) {
         if (ngx_stream_trojan_outbound_request_blocked(&outbound[i],
                                                        command, target))
+
+
         {
             continue;
         }
@@ -4877,23 +4893,130 @@ ngx_stream_trojan_select_route_outbound(ngx_stream_trojan_route_t *route,
 }
 
 
+static ngx_int_t
+ngx_stream_trojan_route_target_equal(ngx_stream_trojan_addr_t *a,
+    ngx_stream_trojan_addr_t *b)
+{
+    size_t  i;
+
+    if (a->type != b->type || a->port != b->port
+        || a->host_len != b->host_len)
+    {
+        return 0;
+    }
+
+    if (a->type == NGX_STREAM_TROJAN_ADDR_DOMAIN) {
+        for (i = 0; i < a->host_len; i++) {
+            if (ngx_stream_trojan_route_lc(a->host[i])
+                != ngx_stream_trojan_route_lc(b->host[i]))
+            {
+                return 0;
+            }
+        }
+
+        return 1;
+    }
+
+    return ngx_memcmp(a->host, b->host, a->host_len) == 0;
+}
+
+
+static void
+ngx_stream_trojan_route_cache_copy_target(ngx_stream_trojan_addr_t *dst,
+    ngx_stream_trojan_addr_t *src)
+{
+    size_t  i;
+
+    *dst = *src;
+
+    if (src->type == NGX_STREAM_TROJAN_ADDR_DOMAIN) {
+        for (i = 0; i < src->host_len; i++) {
+            dst->host[i] = ngx_stream_trojan_route_lc(src->host[i]);
+        }
+    }
+}
+
+
+static ngx_stream_trojan_route_t *
+ngx_stream_trojan_route_cache_lookup(ngx_stream_trojan_srv_conf_t *conf,
+    ngx_stream_trojan_addr_t *target, ngx_uint_t *found)
+{
+    ngx_uint_t                             i;
+    ngx_stream_trojan_route_cache_entry_t *e;
+
+    *found = 0;
+
+    e = conf->route_cache;
+    for (i = 0; i < NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES; i++) {
+        if (!e[i].valid) {
+            continue;
+        }
+
+        if (ngx_stream_trojan_route_target_equal(&e[i].target, target)) {
+            e[i].accessed = ++conf->route_cache_generation;
+            *found = 1;
+            return e[i].route;
+        }
+    }
+
+    return NULL;
+}
+
+
+static void
+ngx_stream_trojan_route_cache_store(ngx_stream_trojan_srv_conf_t *conf,
+    ngx_stream_trojan_addr_t *target, ngx_stream_trojan_route_t *route)
+{
+    ngx_uint_t                             i, oldest;
+    ngx_stream_trojan_route_cache_entry_t *e, *slot;
+
+    e = conf->route_cache;
+    slot = NULL;
+    oldest = 0;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES; i++) {
+        if (e[i].valid
+            && ngx_stream_trojan_route_target_equal(&e[i].target, target))
+        {
+            slot = &e[i];
+            break;
+        }
+
+        if (!e[i].valid) {
+            slot = &e[i];
+            break;
+        }
+
+        if (e[i].accessed < e[oldest].accessed) {
+            oldest = i;
+        }
+    }
+
+    if (slot == NULL) {
+        slot = &e[oldest];
+    }
+
+    slot->valid = 0;
+    ngx_stream_trojan_route_cache_copy_target(&slot->target, target);
+    slot->route = route;
+    slot->accessed = ++conf->route_cache_generation;
+    slot->valid = 1;
+}
+
+
 static ngx_stream_trojan_outbound_t *
 ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_addr_t *target, ngx_uint_t command)
 {
-    ngx_uint_t                    i;
-    ngx_stream_trojan_route_t    *route;
+    ngx_uint_t                    i, cache_found;
+    ngx_stream_trojan_route_t    *route, *cached_route;
     ngx_stream_trojan_outbound_t *outbound;
 
     if (ctx->conf->route_enable) {
         if (ctx->route_cache_valid
             && ctx->route_cache_command == command
-            && ctx->route_cache_target.type == target->type
-            && ctx->route_cache_target.port == target->port
-            && ctx->route_cache_target.host_len == target->host_len
-            && ngx_memcmp(ctx->route_cache_target.host, target->host,
-                          target->host_len)
-               == 0)
+            && ngx_stream_trojan_route_target_equal(&ctx->route_cache_target,
+                                                    target))
         {
             return ctx->route_cache_outbound;
         }
@@ -4902,13 +5025,34 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
             return NULL;
         }
 
-        route = ctx->conf->routes->elts;
+        cached_route = ngx_stream_trojan_route_cache_lookup(ctx->conf, target,
+                                                            &cache_found);
+        if (cache_found) {
+            if (cached_route == NULL) {
+                ctx->route_cache_target = *target;
+                ctx->route_cache_command = command;
+                ctx->route_cache_outbound = NULL;
+                ctx->route_cache_valid = 1;
+                return NULL;
+            }
 
+            outbound = ngx_stream_trojan_select_route_outbound(cached_route,
+                                                               ctx->outbound,
+                                                               command, target);
+            ctx->route_cache_target = *target;
+            ctx->route_cache_command = command;
+            ctx->route_cache_outbound = outbound;
+            ctx->route_cache_valid = 1;
+            return outbound;
+        }
+
+        route = ctx->conf->routes->elts;
         for (i = 0; i < ctx->conf->routes->nelts; i++) {
             if (!ngx_stream_trojan_route_match(&route[i], target)) {
                 continue;
             }
 
+            ngx_stream_trojan_route_cache_store(ctx->conf, target, &route[i]);
             outbound = ngx_stream_trojan_select_route_outbound(&route[i],
                                                                ctx->outbound,
                                                                command, target);
@@ -4919,6 +5063,7 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
             return outbound;
         }
 
+        ngx_stream_trojan_route_cache_store(ctx->conf, target, NULL);
         ctx->route_cache_target = *target;
         ctx->route_cache_command = command;
         ctx->route_cache_outbound = NULL;
