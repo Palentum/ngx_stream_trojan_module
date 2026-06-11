@@ -33,6 +33,8 @@
 #define NGX_STREAM_TROJAN_WS_HANDSHAKE_BUFFER_SIZE 4096
 #define NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE 4096
 #define NGX_STREAM_TROJAN_WS_MAX_FRAMES_PER_RECV 32
+#define NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE \
+    (NGX_STREAM_TROJAN_MUX_MAX_STREAMS * 2)
 
 
 typedef enum {
@@ -391,6 +393,8 @@ struct ngx_stream_trojan_ctx_s {
     ngx_uint_t                  ws_response_is_accept;
 
     ngx_queue_t                 mux_streams;
+    ngx_stream_trojan_mux_stream_t  *mux_stream_table[
+        NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE];
     ngx_uint_t                  mux_cool;
     ngx_uint_t                  mux_sing;
     ngx_uint_t                  mux_nstreams;
@@ -603,6 +607,10 @@ static ngx_int_t ngx_stream_trojan_mux_flush_client(
     ngx_stream_trojan_ctx_t *ctx);
 static ngx_int_t ngx_stream_trojan_mux_handle_frame(
     ngx_stream_trojan_ctx_t *ctx);
+static ngx_int_t ngx_stream_trojan_mux_insert_stream(
+    ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_mux_stream_t *stream);
+static void ngx_stream_trojan_mux_remove_stream(
+    ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_mux_stream_t *stream);
 static ngx_stream_trojan_mux_stream_t *ngx_stream_trojan_mux_find_stream(
     ngx_stream_trojan_ctx_t *ctx, uint32_t id);
 static ngx_stream_trojan_mux_stream_t *ngx_stream_trojan_mux_create_stream(
@@ -6268,19 +6276,106 @@ ngx_stream_trojan_mux_cool_handle_frame(ngx_stream_trojan_ctx_t *ctx)
 }
 
 
+static ngx_uint_t
+ngx_stream_trojan_mux_stream_slot(uint32_t id)
+{
+    return (ngx_uint_t) ((id * 2654435761u)
+                         % NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE);
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_mux_insert_stream(ngx_stream_trojan_ctx_t *ctx,
+    ngx_stream_trojan_mux_stream_t *stream)
+{
+    ngx_uint_t                       i, n;
+    ngx_stream_trojan_mux_stream_t  *entry;
+
+    i = ngx_stream_trojan_mux_stream_slot(stream->id);
+
+    for (n = 0; n < NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE; n++) {
+        entry = ctx->mux_stream_table[i];
+
+        if (entry == NULL) {
+            ctx->mux_stream_table[i] = stream;
+            return NGX_OK;
+        }
+
+        if (entry->id == stream->id) {
+            return NGX_ERROR;
+        }
+
+        if (++i == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
+            i = 0;
+        }
+    }
+
+    return NGX_ERROR;
+}
+
+
+static void
+ngx_stream_trojan_mux_remove_stream(ngx_stream_trojan_ctx_t *ctx,
+    ngx_stream_trojan_mux_stream_t *stream)
+{
+    ngx_uint_t                       i, n;
+    ngx_stream_trojan_mux_stream_t  *entry;
+
+    i = ngx_stream_trojan_mux_stream_slot(stream->id);
+
+    for (n = 0; n < NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE; n++) {
+        entry = ctx->mux_stream_table[i];
+
+        if (entry == NULL) {
+            return;
+        }
+
+        if (entry == stream) {
+            ctx->mux_stream_table[i] = NULL;
+
+            for ( ;; ) {
+                if (++i == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
+                    i = 0;
+                }
+
+                entry = ctx->mux_stream_table[i];
+                if (entry == NULL) {
+                    return;
+                }
+
+                ctx->mux_stream_table[i] = NULL;
+                (void) ngx_stream_trojan_mux_insert_stream(ctx, entry);
+            }
+        }
+
+        if (++i == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
+            i = 0;
+        }
+    }
+}
+
+
 static ngx_stream_trojan_mux_stream_t *
 ngx_stream_trojan_mux_find_stream(ngx_stream_trojan_ctx_t *ctx, uint32_t id)
 {
-    ngx_queue_t                    *q;
-    ngx_stream_trojan_mux_stream_t *stream;
+    ngx_uint_t                       i, n;
+    ngx_stream_trojan_mux_stream_t  *stream;
 
-    for (q = ngx_queue_head(&ctx->mux_streams);
-         q != ngx_queue_sentinel(&ctx->mux_streams);
-         q = ngx_queue_next(q))
-    {
-        stream = ngx_queue_data(q, ngx_stream_trojan_mux_stream_t, queue);
+    i = ngx_stream_trojan_mux_stream_slot(id);
+
+    for (n = 0; n < NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE; n++) {
+        stream = ctx->mux_stream_table[i];
+
+        if (stream == NULL) {
+            return NULL;
+        }
+
         if (stream->id == id) {
             return stream;
+        }
+
+        if (++i == NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE) {
+            i = 0;
         }
     }
 
@@ -6313,6 +6408,11 @@ ngx_stream_trojan_mux_create_stream(ngx_stream_trojan_ctx_t *ctx, uint32_t id)
     stream->pool = pool;
     stream->id = id;
     stream->state = ngx_stream_trojan_mux_stream_request;
+
+    if (ngx_stream_trojan_mux_insert_stream(ctx, stream) != NGX_OK) {
+        ngx_destroy_pool(pool);
+        return NULL;
+    }
 
     ngx_queue_insert_tail(&ctx->mux_streams, &stream->queue);
     ctx->mux_nstreams++;
@@ -7229,6 +7329,7 @@ ngx_stream_trojan_mux_cleanup_stream(ngx_stream_trojan_mux_stream_t *stream)
         ctx->mux_payload_direct = 0;
         ngx_stream_trojan_mux_post_client_read(ctx);
     }
+    ngx_stream_trojan_mux_remove_stream(ctx, stream);
     ngx_queue_remove(&stream->queue);
     if (ctx->mux_nstreams) {
         ctx->mux_nstreams--;
@@ -7268,6 +7369,7 @@ ngx_stream_trojan_mux_close_streams(ngx_stream_trojan_ctx_t *ctx)
         ngx_destroy_pool(pool);
     }
 
+    ngx_memzero(ctx->mux_stream_table, sizeof(ctx->mux_stream_table));
     ctx->mux_nstreams = 0;
 }
 
