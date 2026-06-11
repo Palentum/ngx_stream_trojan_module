@@ -619,7 +619,7 @@ static ngx_int_t ngx_stream_trojan_update_read_event(ngx_connection_t *c,
     ngx_uint_t blocked);
 static ngx_int_t ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
     ngx_connection_t *src, ngx_connection_t *dst, ngx_buf_t *buf,
-    ngx_uint_t *src_eof);
+    ngx_uint_t *src_eof, ngx_uint_t *progress);
 static void ngx_stream_trojan_start_mux(ngx_stream_trojan_ctx_t *ctx);
 static ngx_int_t ngx_stream_trojan_is_mux_cool_target(
     ngx_stream_trojan_ctx_t *ctx);
@@ -5654,19 +5654,21 @@ ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
 {
     ngx_uint_t         client_eof, upstream_eof;
     ngx_uint_t         client_read_blocked, upstream_read_blocked;
+    ngx_uint_t         proxy_active;
     ngx_connection_t  *c, *pc;
 
     c = ctx->session->connection;
     pc = ctx->upstream;
     client_eof = c->read->eof || c->read->error;
     upstream_eof = pc->read->eof || pc->read->error;
+    proxy_active = 0;
 
     if (ctx->pending_to_upstream
         && ctx->pending_to_upstream->pos < ctx->pending_to_upstream->last)
     {
         if (ngx_stream_trojan_process_direction(ctx, NULL, pc,
                                                 ctx->pending_to_upstream,
-                                                &client_eof)
+                                                &client_eof, &proxy_active)
             != NGX_OK)
         {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -5675,7 +5677,7 @@ ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
     }
 
     if (ngx_stream_trojan_process_direction(ctx, c, pc, ctx->client_buffer,
-                                            &client_eof)
+                                            &client_eof, &proxy_active)
         != NGX_OK)
     {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -5683,7 +5685,7 @@ ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
     }
 
     if (ngx_stream_trojan_process_direction(ctx, pc, c, ctx->upstream_buffer,
-                                            &upstream_eof)
+                                            &upstream_eof, &proxy_active)
         != NGX_OK)
     {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -5721,6 +5723,11 @@ ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
         || ngx_handle_write_event(pc->write, 0) != NGX_OK)
     {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    if (proxy_active) {
+        ngx_stream_trojan_set_proxy_timeout(ctx);
     }
 }
 
@@ -5728,7 +5735,7 @@ ngx_stream_trojan_process_proxy(ngx_stream_trojan_ctx_t *ctx)
 static ngx_int_t
 ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
     ngx_connection_t *src, ngx_connection_t *dst, ngx_buf_t *buf,
-    ngx_uint_t *src_eof)
+    ngx_uint_t *src_eof, ngx_uint_t *progress)
 {
     size_t        available, bytes, limit, loops;
     ssize_t       n;
@@ -5760,7 +5767,9 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
             }
 
             buf->pos += n;
-            ngx_stream_trojan_set_proxy_timeout(ctx);
+            if (progress) {
+                *progress = 1;
+            }
         }
 
         buf->pos = buf->start;
@@ -5810,7 +5819,9 @@ ngx_stream_trojan_process_direction(ngx_stream_trojan_ctx_t *ctx,
         }
 
         buf->last += n;
-        ngx_stream_trojan_set_proxy_timeout(ctx);
+        if (progress) {
+            *progress = 1;
+        }
         bytes += (size_t) n;
         loops++;
     }
