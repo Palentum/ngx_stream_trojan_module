@@ -681,10 +681,10 @@ static void ngx_stream_trojan_mux_connect(
 static void ngx_stream_trojan_mux_peer_handler(ngx_event_t *ev);
 static void ngx_stream_trojan_mux_init_proxy(
     ngx_stream_trojan_mux_stream_t *stream);
-static void ngx_stream_trojan_mux_process_stream(
-    ngx_stream_trojan_mux_stream_t *stream);
+static ngx_int_t ngx_stream_trojan_mux_process_stream(
+    ngx_stream_trojan_mux_stream_t *stream, size_t *send_budget);
 static ngx_int_t ngx_stream_trojan_mux_flush_to_upstream(
-    ngx_stream_trojan_mux_stream_t *stream);
+    ngx_stream_trojan_mux_stream_t *stream, size_t *send_budget);
 static ngx_int_t ngx_stream_trojan_mux_read_upstream(
     ngx_stream_trojan_mux_stream_t *stream);
 static void ngx_stream_trojan_mux_close_stream(
@@ -7172,17 +7172,29 @@ ngx_stream_trojan_mux_queue_process(ngx_stream_trojan_mux_stream_t *stream)
 static void
 ngx_stream_trojan_mux_process_queued_streams(ngx_stream_trojan_ctx_t *ctx)
 {
-    ngx_queue_t                    *q;
+    size_t                         budget;
+    ngx_int_t                      rc;
+    ngx_queue_t                   *q;
     ngx_stream_trojan_mux_stream_t *stream;
 
-    while (!ngx_queue_empty(&ctx->mux_process_queue)) {
+    budget = ngx_stream_trojan_relay_limit(ctx->conf->buffer_size);
+
+    while (budget && !ngx_queue_empty(&ctx->mux_process_queue)) {
         q = ngx_queue_head(&ctx->mux_process_queue);
         ngx_queue_remove(q);
         stream = ngx_queue_data(q, ngx_stream_trojan_mux_stream_t,
                                 process_queue);
         stream->process_queued = 0;
 
-        ngx_stream_trojan_mux_process_stream(stream);
+        rc = ngx_stream_trojan_mux_process_stream(stream, &budget);
+        if (rc == NGX_BUSY) {
+            ngx_stream_trojan_mux_queue_process(stream);
+            break;
+        }
+    }
+
+    if (budget == 0 && !ngx_queue_empty(&ctx->mux_process_queue)) {
+        ngx_stream_trojan_mux_post_client_read(ctx);
     }
 }
 
@@ -7828,6 +7840,8 @@ ngx_stream_trojan_mux_connect(ngx_stream_trojan_mux_stream_t *stream,
 static void
 ngx_stream_trojan_mux_peer_handler(ngx_event_t *ev)
 {
+    size_t                            budget;
+    ngx_int_t                         rc;
     ngx_connection_t                 *pc;
     ngx_uint_t                        resume;
     ngx_stream_trojan_ctx_t          *ctx;
@@ -7878,7 +7892,12 @@ ngx_stream_trojan_mux_peer_handler(ngx_event_t *ev)
     }
 
     resume = ngx_stream_trojan_mux_client_blocked_on(ctx, stream);
-    ngx_stream_trojan_mux_process_stream(stream);
+    budget = ngx_stream_trojan_relay_limit(ctx->conf->buffer_size);
+    rc = ngx_stream_trojan_mux_process_stream(stream, &budget);
+    if (rc == NGX_BUSY) {
+        ngx_stream_trojan_mux_queue_process(stream);
+        ngx_stream_trojan_mux_post_client_read(ctx);
+    }
     if (resume) {
         ngx_stream_trojan_mux_post_client_read(ctx);
     }
@@ -7892,6 +7911,8 @@ ngx_stream_trojan_mux_peer_handler(ngx_event_t *ev)
 static void
 ngx_stream_trojan_mux_init_proxy(ngx_stream_trojan_mux_stream_t *stream)
 {
+    size_t                  budget;
+    ngx_int_t               rc;
     ngx_connection_t        *pc;
     ngx_stream_trojan_ctx_t *ctx;
 
@@ -7930,15 +7951,22 @@ ngx_stream_trojan_mux_init_proxy(ngx_stream_trojan_mux_stream_t *stream)
     ngx_stream_trojan_mux_refresh_read_timeout(ctx, pc);
 
     stream->state = ngx_stream_trojan_mux_stream_proxy;
-    ngx_stream_trojan_mux_process_stream(stream);
+    budget = ngx_stream_trojan_relay_limit(ctx->conf->buffer_size);
+    rc = ngx_stream_trojan_mux_process_stream(stream, &budget);
+    if (rc == NGX_BUSY) {
+        ngx_stream_trojan_mux_queue_process(stream);
+        ngx_stream_trojan_mux_post_client_read(ctx);
+    }
 }
 
 
 static ngx_int_t
 ngx_stream_trojan_mux_flush_to_upstream(
-    ngx_stream_trojan_mux_stream_t *stream)
+    ngx_stream_trojan_mux_stream_t *stream, size_t *send_budget)
 {
+    size_t              size;
     ssize_t             n;
+    ngx_uint_t          refreshed;
     ngx_connection_t   *pc;
     ngx_buf_t          *b;
 
@@ -7949,12 +7977,32 @@ ngx_stream_trojan_mux_flush_to_upstream(
         return NGX_OK;
     }
 
+    refreshed = 0;
+
     while (b->pos < b->last) {
-        n = pc->send(pc, b->pos, b->last - b->pos);
+        if (send_budget != NULL && *send_budget == 0) {
+            if (ngx_handle_write_event(pc->write, 0) != NGX_OK) {
+                return NGX_ERROR;
+            }
+            if (refreshed) {
+                ngx_stream_trojan_mux_refresh_read_timeout(stream->ctx, pc);
+            }
+            return NGX_BUSY;
+        }
+
+        size = b->last - b->pos;
+        if (send_budget != NULL && size > *send_budget) {
+            size = *send_budget;
+        }
+
+        n = pc->send(pc, b->pos, size);
 
         if (n == NGX_AGAIN || n == 0) {
             if (ngx_handle_write_event(pc->write, 0) != NGX_OK) {
                 return NGX_ERROR;
+            }
+            if (refreshed) {
+                ngx_stream_trojan_mux_refresh_read_timeout(stream->ctx, pc);
             }
             return NGX_AGAIN;
         }
@@ -7964,7 +8012,10 @@ ngx_stream_trojan_mux_flush_to_upstream(
         }
 
         b->pos += n;
-        ngx_stream_trojan_mux_refresh_read_timeout(stream->ctx, pc);
+        refreshed = 1;
+        if (send_budget != NULL) {
+            *send_budget -= (size_t) n;
+        }
     }
 
     ngx_stream_trojan_mux_reset_buf(b);
@@ -7972,6 +8023,10 @@ ngx_stream_trojan_mux_flush_to_upstream(
     if (stream->client_fin && !stream->upstream_write_shutdown) {
         (void) shutdown(pc->fd, SHUT_WR);
         stream->upstream_write_shutdown = 1;
+    }
+
+    if (refreshed) {
+        ngx_stream_trojan_mux_refresh_read_timeout(stream->ctx, pc);
     }
 
     return NGX_OK;
@@ -8023,19 +8078,24 @@ ngx_stream_trojan_mux_read_upstream(ngx_stream_trojan_mux_stream_t *stream)
 }
 
 
-static void
-ngx_stream_trojan_mux_process_stream(ngx_stream_trojan_mux_stream_t *stream)
+static ngx_int_t
+ngx_stream_trojan_mux_process_stream(ngx_stream_trojan_mux_stream_t *stream,
+    size_t *send_budget)
 {
     ngx_int_t  rc;
 
     if (stream->state != ngx_stream_trojan_mux_stream_proxy) {
-        return;
+        return NGX_OK;
     }
 
-    rc = ngx_stream_trojan_mux_flush_to_upstream(stream);
+    rc = ngx_stream_trojan_mux_flush_to_upstream(stream, send_budget);
     if (rc == NGX_ERROR) {
         ngx_stream_trojan_mux_close_stream(stream, 1);
-        return;
+        return NGX_ERROR;
+    }
+
+    if (rc == NGX_BUSY) {
+        return NGX_BUSY;
     }
 
     if (ngx_stream_trojan_mux_client_blocked_on(stream->ctx, stream)
@@ -8048,7 +8108,7 @@ ngx_stream_trojan_mux_process_stream(ngx_stream_trojan_mux_stream_t *stream)
 
     if (ngx_stream_trojan_mux_read_upstream(stream) != NGX_OK) {
         ngx_stream_trojan_mux_close_stream(stream, 1);
-        return;
+        return NGX_ERROR;
     }
 
     if (stream->upstream_eof
@@ -8069,21 +8129,24 @@ ngx_stream_trojan_mux_process_stream(ngx_stream_trojan_mux_stream_t *stream)
         && stream->upstream_eof && stream->fin_sent)
     {
         ngx_stream_trojan_mux_close_stream(stream, 0);
-        return;
+        return NGX_OK;
     }
 
     if (stream->upstream && ngx_handle_read_event(stream->upstream->read, 0)
         != NGX_OK)
     {
         ngx_stream_trojan_mux_close_stream(stream, 1);
-        return;
+        return NGX_ERROR;
     }
 
     if (stream->upstream && ngx_handle_write_event(stream->upstream->write, 0)
         != NGX_OK)
     {
         ngx_stream_trojan_mux_close_stream(stream, 1);
+        return NGX_ERROR;
     }
+
+    return NGX_OK;
 }
 
 
