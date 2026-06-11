@@ -230,6 +230,10 @@ ngx_stream_trojan_doh_parse_response(u_char *data, size_t len,
                 if (ttl < min_ttl) {
                     min_ttl = ttl;
                 }
+            } else if (rtype == 5) {
+                if (ttl < min_ttl) {
+                    min_ttl = ttl;
+                }
             }
 
             scan += rdlen;
@@ -952,21 +956,19 @@ ngx_stream_trojan_doh_run_pending(ngx_stream_trojan_doh_conf_t *conf)
     ngx_queue_t                  *q;
     ngx_stream_trojan_doh_ctx_t  *doh;
 
-    if (conf->active >= NGX_STREAM_TROJAN_DOH_MAX_ACTIVE
-        || ngx_queue_empty(&conf->pending))
+    while (conf->active < NGX_STREAM_TROJAN_DOH_MAX_ACTIVE
+           && !ngx_queue_empty(&conf->pending))
     {
-        return;
-    }
+        q = ngx_queue_head(&conf->pending);
+        ngx_queue_remove(q);
+        conf->pending_n--;
 
-    q = ngx_queue_head(&conf->pending);
-    ngx_queue_remove(q);
-    conf->pending_n--;
+        doh = ngx_queue_data(q, ngx_stream_trojan_doh_ctx_t, queue);
+        doh->queued = 0;
 
-    doh = ngx_queue_data(q, ngx_stream_trojan_doh_ctx_t, queue);
-    doh->queued = 0;
-
-    if (ngx_stream_trojan_doh_start_request(doh) != NGX_OK) {
-        ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+        if (ngx_stream_trojan_doh_start_request(doh) != NGX_OK) {
+            ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+        }
     }
 }
 
