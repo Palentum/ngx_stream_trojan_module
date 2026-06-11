@@ -35,6 +35,7 @@
 #define NGX_STREAM_TROJAN_WS_MAX_FRAMES_PER_RECV 32
 #define NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE \
     (NGX_STREAM_TROJAN_MUX_MAX_STREAMS * 2)
+#define NGX_STREAM_TROJAN_MUX_STREAM_POOL_SIZE 2048
 
 
 typedef enum {
@@ -623,7 +624,7 @@ static ngx_stream_trojan_mux_stream_t *ngx_stream_trojan_mux_find_stream(
 static ngx_stream_trojan_mux_stream_t *ngx_stream_trojan_mux_create_stream(
     ngx_stream_trojan_ctx_t *ctx, uint32_t id);
 static ngx_int_t ngx_stream_trojan_mux_ensure_client_buffer(
-    ngx_stream_trojan_mux_stream_t *stream);
+    ngx_stream_trojan_mux_stream_t *stream, size_t len);
 static ngx_int_t ngx_stream_trojan_mux_ensure_upstream_buffer(
     ngx_stream_trojan_mux_stream_t *stream);
 static ngx_int_t ngx_stream_trojan_mux_stream_can_accept(
@@ -6407,7 +6408,6 @@ ngx_stream_trojan_mux_remove_stream(ngx_stream_trojan_ctx_t *ctx,
                 if (entry == NULL) {
                     return;
                 }
-
                 ctx->mux_stream_table[i] = NULL;
                 (void) ngx_stream_trojan_mux_insert_stream(ctx, entry);
             }
@@ -6458,7 +6458,8 @@ ngx_stream_trojan_mux_create_stream(ngx_stream_trojan_ctx_t *ctx, uint32_t id)
         return NULL;
     }
 
-    pool = ngx_create_pool(4096, ctx->session->connection->log);
+    pool = ngx_create_pool(NGX_STREAM_TROJAN_MUX_STREAM_POOL_SIZE,
+                           ctx->session->connection->log);
     if (pool == NULL) {
         return NULL;
     }
@@ -6475,7 +6476,6 @@ ngx_stream_trojan_mux_create_stream(ngx_stream_trojan_ctx_t *ctx, uint32_t id)
     stream->state = ngx_stream_trojan_mux_stream_request;
     ngx_queue_init(&stream->process_queue);
     ngx_queue_init(&stream->flush_queue);
-
 
     if (ngx_stream_trojan_mux_insert_stream(ctx, stream) != NGX_OK) {
         ngx_destroy_pool(pool);
@@ -6536,16 +6536,47 @@ ngx_stream_trojan_mux_queue_flush(ngx_stream_trojan_mux_stream_t *stream)
 
 static ngx_int_t
 ngx_stream_trojan_mux_ensure_client_buffer(
-    ngx_stream_trojan_mux_stream_t *stream)
+    ngx_stream_trojan_mux_stream_t *stream, size_t len)
 {
-    if (stream->client_buffer != NULL) {
-        return NGX_OK;
+    size_t      size, capacity, buffered;
+    ngx_buf_t  *b, *nb;
+
+    b = stream->client_buffer;
+    buffered = b == NULL ? 0 : (size_t) (b->last - b->pos);
+
+    size = stream->ctx->conf->buffer_size;
+    if (size > NGX_STREAM_TROJAN_MUX_STREAM_BUFFER_SIZE) {
+        size = NGX_STREAM_TROJAN_MUX_STREAM_BUFFER_SIZE;
+    }
+    if (size < len) {
+        size = len;
+    }
+    if (size < buffered + len) {
+        size = buffered + len;
+    }
+    if (size > NGX_STREAM_TROJAN_MUX_MAX_FRAME_SIZE) {
+        size = NGX_STREAM_TROJAN_MUX_MAX_FRAME_SIZE;
     }
 
-    stream->client_buffer = ngx_stream_trojan_create_temp_buf(
-        stream->pool, NGX_STREAM_TROJAN_MUX_STREAM_BUFFER_SIZE);
+    if (b != NULL) {
+        capacity = b->end - b->start;
+        if (capacity >= size) {
+            return NGX_OK;
+        }
+    }
 
-    return stream->client_buffer == NULL ? NGX_ERROR : NGX_OK;
+    nb = ngx_stream_trojan_create_temp_buf(stream->pool, size);
+    if (nb == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (buffered) {
+        ngx_memcpy(nb->last, b->pos, buffered);
+        nb->last += buffered;
+    }
+
+    stream->client_buffer = nb;
+    return NGX_OK;
 }
 
 
@@ -6583,7 +6614,7 @@ ngx_stream_trojan_mux_stream_can_accept(
         return NGX_OK;
     }
 
-    if (ngx_stream_trojan_mux_ensure_client_buffer(stream) != NGX_OK) {
+    if (ngx_stream_trojan_mux_ensure_client_buffer(stream, len) != NGX_OK) {
         return NGX_ERROR;
     }
 
