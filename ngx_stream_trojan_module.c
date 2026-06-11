@@ -10043,7 +10043,7 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
 static void
 ngx_stream_trojan_socks5_udp_control_handler(ngx_event_t *ev)
 {
-    u_char                    buf[128];
+    u_char                    buf[1];
     ssize_t                   n;
     ngx_connection_t         *pc;
     ngx_stream_trojan_ctx_t  *ctx;
@@ -10068,36 +10068,30 @@ ngx_stream_trojan_socks5_udp_control_handler(ngx_event_t *ev)
         return;
     }
 
-    for ( ;; ) {
-        n = pc->recv(pc, buf, sizeof(buf));
+    n = pc->recv(pc, buf, sizeof(buf));
 
-        if (n == NGX_AGAIN) {
-            break;
+    if (n == NGX_AGAIN) {
+        if (ngx_handle_read_event(pc->read, 0) != NGX_OK) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
         }
 
-        if (n == 0) {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
-            return;
-        }
-
-        if (n == NGX_ERROR) {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
-            return;
-        }
-
-        ngx_stream_trojan_refresh_udp_timeout(ctx);
+        return;
     }
 
-    if (ngx_handle_read_event(pc->read, 0) != NGX_OK) {
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+    if (n == 0) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+        return;
     }
+
+    ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+    return;
 }
 
 
 static void
 ngx_stream_trojan_socks5_in_udp_control_handler(ngx_event_t *ev)
 {
-    u_char                    buf[128];
+    u_char                    buf[1];
     ssize_t                   n;
     ngx_connection_t         *c;
     ngx_stream_session_t     *s;
@@ -10124,29 +10118,18 @@ ngx_stream_trojan_socks5_in_udp_control_handler(ngx_event_t *ev)
         return;
     }
 
-    for ( ;; ) {
-        n = c->recv(c, buf, sizeof(buf));
+    n = c->recv(c, buf, sizeof(buf));
 
-        if (n == NGX_AGAIN) {
-            break;
+    if (n == NGX_AGAIN) {
+        if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
         }
 
-        if (n == 0) {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
-            return;
-        }
-
-        if (n == NGX_ERROR) {
-            ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
-            return;
-        }
-
-        ngx_stream_trojan_refresh_udp_timeout(ctx);
+        return;
     }
 
-    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
-    }
+    ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+    return;
 }
 
 
