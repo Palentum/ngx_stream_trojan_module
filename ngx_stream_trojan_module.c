@@ -369,6 +369,7 @@ struct ngx_stream_trojan_ctx_s {
 
     ngx_buf_t                  *socks5_buffer;
     ngx_buf_t                  *http_buffer;
+    size_t                      http_header_scan;
     ngx_stream_trojan_socks5_mode_e  socks5_mode;
     ngx_stream_trojan_socks5_step_e  socks5_step;
     ngx_uint_t                  socks5_connected;
@@ -380,6 +381,7 @@ struct ngx_stream_trojan_ctx_s {
     ngx_uint_t                  inbound_http_proxy;
     ngx_uint_t                  websocket;
     ngx_buf_t                  *ws_buffer;
+    size_t                      ws_header_scan;
     ngx_buf_t                  *ws_raw;
     ngx_buf_t                  *ws_out;
     u_char                      ws_header[NGX_STREAM_TROJAN_WS_MAX_HEADER_LEN];
@@ -1478,7 +1480,7 @@ static void
 ngx_stream_trojan_process_http_in(ngx_stream_trojan_ctx_t *ctx)
 {
     int                          rc;
-    size_t                       needed;
+    size_t                       needed, len;
     ngx_stream_trojan_srv_conf_t *effective, *proxy_conf;
 
     if (ctx->http_buffer == NULL) {
@@ -1494,11 +1496,15 @@ ngx_stream_trojan_process_http_in(ngx_stream_trojan_ctx_t *ctx)
         switch (ctx->state) {
 
         case ngx_stream_trojan_state_http_in_request:
-            rc = ngx_stream_trojan_http_proxy_parse_connect(
-                ctx->http_buffer->pos,
-                ctx->http_buffer->last - ctx->http_buffer->pos,
-                &needed, &ctx->target);
-
+            len = (size_t) (ctx->http_buffer->last - ctx->http_buffer->pos);
+            if (!ngx_stream_trojan_header_end_seen(ctx->http_buffer->pos, len,
+                                                   &ctx->http_header_scan))
+            {
+                rc = NGX_STREAM_TROJAN_HTTP_PROXY_NEED_MORE;
+            } else {
+                rc = ngx_stream_trojan_http_proxy_parse_connect(
+                    ctx->http_buffer->pos, len, &needed, &ctx->target);
+            }
             if (rc == NGX_STREAM_TROJAN_HTTP_PROXY_NEED_MORE) {
                 rc = ngx_stream_trojan_http_in_read(ctx);
                 if (rc == NGX_AGAIN) {
@@ -2382,7 +2388,14 @@ ngx_stream_trojan_process_websocket_handshake(ngx_stream_trojan_ctx_t *ctx)
 
     for ( ;; ) {
         len = (size_t) (b->last - b->pos);
-        rc = ngx_stream_trojan_ws_parse_handshake(b->pos, len, &needed, &hs);
+        if (!ngx_stream_trojan_header_end_seen(b->pos, len,
+                                               &ctx->ws_header_scan))
+        {
+            rc = NGX_STREAM_TROJAN_WS_NEED_MORE;
+        } else {
+            rc = ngx_stream_trojan_ws_parse_handshake(b->pos, len, &needed,
+                                                      &hs);
+        }
 
         if (rc == NGX_STREAM_TROJAN_WS_OK) {
             if (hs.path_len != ctx->conf->websocket_path.len
@@ -3264,6 +3277,7 @@ ngx_stream_trojan_post_read_if_ready(ngx_stream_trojan_ctx_t *ctx,
         ngx_post_event(c->read, &ngx_posted_next_events);
     }
 }
+
 static void
 ngx_stream_trojan_compact_udp_input(ngx_stream_trojan_ctx_t *ctx)
 {
@@ -3277,6 +3291,36 @@ ngx_stream_trojan_compact_udp_input(ngx_stream_trojan_ctx_t *ctx)
     }
 
     ctx->udp_in_pos = 0;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_header_end_seen(u_char *buf, size_t len, size_t *scan)
+{
+    size_t  i;
+
+    if (len < 4) {
+        *scan = 0;
+        return 0;
+    }
+
+    i = *scan;
+    if (i > 3) {
+        i -= 3;
+    } else {
+        i = 0;
+    }
+
+    for (; i + 3 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n'
+            && buf[i + 2] == '\r' && buf[i + 3] == '\n')
+        {
+            return 1;
+        }
+    }
+
+    *scan = len - 3;
+    return 0;
 }
 
 
