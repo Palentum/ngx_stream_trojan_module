@@ -3053,18 +3053,23 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
 
 
 static ssize_t
-ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
-    size_t size, size_t frame_size)
+ngx_stream_trojan_websocket_send_parts(ngx_stream_trojan_ctx_t *ctx,
+    u_char *src, size_t size, u_char *next, size_t next_size,
+    size_t frame_size, size_t *first_sent, size_t *second_sent)
 {
-    ssize_t            n;
-    size_t             chunk;
+    size_t             first_size, second_size, payload_sent;
+    ngx_buf_t          hb, fb, sb;
+    ngx_chain_t        hcl, fcl, scl, *cl, *tail, *out;
     ngx_int_t          rc;
     ngx_connection_t  *c;
 
     c = ctx->session->connection;
 
-    if (!ctx->websocket) {
-        return c->send(c, src, size);
+    if (first_sent != NULL) {
+        *first_sent = 0;
+    }
+    if (second_sent != NULL) {
+        *second_sent = 0;
     }
 
     rc = ngx_stream_trojan_websocket_flush_out(ctx);
@@ -3077,6 +3082,10 @@ ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
 
     if (ctx->state == ngx_stream_trojan_state_ws_closing) {
         return NGX_AGAIN;
+    }
+
+    if (c->send_chain == NULL) {
+        return NGX_ERROR;
     }
 
     if (ctx->ws_send_header_len == 0
@@ -3095,43 +3104,94 @@ ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
         ctx->ws_send_payload_remaining = frame_size;
     }
 
-    while (ctx->ws_send_header_pos < ctx->ws_send_header_len) {
-        n = c->send(c, ctx->ws_send_header + ctx->ws_send_header_pos,
-                    ctx->ws_send_header_len - ctx->ws_send_header_pos);
-
-        if (n == NGX_AGAIN || n == 0) {
-            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
-                return NGX_ERROR;
-            }
-            return NGX_AGAIN;
-        }
-
-        if (n == NGX_ERROR) {
-            return NGX_ERROR;
-        }
-
-        ctx->ws_send_header_pos += (size_t) n;
+    first_size = size;
+    if (first_size > ctx->ws_send_payload_remaining) {
+        first_size = ctx->ws_send_payload_remaining;
     }
 
-    chunk = size;
-    if (chunk > ctx->ws_send_payload_remaining) {
-        chunk = ctx->ws_send_payload_remaining;
+    second_size = 0;
+    if (first_size == size && next_size) {
+        second_size = ctx->ws_send_payload_remaining - first_size;
+        if (second_size > next_size) {
+            second_size = next_size;
+        }
     }
 
-    n = c->send(c, src, chunk);
-    if (n == NGX_AGAIN || n == 0) {
-        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
-            return NGX_ERROR;
+    ngx_memzero(&hb, sizeof(ngx_buf_t));
+    ngx_memzero(&fb, sizeof(ngx_buf_t));
+    ngx_memzero(&sb, sizeof(ngx_buf_t));
+
+    hb.pos = ctx->ws_send_header + ctx->ws_send_header_pos;
+    hb.last = ctx->ws_send_header + ctx->ws_send_header_len;
+    hb.memory = 1;
+    hcl.buf = &hb;
+
+    fb.pos = src;
+    fb.last = src + first_size;
+    fb.memory = 1;
+    fcl.buf = &fb;
+
+    if (second_size) {
+        sb.pos = next;
+        sb.last = next + second_size;
+        sb.memory = 1;
+        scl.buf = &sb;
+    }
+
+    cl = NULL;
+    tail = NULL;
+
+    if (hb.pos < hb.last) {
+        cl = &hcl;
+        tail = &hcl;
+    }
+
+    if (first_size) {
+        if (tail != NULL) {
+            tail->next = &fcl;
+        } else {
+            cl = &fcl;
         }
+        tail = &fcl;
+    }
+
+    if (second_size) {
+        if (tail != NULL) {
+            tail->next = &scl;
+        } else {
+            cl = &scl;
+        }
+        tail = &scl;
+    }
+
+    if (tail == NULL) {
         return NGX_AGAIN;
     }
+    tail->next = NULL;
 
-    if (n == NGX_ERROR) {
+    out = c->send_chain(c, cl, 0);
+    if (out == NGX_CHAIN_ERROR) {
         return NGX_ERROR;
     }
 
-    ctx->ws_send_payload_remaining -= (size_t) n;
-    if (ctx->ws_send_payload_remaining == 0) {
+    ctx->ws_send_header_pos = (size_t) (hb.pos - ctx->ws_send_header);
+    payload_sent = (size_t) (fb.pos - src);
+    if (second_size) {
+        payload_sent += (size_t) (sb.pos - next);
+    }
+
+    if (first_sent != NULL) {
+        *first_sent = (size_t) (fb.pos - src);
+    }
+    if (second_sent != NULL && second_size) {
+        *second_sent = (size_t) (sb.pos - next);
+    }
+
+    ctx->ws_send_payload_remaining -= payload_sent;
+
+    if (ctx->ws_send_payload_remaining == 0
+        && ctx->ws_send_header_pos == ctx->ws_send_header_len)
+    {
         ctx->ws_send_header_len = 0;
         ctx->ws_send_header_pos = 0;
 
@@ -3145,7 +3205,29 @@ ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
         }
     }
 
-    return n;
+    if (out != NULL) {
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return payload_sent ? (ssize_t) payload_sent : NGX_AGAIN;
+    }
+
+    return (ssize_t) payload_sent;
+}
+
+
+static ssize_t
+ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
+    size_t size, size_t frame_size)
+{
+    if (!ctx->websocket) {
+        return ctx->session->connection->send(ctx->session->connection, src,
+                                              size);
+    }
+
+    return ngx_stream_trojan_websocket_send_parts(ctx, src, size, NULL, 0,
+                                                  frame_size, NULL, NULL);
 }
 
 
@@ -5625,7 +5707,8 @@ ngx_stream_trojan_mux_send_frame_payload(
     size_t limit)
 {
     ssize_t                   n;
-    size_t                    available, frame_size, header_before;
+    size_t                    available, frame_size, header_available;
+    size_t                    header_before, header_sent, payload_sent;
     u_char                   *payload_before;
     ngx_buf_t                 hb, pb;
     ngx_chain_t               hcl, pcl, *cl, *out;
@@ -5643,45 +5726,33 @@ ngx_stream_trojan_mux_send_frame_payload(
            || b->pos < b->last)
     {
         if (ctx->websocket) {
-            if (stream->frame_header_pos < stream->frame_header_len) {
-                frame_size = stream->frame_header_len
-                             - stream->frame_header_pos
-                             + (size_t) (b->last - b->pos);
-                n = ngx_stream_trojan_client_send_part(ctx,
-                    stream->frame_header + stream->frame_header_pos,
-                    stream->frame_header_len - stream->frame_header_pos,
-                    frame_size);
-
-                if (n == NGX_AGAIN || n == 0) {
-                    return NGX_AGAIN;
-                }
-
-                if (n == NGX_ERROR) {
-                    return NGX_ERROR;
-                }
-
-                stream->frame_header_pos += (size_t) n;
-                if (sent != NULL) {
-                    *sent += (size_t) n;
-                }
-                ngx_stream_trojan_mux_refresh_read_timeout(ctx, c);
-                continue;
-            }
-
-            if (limit && sent != NULL && *sent >= limit) {
+            if (stream->frame_header_pos == stream->frame_header_len
+                && limit && sent != NULL && *sent >= limit)
+            {
                 return NGX_AGAIN;
             }
 
+            header_available = stream->frame_header_len
+                               - stream->frame_header_pos;
             available = b->last - b->pos;
-            if (limit && sent != NULL && *sent + available > limit) {
-                available = limit - *sent;
+
+            if (limit && sent != NULL) {
+                if (*sent + header_available >= limit) {
+                    available = 0;
+                } else if (*sent + header_available + available > limit) {
+                    available = limit - *sent - header_available;
+                }
             }
-            if (available == 0) {
+
+            if (header_available == 0 && available == 0) {
                 return NGX_AGAIN;
             }
 
-            n = ngx_stream_trojan_client_send_part(ctx, b->pos, available,
-                                                   available);
+            frame_size = header_available + available;
+            n = ngx_stream_trojan_websocket_send_parts(ctx,
+                stream->frame_header + stream->frame_header_pos,
+                header_available, b->pos, available, frame_size,
+                &header_sent, &payload_sent);
 
             if (n == NGX_AGAIN || n == 0) {
                 return NGX_AGAIN;
@@ -5691,10 +5762,12 @@ ngx_stream_trojan_mux_send_frame_payload(
                 return NGX_ERROR;
             }
 
-            b->pos += n;
+            stream->frame_header_pos += header_sent;
+            b->pos += payload_sent;
             if (sent != NULL) {
-                *sent += (size_t) n;
+                *sent += header_sent + payload_sent;
             }
+
             ngx_stream_trojan_mux_refresh_read_timeout(ctx, c);
             continue;
         }
