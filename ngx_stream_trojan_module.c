@@ -365,6 +365,9 @@ struct ngx_stream_trojan_ctx_s {
     u_char                     *udp_out;
     u_char                     *udp_payload;
     ngx_buf_t                  *udp_pending_to_client;
+    const u_char              *udp_pending_payload;
+    size_t                      udp_pending_payload_len;
+    size_t                      udp_pending_payload_sent;
     ngx_buf_t                  *udp_pending_to_upstream;
 
     ngx_buf_t                  *socks5_buffer;
@@ -551,7 +554,8 @@ static ngx_int_t ngx_stream_trojan_send_socks5_udp_frame(
 static ngx_int_t ngx_stream_trojan_forward_socks5_udp_packet(
     ngx_stream_trojan_ctx_t *ctx, u_char *packet, size_t packet_len);
 static ngx_int_t ngx_stream_trojan_queue_udp_client(
-    ngx_stream_trojan_ctx_t *ctx, u_char *data, size_t len);
+    ngx_stream_trojan_ctx_t *ctx, u_char *header, size_t header_len,
+    const u_char *payload, size_t payload_len);
 static ngx_int_t ngx_stream_trojan_queue_socks5_udp_packet(
     ngx_stream_trojan_ctx_t *ctx, u_char *packet, size_t packet_len);
 static ngx_int_t ngx_stream_trojan_flush_socks5_udp_packet(
@@ -3241,6 +3245,134 @@ ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
 
     return ngx_stream_trojan_websocket_send_parts(ctx, src, size, NULL, 0,
                                                   frame_size, NULL, NULL);
+}
+
+
+static ssize_t
+ngx_stream_trojan_client_send_part(ngx_stream_trojan_ctx_t *ctx, u_char *src,
+    size_t size, size_t frame_size)
+{
+    if (!ctx->websocket) {
+        return ctx->session->connection->send(ctx->session->connection, src,
+                                              size);
+    }
+
+    return ngx_stream_trojan_websocket_send_parts(ctx, src, size, NULL, 0,
+                                                  frame_size, NULL, NULL);
+}
+
+
+static ssize_t
+ngx_stream_trojan_client_send_parts(ngx_stream_trojan_ctx_t *ctx, u_char *src,
+    size_t size, const u_char *next, size_t next_size, size_t frame_size,
+    size_t *first_sent, size_t *second_sent)
+{
+    size_t             payload_sent;
+    ngx_buf_t          fb, sb;
+    ngx_chain_t        fcl, scl, *cl, *tail, *out;
+    ngx_connection_t  *c;
+
+    if (first_sent != NULL) {
+        *first_sent = 0;
+    }
+    if (second_sent != NULL) {
+        *second_sent = 0;
+    }
+    c = ctx->session->connection;
+
+    if (ctx->websocket) {
+        return ngx_stream_trojan_websocket_send_parts(ctx, src, size,
+                                                      (u_char *) next,
+                                                      next_size, frame_size,
+                                                      first_sent, second_sent);
+    }
+
+    if (c->send_chain == NULL) {
+        ssize_t  n;
+
+        if (size != 0) {
+            n = c->send(c, src, size);
+            if (n > 0 && first_sent != NULL) {
+                *first_sent = (size_t) n;
+            }
+            return n;
+        }
+
+        if (next_size != 0) {
+            n = c->send(c, (u_char *) next, next_size);
+            if (n > 0 && second_sent != NULL) {
+                *second_sent = (size_t) n;
+            }
+            return n;
+        }
+
+        return NGX_AGAIN;
+    }
+
+    ngx_memzero(&fb, sizeof(ngx_buf_t));
+    ngx_memzero(&sb, sizeof(ngx_buf_t));
+
+    cl = NULL;
+    tail = NULL;
+
+    if (size != 0) {
+        fb.pos = src;
+        fb.last = src + size;
+        fb.memory = 1;
+        fcl.buf = &fb;
+        cl = &fcl;
+        tail = &fcl;
+    }
+
+    if (next_size != 0) {
+        sb.pos = (u_char *) next;
+        sb.last = (u_char *) next + next_size;
+        sb.memory = 1;
+        scl.buf = &sb;
+
+        if (tail != NULL) {
+            tail->next = &scl;
+        } else {
+            cl = &scl;
+        }
+
+        tail = &scl;
+    }
+
+    if (tail == NULL) {
+        return NGX_AGAIN;
+    }
+    tail->next = NULL;
+
+    out = c->send_chain(c, cl, 0);
+    if (out == NGX_CHAIN_ERROR) {
+        return NGX_ERROR;
+    }
+
+    payload_sent = 0;
+    if (size != 0) {
+        payload_sent += (size_t) (fb.pos - src);
+        if (first_sent != NULL) {
+            *first_sent = (size_t) (fb.pos - src);
+        }
+    }
+
+    if (next_size != 0) {
+        payload_sent += (size_t) (sb.pos - next);
+        if (second_sent != NULL) {
+            *second_sent = (size_t) (sb.pos - next);
+        }
+    }
+
+    if (out != NULL) {
+        if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        return payload_sent ? (ssize_t) payload_sent : NGX_AGAIN;
+    }
+
+    return (ssize_t) payload_sent;
 }
 
 
@@ -9288,17 +9420,21 @@ ngx_stream_trojan_send_udp_sockaddr(ngx_stream_trojan_ctx_t *ctx,
         return NGX_ERROR;
     }
 
+    ngx_stream_trojan_refresh_udp_timeout(ctx);
+
     return NGX_OK;
 }
 
 
 static ngx_int_t
-ngx_stream_trojan_queue_udp_client(ngx_stream_trojan_ctx_t *ctx, u_char *data,
-    size_t len)
+ngx_stream_trojan_queue_udp_client(ngx_stream_trojan_ctx_t *ctx, u_char *header,
+    size_t header_len, const u_char *payload, size_t payload_len)
 {
     ngx_buf_t  *b;
 
-    if (len > NGX_STREAM_TROJAN_UDP_BUFFER_SIZE) {
+    if (header_len + payload_len > NGX_STREAM_TROJAN_UDP_BUFFER_SIZE
+        || (payload_len != 0 && payload == NULL))
+    {
         return NGX_ERROR;
     }
 
@@ -9313,11 +9449,16 @@ ngx_stream_trojan_queue_udp_client(ngx_stream_trojan_ctx_t *ctx, u_char *data,
     b = ctx->udp_pending_to_client;
     b->pos = b->start;
     b->last = b->start;
-    ngx_memcpy(b->last, data, len);
-    b->last += len;
+    ngx_memcpy(b->last, header, header_len);
+    b->last += header_len;
+
+    ctx->udp_pending_payload = payload;
+    ctx->udp_pending_payload_len = payload_len;
+    ctx->udp_pending_payload_sent = 0;
 
     return NGX_OK;
 }
+
 
 static ngx_int_t
 ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
@@ -9333,13 +9474,23 @@ ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
         return NGX_OK;
     }
 
-    while (b->pos < b->last) {
-        n = ngx_stream_trojan_client_send(ctx, b->pos, b->last - b->pos);
+    while (b->pos < b->last
+           || ctx->udp_pending_payload_sent < ctx->udp_pending_payload_len)
+    {
+        size_t         header_sent, payload_sent, frame_size;
+        const u_char  *payload;
+
+        payload = ctx->udp_pending_payload_len == ctx->udp_pending_payload_sent
+                  ? NULL
+                  : ctx->udp_pending_payload + ctx->udp_pending_payload_sent;
+        frame_size = (size_t) (b->last - b->start)
+                     + ctx->udp_pending_payload_len;
+        n = ngx_stream_trojan_client_send_parts(
+            ctx, b->pos, b->last - b->pos, payload,
+            ctx->udp_pending_payload_len - ctx->udp_pending_payload_sent,
+            frame_size, &header_sent, &payload_sent);
 
         if (n == NGX_AGAIN) {
-            if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
-                return NGX_ERROR;
-            }
             return NGX_AGAIN;
         }
 
@@ -9347,12 +9498,16 @@ ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
             return NGX_ERROR;
         }
 
-        b->pos += n;
+        b->pos += header_sent;
+        ctx->udp_pending_payload_sent += payload_sent;
         ngx_stream_trojan_refresh_udp_timeout(ctx);
     }
 
     b->pos = b->start;
     b->last = b->start;
+    ctx->udp_pending_payload = NULL;
+    ctx->udp_pending_payload_len = 0;
+    ctx->udp_pending_payload_sent = 0;
 
     return NGX_OK;
 }
@@ -9826,11 +9981,10 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
             continue;
         }
 
-        if (ngx_stream_trojan_pack_udp_frame(&addr, ctx->udp_payload,
-                                             (uint16_t) n,
-                                             ctx->udp_out,
-                                             NGX_STREAM_TROJAN_UDP_BUFFER_SIZE,
-                                             &written)
+        if (ngx_stream_trojan_build_udp_header(&addr, (uint16_t) n,
+                                               ctx->udp_out,
+                                               NGX_STREAM_TROJAN_UDP_BUFFER_SIZE,
+                                               &written)
             != 0)
         {
             continue;
@@ -9868,7 +10022,8 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
             continue;
         }
 
-        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_out, written)
+        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_out, written,
+                                               ctx->udp_payload, (size_t) n)
             != NGX_OK)
         {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
@@ -9965,18 +10120,17 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
             continue;
         }
 
-        ngx_memcpy(ctx->udp_payload, frame.payload, frame.payload_len);
-
-        if (ngx_stream_trojan_pack_udp_frame(
-                &frame.addr, ctx->udp_payload, frame.payload_len,
-                ctx->udp_out, NGX_STREAM_TROJAN_UDP_BUFFER_SIZE,
-                &written)
+        if (ngx_stream_trojan_build_udp_header(
+                &frame.addr, frame.payload_len, ctx->udp_payload,
+                NGX_STREAM_TROJAN_DEFAULT_UDP_PAYLOAD_SIZE, &written)
             != 0)
         {
             continue;
         }
 
-        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_out, written)
+        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_payload, written,
+                                               frame.payload,
+                                               frame.payload_len)
             != NGX_OK)
         {
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
