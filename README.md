@@ -10,7 +10,7 @@
 - **多密码认证**：`trojan_password` 可配置多个明文密码；模块内部派生 SHA-224 十六进制 key，并使用常量时间比较。
 - **TCP 中继**：非阻塞连接目标地址，并在 NGINX 事件循环内双向转发。
 - **UDP ASSOCIATE**：支持 Trojan UDP 包格式，直连 UDP 和 SOCKS5 UDP 出站。
-- **Mux TCP 多路复用**：支持 Trojan-Go `0x7f` mux、Xray/V2Ray `v1.mux.cool`、sing-box/mihomo `sp.mux.sing-box.arpa:444` smux。当前 mux 子流只接受 TCP CONNECT；Mux.Cool UDP 和 sing-mux padding/yamux/h2mux 不支持。
+- **Mux TCP 多路复用**：支持 Trojan-Go `0x7f` raw smux、Xray/V2Ray `v1.mux.cool`、sing-box/mihomo `sp.mux.sing-box.arpa:444` smux。raw/sing smux 对齐 xtaci/smux v1/v2，v2 支持 `cmdUPD` 每流滑动窗口；当前 mux 子流只接受 TCP CONNECT，Mux.Cool 保留 TCP-only，sing-mux padding/yamux/h2mux 不支持。
 - **Fallback**：非 Trojan 流量可转发到 `trojan_fallback`；未配置时返回内置 HTTP 503。
 - **本地 SOCKS5 入站**：`socks5 on;` 提供无认证 SOCKS5 CONNECT；配合 `socks5_udp on;` 支持 UDP ASSOCIATE。
 - **本地 HTTP CONNECT 入站**：`http_proxy on;` 提供 HTTP/1.x CONNECT；其他 HTTP 方法返回 405。
@@ -92,7 +92,7 @@ load_module modules/ngx_stream_trojan_module.so;
 | `trojan_connect_timeout <time>;` | `60s` | 与目标或出站代理建立 TCP 连接的超时。 |
 | `trojan_timeout <time>;` | `10m` | TCP relay 空闲超时。 |
 | `trojan_udp_timeout <time>;` | `10m` | UDP ASSOCIATE 空闲超时。 |
-| `trojan_buffer_size <size>;` | `32k` | TCP relay 每方向缓冲区大小；mux 子流内部缓冲仍按实现上限 `8k` 切片，避免单个 mux 流长期占用 worker。 |
+| `trojan_buffer_size <size>;` | `32k` | TCP relay 每方向缓冲区大小；smux 每子流接收窗口为 `64KiB`，会话接收 token bucket 为 `4MiB`；单帧 payload 仍为 `32KiB`。 |
 
 ### DNS 和数据文件
 
@@ -214,7 +214,7 @@ trojan_routes {
 ## 客户端兼容提示
 
 - Trojan 客户端必须使用 TLS 连接到 NGINX 的 `listen ... ssl` server。
-- mihomo/sing-box 的 sing-mux 需要使用 `smux`，且关闭 padding；`yamux`、`h2mux` 和 padding 当前不支持。
+- mihomo/sing-box 的 sing-mux 需要使用 `smux`，且关闭 padding；`smux` v1/v2 均可，`yamux`、`h2mux` 和 padding 当前不支持。
 - SOCKS5 本地入站只支持无认证方法。
 - HTTP 本地入站只支持 CONNECT，不实现普通 HTTP 正向代理请求转发。
 - Trojan-Go WebSocket 客户端的 `path` 必须与 `trojan_websocket_path` 完全一致；开启 `trojan_websocket` 的 server 不接受普通 Trojan 客户端。
@@ -239,7 +239,7 @@ trojan_routes {
 | `ngx_stream_trojan_socks5_protocol.c/h` | SOCKS5 编解码：握手、认证、请求、响应、UDP 包。 |
 | `ngx_stream_trojan_http_proxy_protocol.c/h` | HTTP CONNECT 入站解析和响应生成。 |
 | `ngx_stream_trojan_websocket_protocol.c/h` | Trojan-Go WebSocket 握手、Accept、错误响应和 frame header/mask 辅助。 |
-| `ngx_stream_trojan_mux.c/h` | Trojan-Go mux、Mux.Cool、sing-mux smux 帧解析/打包。 |
+| `ngx_stream_trojan_mux.c/h` | xtaci/smux v1/v2 frame、Mux.Cool、sing-mux 请求解析/打包。 |
 | `ngx_stream_trojan_doh.c/h` | 异步 DoH client。 |
 | `ngx_stream_trojan_dns_rules.c/h` | DNS 规则文件解析和域名匹配。 |
 | `ngx_stream_trojan_geosite.c/h` | `geosite.dat` / `dlc.dat` 解析和匹配。 |

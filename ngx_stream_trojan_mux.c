@@ -66,7 +66,8 @@ ngx_stream_trojan_mux_parse_header(const uint8_t *buf, size_t len,
     frame->length = ngx_stream_trojan_mux_get16le(buf + 2);
     frame->stream_id = ngx_stream_trojan_mux_get32le(buf + 4);
 
-    if (frame->version != NGX_STREAM_TROJAN_MUX_VERSION
+    if ((frame->version != NGX_STREAM_TROJAN_MUX_VERSION1
+         && frame->version != NGX_STREAM_TROJAN_MUX_VERSION2)
         || frame->length > NGX_STREAM_TROJAN_MUX_MAX_FRAME_SIZE)
     {
         return NGX_STREAM_TROJAN_MUX_ERROR;
@@ -84,6 +85,14 @@ ngx_stream_trojan_mux_parse_header(const uint8_t *buf, size_t len,
     case NGX_STREAM_TROJAN_MUX_CMD_PSH:
         break;
 
+    case NGX_STREAM_TROJAN_MUX_CMD_UPD:
+        if (frame->version != NGX_STREAM_TROJAN_MUX_VERSION2
+            || frame->length != NGX_STREAM_TROJAN_MUX_UPD_LEN)
+        {
+            return NGX_STREAM_TROJAN_MUX_ERROR;
+        }
+        break;
+
     default:
         return NGX_STREAM_TROJAN_MUX_ERROR;
     }
@@ -94,9 +103,12 @@ ngx_stream_trojan_mux_parse_header(const uint8_t *buf, size_t len,
 
 int
 ngx_stream_trojan_mux_pack_header(uint8_t *buf, size_t len,
-    uint8_t command, uint16_t payload_len, uint32_t stream_id)
+    uint8_t version, uint8_t command, uint16_t payload_len,
+    uint32_t stream_id)
 {
     if (buf == NULL || len < NGX_STREAM_TROJAN_MUX_HEADER_LEN
+        || (version != NGX_STREAM_TROJAN_MUX_VERSION1
+            && version != NGX_STREAM_TROJAN_MUX_VERSION2)
         || payload_len > NGX_STREAM_TROJAN_MUX_MAX_FRAME_SIZE)
     {
         return NGX_STREAM_TROJAN_MUX_ERROR;
@@ -114,14 +126,53 @@ ngx_stream_trojan_mux_pack_header(uint8_t *buf, size_t len,
     case NGX_STREAM_TROJAN_MUX_CMD_PSH:
         break;
 
+    case NGX_STREAM_TROJAN_MUX_CMD_UPD:
+        if (version != NGX_STREAM_TROJAN_MUX_VERSION2
+            || payload_len != NGX_STREAM_TROJAN_MUX_UPD_LEN)
+        {
+            return NGX_STREAM_TROJAN_MUX_ERROR;
+        }
+        break;
+
     default:
         return NGX_STREAM_TROJAN_MUX_ERROR;
     }
 
-    buf[0] = NGX_STREAM_TROJAN_MUX_VERSION;
+    buf[0] = version;
     buf[1] = command;
     ngx_stream_trojan_mux_put16le(buf + 2, payload_len);
     ngx_stream_trojan_mux_put32le(buf + 4, stream_id);
+
+    return NGX_STREAM_TROJAN_MUX_OK;
+}
+
+int
+ngx_stream_trojan_mux_parse_update(const uint8_t *buf, size_t len,
+    uint32_t *consumed, uint32_t *window)
+{
+    if (buf == NULL || consumed == NULL || window == NULL
+        || len < NGX_STREAM_TROJAN_MUX_UPD_LEN)
+    {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    *consumed = ngx_stream_trojan_mux_get32le(buf);
+    *window = ngx_stream_trojan_mux_get32le(buf + 4);
+
+    return NGX_STREAM_TROJAN_MUX_OK;
+}
+
+
+int
+ngx_stream_trojan_mux_pack_update(uint8_t *buf, size_t len,
+    uint32_t consumed, uint32_t window)
+{
+    if (buf == NULL || len < NGX_STREAM_TROJAN_MUX_UPD_LEN) {
+        return NGX_STREAM_TROJAN_MUX_ERROR;
+    }
+
+    ngx_stream_trojan_mux_put32le(buf, consumed);
+    ngx_stream_trojan_mux_put32le(buf + 4, window);
 
     return NGX_STREAM_TROJAN_MUX_OK;
 }

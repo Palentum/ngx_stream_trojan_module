@@ -8,10 +8,16 @@
 
 #define NGX_STREAM_TROJAN_CMD_MUX 0x7f
 
-#define NGX_STREAM_TROJAN_MUX_VERSION 1
+#define NGX_STREAM_TROJAN_MUX_VERSION1 1
+#define NGX_STREAM_TROJAN_MUX_VERSION2 2
+#define NGX_STREAM_TROJAN_MUX_DEFAULT_VERSION NGX_STREAM_TROJAN_MUX_VERSION1
 #define NGX_STREAM_TROJAN_MUX_HEADER_LEN 8
 #define NGX_STREAM_TROJAN_MUX_MAX_FRAME_SIZE 32768
-#define NGX_STREAM_TROJAN_MUX_STREAM_BUFFER_SIZE 8192
+#define NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER 65536
+#define NGX_STREAM_TROJAN_MUX_MAX_RECEIVE_BUFFER 4194304
+#define NGX_STREAM_TROJAN_MUX_INITIAL_PEER_WINDOW 262144
+#define NGX_STREAM_TROJAN_MUX_WINDOW_UPDATE_THRESHOLD (NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER / 2)
+#define NGX_STREAM_TROJAN_MUX_UPD_LEN 8
 #define NGX_STREAM_TROJAN_MUX_MAX_STREAMS 64
 
 #define NGX_STREAM_TROJAN_MUX_COOL_HOST "v1.mux.cool"
@@ -48,6 +54,7 @@
 #define NGX_STREAM_TROJAN_MUX_CMD_FIN 0x01
 #define NGX_STREAM_TROJAN_MUX_CMD_PSH 0x02
 #define NGX_STREAM_TROJAN_MUX_CMD_NOP 0x03
+#define NGX_STREAM_TROJAN_MUX_CMD_UPD 0x04
 
 #define NGX_STREAM_TROJAN_MUX_OK 0
 #define NGX_STREAM_TROJAN_MUX_AGAIN 1
@@ -71,7 +78,12 @@ typedef struct {
 int ngx_stream_trojan_mux_parse_header(const uint8_t *buf, size_t len,
     ngx_stream_trojan_mux_frame_t *frame);
 int ngx_stream_trojan_mux_pack_header(uint8_t *buf, size_t len,
-    uint8_t command, uint16_t payload_len, uint32_t stream_id);
+    uint8_t version, uint8_t command, uint16_t payload_len,
+    uint32_t stream_id);
+int ngx_stream_trojan_mux_parse_update(const uint8_t *buf, size_t len,
+    uint32_t *consumed, uint32_t *window);
+int ngx_stream_trojan_mux_pack_update(uint8_t *buf, size_t len,
+    uint32_t consumed, uint32_t window);
 int ngx_stream_trojan_mux_request_needed(const uint8_t *buf, size_t len,
     size_t *needed);
 int ngx_stream_trojan_mux_sing_request_needed(const uint8_t *buf, size_t len,
