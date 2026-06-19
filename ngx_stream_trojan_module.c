@@ -53,6 +53,7 @@
 #define NGX_STREAM_TROJAN_CACHE_FNV_OFFSET 2166136261u
 #define NGX_STREAM_TROJAN_CACHE_FNV_PRIME 16777619u
 #define NGX_STREAM_TROJAN_KEY_BUCKETS 256
+#define NGX_STREAM_TROJAN_UDP_ERROR_LOG_INTERVAL 1000
 
 
 
@@ -466,6 +467,10 @@ struct ngx_stream_trojan_ctx_s {
     size_t                      udp_pending_payload_len;
     size_t                      udp_pending_payload_sent;
     ngx_buf_t                  *udp_pending_to_upstream;
+    const char                 *udp_error_log_message;
+    ngx_err_t                   udp_error_log_err;
+    ngx_msec_t                  udp_error_log_time;
+    ngx_uint_t                  udp_error_log_suppressed;
 
     ngx_buf_t                  *socks5_buffer;
     ngx_buf_t                  *http_buffer;
@@ -11228,11 +11233,77 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
 }
 
 
+static void
+ngx_stream_trojan_flush_udp_error_log(ngx_stream_trojan_ctx_t *ctx,
+    ngx_log_t *log)
+{
+    if (ctx->udp_error_log_message == NULL
+        || ctx->udp_error_log_suppressed == 0)
+    {
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, log, ctx->udp_error_log_err,
+                  "%s (suppressed %ui similar UDP errors)",
+                  ctx->udp_error_log_message,
+                  ctx->udp_error_log_suppressed);
+
+    ctx->udp_error_log_suppressed = 0;
+}
+
+
+static void
+ngx_stream_trojan_log_udp_error(ngx_stream_trojan_ctx_t *ctx, ngx_log_t *log,
+    ngx_err_t err, const char *message)
+{
+    ngx_msec_t  now;
+
+    now = ngx_current_msec;
+
+    if (ctx->udp_error_log_message != NULL
+        && ctx->udp_error_log_err == err
+        && ngx_strcmp(ctx->udp_error_log_message, message) == 0)
+    {
+        if ((ngx_msec_int_t) (now - ctx->udp_error_log_time)
+            < (ngx_msec_int_t) NGX_STREAM_TROJAN_UDP_ERROR_LOG_INTERVAL)
+        {
+            if (ctx->udp_error_log_suppressed != (ngx_uint_t) -1) {
+                ctx->udp_error_log_suppressed++;
+            }
+
+            return;
+        }
+
+        if (ctx->udp_error_log_suppressed) {
+            ngx_log_error(NGX_LOG_INFO, log, err,
+                          "%s (suppressed %ui similar UDP errors)",
+                          message, ctx->udp_error_log_suppressed);
+        } else {
+            ngx_log_error(NGX_LOG_INFO, log, err, "%s", message);
+        }
+
+        ctx->udp_error_log_time = now;
+        ctx->udp_error_log_suppressed = 0;
+
+        return;
+    }
+
+    ngx_stream_trojan_flush_udp_error_log(ctx, log);
+
+    ctx->udp_error_log_message = message;
+    ctx->udp_error_log_err = err;
+    ctx->udp_error_log_time = now;
+    ctx->udp_error_log_suppressed = 0;
+
+    ngx_log_error(NGX_LOG_INFO, log, err, "%s", message);
+}
+
+
 static ngx_int_t
 ngx_stream_trojan_send_udp_iov(ngx_stream_trojan_ctx_t *ctx,
     ngx_connection_t *uc, u_char *header, size_t header_len,
     const u_char *payload, size_t payload_len, struct sockaddr *sockaddr,
-    socklen_t socklen, const char *message)
+    socklen_t socklen, const char *message, const char *short_message)
 {
     ssize_t        n;
     struct iovec   iov[2];
@@ -11257,14 +11328,14 @@ ngx_stream_trojan_send_udp_iov(ngx_stream_trojan_ctx_t *ctx,
             return NGX_OK;
         }
 
-        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log,
-                      err, "%s", message);
+        ngx_stream_trojan_log_udp_error(
+            ctx, ctx->session->connection->log, err, message);
         return NGX_ERROR;
     }
 
     if ((size_t) n != header_len + payload_len) {
-        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log, 0,
-                      "short UDP sendmsg() while sending %s", message);
+        ngx_stream_trojan_log_udp_error(
+            ctx, ctx->session->connection->log, 0, short_message);
         return NGX_ERROR;
     }
 
@@ -11291,7 +11362,8 @@ ngx_stream_trojan_send_socks5_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     return ngx_stream_trojan_send_udp_iov(
         ctx, ctx->socks5_udp, ctx->udp_out, header_len, frame->payload,
         frame->payload_len, ctx->socks5_udp_relay.sockaddr,
-        ctx->socks5_udp_relay.socklen, "sendmsg() to socks5 udp relay failed");
+        ctx->socks5_udp_relay.socklen, "sendmsg() to socks5 udp relay failed",
+        "short UDP sendmsg() to socks5 udp relay");
 }
 
 
@@ -11317,8 +11389,9 @@ ngx_stream_trojan_forward_socks5_udp_packet(ngx_stream_trojan_ctx_t *ctx,
             return NGX_OK;
         }
 
-        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log,
-                      err, "sendto() to socks5 udp relay failed");
+        ngx_stream_trojan_log_udp_error(ctx, ctx->session->connection->log,
+                                        err,
+                                        "sendto() to socks5 udp relay failed");
         return NGX_ERROR;
     }
     ngx_stream_trojan_refresh_udp_timeout(ctx);
@@ -11481,8 +11554,8 @@ ngx_stream_trojan_send_udp_sockaddr(ngx_stream_trojan_ctx_t *ctx,
             return NGX_OK;
         }
 
-        ngx_log_error(NGX_LOG_INFO, ctx->session->connection->log,
-                      err, "sendto() failed");
+        ngx_stream_trojan_log_udp_error(ctx, ctx->session->connection->log,
+                                        err, "sendto() failed");
         return NGX_ERROR;
     }
 
@@ -12030,7 +12103,8 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
                 break;
             }
 
-            ngx_log_error(NGX_LOG_INFO, c->log, err, "recvfrom() failed");
+            ngx_stream_trojan_log_udp_error(ctx, c->log, err,
+                                            "recvfrom() failed");
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
@@ -12076,7 +12150,8 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
                     ctx->udp_payload, (size_t) n,
                     (struct sockaddr *) &ctx->socks5_udp_client,
                     ctx->socks5_udp_client_socklen,
-                    "sendmsg() socks5 udp client failed")
+                    "sendmsg() socks5 udp client failed",
+                    "short UDP sendmsg() to socks5 udp client")
                 != NGX_OK)
             {
                 ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -12150,8 +12225,8 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
                 break;
             }
 
-            ngx_log_error(NGX_LOG_INFO, c->log, err,
-                          "recvfrom() from socks5 udp relay failed");
+            ngx_stream_trojan_log_udp_error(
+                ctx, c->log, err, "recvfrom() from socks5 udp relay failed");
             ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
             return;
         }
@@ -12174,11 +12249,15 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
             n = sendto(ctx->socks5_in_udp->fd, ctx->udp_out, (size_t) n, 0,
                        (struct sockaddr *) &ctx->socks5_udp_client,
                        ctx->socks5_udp_client_socklen);
-            if (n == -1 && ngx_socket_errno != NGX_EAGAIN) {
-                ngx_log_error(NGX_LOG_INFO, c->log, ngx_socket_errno,
-                              "sendto() socks5 udp client failed");
-                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
-                return;
+            if (n == -1) {
+                ngx_err_t err = ngx_socket_errno;
+
+                if (err != NGX_EAGAIN) {
+                    ngx_stream_trojan_log_udp_error(
+                        ctx, c->log, err, "sendto() socks5 udp client failed");
+                    ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                    return;
+                }
             }
 
             continue;
@@ -12264,8 +12343,8 @@ ngx_stream_trojan_socks5_in_udp_read_handler(ngx_event_t *ev)
                 break;
             }
 
-            ngx_log_error(NGX_LOG_INFO, uc->log, err,
-                          "recvfrom() socks5 udp relay failed");
+            ngx_stream_trojan_log_udp_error(
+                ctx, uc->log, err, "recvfrom() socks5 udp relay failed");
             break;
         }
         packets++;
@@ -12477,6 +12556,8 @@ ngx_stream_trojan_finalize(ngx_stream_trojan_ctx_t *ctx, ngx_uint_t rc)
     }
 
     ctx->finalized = 1;
+    ngx_stream_trojan_flush_udp_error_log(ctx,
+                                          ctx->session->connection->log);
     if (ctx->resolver_ctx) {
         ngx_resolve_name_done(ctx->resolver_ctx);
         ctx->resolver_ctx = NULL;
