@@ -16,6 +16,7 @@ struct ngx_stream_trojan_dns_rule_group_s {
     ngx_stream_trojan_doh_conf_t      *doh_conf;
     ngx_uint_t                         ip_prefer;
     ngx_array_t     *rules;
+    ngx_array_t     *non_domain_rules;
     ngx_uint_t       strategy_set;
 };
 

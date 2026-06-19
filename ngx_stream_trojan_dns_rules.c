@@ -41,9 +41,22 @@ typedef struct {
     ngx_stream_trojan_dns_rule_group_t *group;
 } ngx_stream_trojan_dns_rules_cache_entry_t;
 
+typedef struct {
+    ngx_uint_t       valid;
+    ngx_uint_t       hash;
+    ngx_str_t        value;
+    ngx_uint_t       group_index;
+    ngx_stream_trojan_dns_rule_group_t *group;
+} ngx_stream_trojan_dns_rules_domain_index_t;
+
+
+
 struct ngx_stream_trojan_dns_rules_conf_s {
     ngx_array_t     *groups;
     ngx_str_t        path;
+    ngx_stream_trojan_dns_rules_domain_index_t
+                    *domain_index;
+    ngx_uint_t       domain_index_slots;
     ngx_stream_trojan_dns_rules_cache_entry_t
                      cache[NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES];
     ngx_uint_t       cache_generation;
@@ -75,6 +88,25 @@ static ngx_int_t ngx_stream_trojan_dns_rules_match_rule(
     ngx_stream_trojan_dns_rule_t *rule, const u_char *host, size_t host_len);
 static ngx_int_t ngx_stream_trojan_dns_rules_match_domain(const u_char *host,
     size_t host_len, ngx_str_t *domain);
+static ngx_uint_t ngx_stream_trojan_dns_rules_domain_index_slots(
+    ngx_uint_t count);
+static ngx_int_t ngx_stream_trojan_dns_rules_build_domain_index(
+    ngx_conf_t *cf, ngx_stream_trojan_dns_rules_conf_t *rules);
+static ngx_int_t ngx_stream_trojan_dns_rules_domain_index_insert(
+    ngx_stream_trojan_dns_rules_domain_index_t *index, ngx_uint_t slots,
+    ngx_str_t *value, ngx_uint_t group_index,
+    ngx_stream_trojan_dns_rule_group_t *group);
+static ngx_stream_trojan_dns_rules_domain_index_t *
+ngx_stream_trojan_dns_rules_domain_index_find(
+    ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *value,
+    size_t value_len, ngx_uint_t hash);
+static ngx_stream_trojan_dns_rule_group_t *
+ngx_stream_trojan_dns_rules_domain_index_match(
+    ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *host,
+    size_t host_len, ngx_uint_t *group_index);
+static ngx_int_t ngx_stream_trojan_dns_rules_match_group(
+    ngx_stream_trojan_dns_rule_group_t *group, const u_char *host,
+    size_t host_len, ngx_uint_t skip_domain);
 static ngx_int_t ngx_stream_trojan_dns_rules_prepare_rule_geosite(
     ngx_conf_t *cf, ngx_stream_trojan_dns_rule_t *rule,
     ngx_stream_trojan_geosite_t *geosite);
@@ -256,6 +288,226 @@ ngx_stream_trojan_dns_rules_cache_store(
     slot->accessed = ++rules->cache_generation;
     slot->valid = 1;
 }
+
+static ngx_uint_t
+ngx_stream_trojan_dns_rules_domain_index_slots(ngx_uint_t count)
+{
+    ngx_uint_t  slots;
+
+    slots = 8;
+
+    while (slots < count * 2) {
+        slots <<= 1;
+    }
+
+    return slots;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_dns_rules_domain_index_insert(
+    ngx_stream_trojan_dns_rules_domain_index_t *index, ngx_uint_t slots,
+    ngx_str_t *value, ngx_uint_t group_index,
+    ngx_stream_trojan_dns_rule_group_t *group)
+{
+    ngx_uint_t                                  i, hash, idx;
+    ngx_stream_trojan_dns_rules_domain_index_t *slot;
+
+    hash = ngx_stream_trojan_dns_rules_host_hash(value->data, value->len);
+    idx = hash % slots;
+
+    for (i = 0; i < slots; i++) {
+        slot = &index[(idx + i) % slots];
+
+        if (!slot->valid) {
+            slot->valid = 1;
+            slot->hash = hash;
+            slot->value = *value;
+            slot->group_index = group_index;
+            slot->group = group;
+            return NGX_OK;
+        }
+
+        if (slot->hash == hash
+            && slot->value.len == value->len
+            && ngx_memcmp(slot->value.data, value->data, value->len) == 0)
+        {
+            return NGX_OK;
+        }
+    }
+
+    return NGX_ERROR;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_dns_rules_build_domain_index(ngx_conf_t *cf,
+    ngx_stream_trojan_dns_rules_conf_t *rules)
+{
+    ngx_uint_t                             i, j, count;
+    ngx_stream_trojan_dns_rule_group_t    *groups;
+    ngx_stream_trojan_dns_rule_t          *rule, **rule_slot;
+
+    if (rules->domain_index != NULL || rules->groups == NULL) {
+        return NGX_OK;
+    }
+
+    count = 0;
+    groups = rules->groups->elts;
+
+    for (i = 0; i < rules->groups->nelts; i++) {
+        rule = groups[i].rules->elts;
+
+        for (j = 0; j < groups[i].rules->nelts; j++) {
+            if (rule[j].type == ngx_stream_trojan_dns_rule_domain) {
+                count++;
+            }
+        }
+    }
+
+    if (count == 0) {
+        return NGX_OK;
+    }
+
+    rules->domain_index_slots =
+        ngx_stream_trojan_dns_rules_domain_index_slots(count);
+    rules->domain_index = ngx_pcalloc(cf->pool,
+        rules->domain_index_slots
+        * sizeof(ngx_stream_trojan_dns_rules_domain_index_t));
+    if (rules->domain_index == NULL) {
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < rules->groups->nelts; i++) {
+        rule = groups[i].rules->elts;
+
+        for (j = 0; j < groups[i].rules->nelts; j++) {
+            if (rule[j].type != ngx_stream_trojan_dns_rule_domain) {
+                if (groups[i].non_domain_rules == NULL) {
+                    groups[i].non_domain_rules = ngx_array_create(cf->pool, 1,
+                        sizeof(ngx_stream_trojan_dns_rule_t *));
+                    if (groups[i].non_domain_rules == NULL) {
+                        return NGX_ERROR;
+                    }
+                }
+
+                rule_slot = ngx_array_push(groups[i].non_domain_rules);
+                if (rule_slot == NULL) {
+                    return NGX_ERROR;
+                }
+
+                *rule_slot = &rule[j];
+                continue;
+            }
+
+            if (ngx_stream_trojan_dns_rules_domain_index_insert(
+                    rules->domain_index, rules->domain_index_slots,
+                    &rule[j].value, i, &groups[i])
+                != NGX_OK)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "could not index trojan_dns_rules domains");
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_stream_trojan_dns_rules_domain_index_t *
+ngx_stream_trojan_dns_rules_domain_index_find(
+    ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *value,
+    size_t value_len, ngx_uint_t hash)
+{
+    ngx_uint_t                                  i, idx;
+    ngx_stream_trojan_dns_rules_domain_index_t *slot;
+
+    if (rules->domain_index == NULL || rules->domain_index_slots == 0) {
+        return NULL;
+    }
+
+    idx = hash % rules->domain_index_slots;
+
+    for (i = 0; i < rules->domain_index_slots; i++) {
+        slot = &rules->domain_index[(idx + i) % rules->domain_index_slots];
+
+        if (!slot->valid) {
+            return NULL;
+        }
+
+        if (slot->hash == hash
+            && slot->value.len == value_len
+            && ngx_memcmp(slot->value.data, value, value_len) == 0)
+        {
+            return slot;
+        }
+    }
+
+    return NULL;
+}
+
+
+static ngx_stream_trojan_dns_rule_group_t *
+ngx_stream_trojan_dns_rules_domain_index_match(
+    ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *host,
+    size_t host_len, ngx_uint_t *group_index)
+{
+    u_char                                      key[256];
+    u_char                                     *suffix, *end, *p;
+    size_t                                      suffix_len, i;
+    ngx_uint_t                                  hash, best;
+    ngx_stream_trojan_dns_rule_group_t         *group;
+    ngx_stream_trojan_dns_rules_domain_index_t *slot;
+
+    *group_index = (ngx_uint_t) -1;
+
+    if (rules->domain_index == NULL || rules->domain_index_slots == 0
+        || host_len > sizeof(key))
+    {
+        return NULL;
+    }
+
+    for (i = 0; i < host_len; i++) {
+        key[i] = ngx_stream_trojan_dns_rules_lc(host[i]);
+    }
+
+    best = (ngx_uint_t) -1;
+    group = NULL;
+    suffix = key;
+    end = key + host_len;
+
+    for (;;) {
+        suffix_len = (size_t) (end - suffix);
+        hash = ngx_stream_trojan_dns_rules_host_hash(suffix, suffix_len);
+        slot = ngx_stream_trojan_dns_rules_domain_index_find(
+            rules, suffix, suffix_len, hash);
+
+        if (slot != NULL && slot->group_index < best) {
+            best = slot->group_index;
+            group = slot->group;
+
+            if (best == 0) {
+                break;
+            }
+        }
+
+        p = ngx_strlchr(suffix, end, '.');
+        if (p == NULL) {
+            break;
+        }
+
+        suffix = p + 1;
+        if (suffix >= end) {
+            break;
+        }
+    }
+
+    *group_index = best;
+    return group;
+}
+
 
 static ngx_uint_t
 ngx_stream_trojan_dns_rules_space(u_char ch)
@@ -451,6 +703,10 @@ ngx_stream_trojan_dns_rules_parse(ngx_conf_t *cf, ngx_str_t *path,
     }
 
     if (ngx_stream_trojan_dns_rules_validate(cf, rules) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_stream_trojan_dns_rules_build_domain_index(cf, rules) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
 
@@ -1088,9 +1344,9 @@ ngx_stream_trojan_dns_rule_group_t *
 ngx_stream_trojan_dns_rules_match(ngx_stream_trojan_dns_rules_conf_t *rules,
     const u_char *host, size_t host_len)
 {
-    ngx_uint_t                             i, j, cache_found;
-    ngx_stream_trojan_dns_rule_group_t    *groups, *cached;
-    ngx_stream_trojan_dns_rule_t          *rule;
+    ngx_uint_t                             i, start, cache_found, group_index;
+    ngx_uint_t                             scan_limit, indexed;
+    ngx_stream_trojan_dns_rule_group_t    *groups, *cached, *candidate;
 
     if (rules == NULL || rules->groups == NULL
         || host == NULL || host_len == 0)
@@ -1107,27 +1363,100 @@ ngx_stream_trojan_dns_rules_match(ngx_stream_trojan_dns_rules_conf_t *rules,
         return cached;
     }
 
-
     groups = rules->groups->elts;
+    indexed = rules->domain_index != NULL
+              && rules->domain_index_slots != 0
+              && host_len <= 256;
+    start = 0;
+    if (indexed) {
+        for (start = 0; start < rules->groups->nelts; start++) {
+            if (groups[start].non_domain_rules == NULL
+                || groups[start].non_domain_rules->nelts
+                   != groups[start].rules->nelts)
+            {
+                break;
+            }
 
-    for (i = 0; i < rules->groups->nelts; i++) {
-        rule = groups[i].rules->elts;
-
-        for (j = 0; j < groups[i].rules->nelts; j++) {
-            if (ngx_stream_trojan_dns_rules_match_rule(&rule[j], host,
-                                                       host_len))
+            if (ngx_stream_trojan_dns_rules_match_group(&groups[start], host,
+                                                        host_len, 1))
             {
                 ngx_stream_trojan_dns_rules_cache_store(rules, host,
-                                                        host_len, &groups[i]);
+                                                        host_len,
+                                                        &groups[start]);
 
-                return &groups[i];
+                return &groups[start];
             }
         }
+    }
+    candidate = indexed
+                ? ngx_stream_trojan_dns_rules_domain_index_match(
+                    rules, host, host_len, &group_index)
+                : NULL;
+    scan_limit = candidate != NULL ? group_index : rules->groups->nelts;
+
+    for (i = start; i < scan_limit; i++) {
+        if (ngx_stream_trojan_dns_rules_match_group(&groups[i], host,
+                                                    host_len, indexed))
+        {
+            ngx_stream_trojan_dns_rules_cache_store(rules, host,
+                                                    host_len, &groups[i]);
+
+            return &groups[i];
+        }
+    }
+
+    if (candidate != NULL) {
+        ngx_stream_trojan_dns_rules_cache_store(rules, host, host_len,
+                                                candidate);
+
+        return candidate;
     }
 
     ngx_stream_trojan_dns_rules_cache_store(rules, host, host_len, NULL);
 
     return NULL;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_dns_rules_match_group(
+    ngx_stream_trojan_dns_rule_group_t *group, const u_char *host,
+    size_t host_len, ngx_uint_t skip_domain)
+{
+    ngx_uint_t                     j;
+    ngx_stream_trojan_dns_rule_t  *rule, **rulep;
+
+    if (group->rules == NULL || group->rules->nelts == 0) {
+        return 0;
+    }
+
+    if (skip_domain) {
+        if (group->non_domain_rules == NULL
+            || group->non_domain_rules->nelts == 0)
+        {
+            return 0;
+        }
+
+        rulep = group->non_domain_rules->elts;
+        for (j = 0; j < group->non_domain_rules->nelts; j++) {
+            if (ngx_stream_trojan_dns_rules_match_rule(rulep[j], host,
+                                                       host_len))
+            {
+                return 1;
+            }
+        }
+
+        return 0;
+    }
+
+    rule = group->rules->elts;
+    for (j = 0; j < group->rules->nelts; j++) {
+        if (ngx_stream_trojan_dns_rules_match_rule(&rule[j], host, host_len)) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 
