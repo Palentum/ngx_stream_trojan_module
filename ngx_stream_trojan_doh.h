@@ -16,12 +16,14 @@
 #define NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES     64
 #define NGX_STREAM_TROJAN_DOH_CACHE_ADDRS       8
 #define NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL     600
+#define NGX_STREAM_TROJAN_DOH_CACHE_NEGATIVE_TTL 30
 #define NGX_STREAM_TROJAN_DOH_MAX_ACTIVE        32
 #define NGX_STREAM_TROJAN_DOH_MAX_PENDING       256
 #define NGX_STREAM_TROJAN_DOH_MAX_IDLE          NGX_STREAM_TROJAN_DOH_MAX_ACTIVE
 
 typedef struct {
     ngx_uint_t           valid;
+    ngx_int_t            status;
     uint16_t             qtype;
     size_t               name_len;
     u_char               name[255];

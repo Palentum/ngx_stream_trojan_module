@@ -556,8 +556,8 @@ static ngx_stream_trojan_doh_cache_entry_t *
     u_char *name, size_t name_len, uint16_t qtype);
 static void ngx_stream_trojan_doh_cache_store(
     ngx_stream_trojan_doh_conf_t *conf, u_char *name, size_t name_len,
-    uint16_t qtype, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs,
-    uint32_t ttl);
+    uint16_t qtype, ngx_int_t status, ngx_resolver_addr_t *addrs,
+    ngx_uint_t naddrs, uint32_t ttl);
 static ngx_int_t ngx_stream_trojan_doh_start_request(
     ngx_stream_trojan_doh_ctx_t *doh);
 static void ngx_stream_trojan_doh_run_pending(
@@ -659,21 +659,37 @@ ngx_stream_trojan_doh_cache_lookup(ngx_stream_trojan_doh_conf_t *conf,
 
 static void
 ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
-    u_char *name, size_t name_len, uint16_t qtype,
+    u_char *name, size_t name_len, uint16_t qtype, ngx_int_t status,
     ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, uint32_t ttl)
 {
-    ngx_uint_t                             i, oldest;
+    ngx_uint_t                             i, oldest, oldest_negative;
+    ngx_uint_t                             has_negative;
     ngx_msec_t                            now, ttl_ms;
     ngx_stream_trojan_doh_cache_entry_t  *e, *slot;
 
-    if (ttl == 0 || name_len == 0 || name_len > 255
-        || naddrs == 0 || naddrs > NGX_STREAM_TROJAN_DOH_CACHE_ADDRS)
-    {
+    if (name_len == 0 || name_len > 255) {
         return;
     }
 
-    if (ttl > NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL) {
-        ttl = NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL;
+    if (status == NGX_OK) {
+        if (ttl == 0 || naddrs == 0
+            || naddrs > NGX_STREAM_TROJAN_DOH_CACHE_ADDRS
+            || addrs == NULL)
+        {
+            return;
+        }
+
+        if (ttl > NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL) {
+            ttl = NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL;
+        }
+
+    } else if (status == NGX_DECLINED || status == NGX_ERROR) {
+        ttl = NGX_STREAM_TROJAN_DOH_CACHE_NEGATIVE_TTL;
+        addrs = NULL;
+        naddrs = 0;
+
+    } else {
+        return;
     }
 
     ttl_ms = (ngx_msec_t) ttl * 1000;
@@ -681,12 +697,23 @@ ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
     e = conf->cache;
     slot = NULL;
     oldest = 0;
+    oldest_negative = 0;
+    has_negative = 0;
 
     for (i = 0; i < NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES; i++) {
         if (e[i].valid
             && e[i].qtype == qtype
             && ngx_stream_trojan_doh_name_eq(&e[i], name, name_len))
         {
+            if ((ngx_msec_int_t) (e[i].expire - now) <= 0) {
+                slot = &e[i];
+                break;
+            }
+
+            if (status != NGX_OK && e[i].status == NGX_OK) {
+                return;
+            }
+
             slot = &e[i];
             break;
         }
@@ -701,14 +728,28 @@ ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
         if (e[i].accessed < e[oldest].accessed) {
             oldest = i;
         }
+
+        if (e[i].status != NGX_OK) {
+            if (!has_negative
+                || e[i].accessed < e[oldest_negative].accessed)
+            {
+                oldest_negative = i;
+                has_negative = 1;
+            }
+        }
     }
 
     if (slot == NULL) {
-        slot = &e[oldest];
+        if (has_negative) {
+            slot = &e[oldest_negative];
+        } else {
+            slot = &e[oldest];
+        }
     }
 
     slot->valid = 0;
     slot->qtype = qtype;
+    slot->status = status;
     slot->name_len = name_len;
     for (i = 0; i < name_len; i++) {
         slot->name[i] = ngx_stream_trojan_doh_lc(name[i]);
@@ -1330,7 +1371,12 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
 
     ce = ngx_stream_trojan_doh_cache_lookup(doh_conf, name, name_len, qtype);
     if (ce != NULL) {
-        handler(data, NGX_OK, ce->addrs, ce->naddrs);
+        if (ce->status == NGX_OK && ce->naddrs > 0) {
+            handler(data, NGX_OK, ce->addrs, ce->naddrs);
+        } else {
+            handler(data, ce->status, NULL, 0);
+        }
+
         return NGX_OK;
     }
 
@@ -1772,6 +1818,99 @@ ngx_stream_trojan_doh_body_ready(ngx_stream_trojan_doh_ctx_t *doh,
 }
 
 
+static ngx_uint_t
+ngx_stream_trojan_doh_negative_cacheable(ngx_stream_trojan_doh_ctx_t *doh,
+    ngx_int_t rc)
+{
+    u_char   *p, *end, *start;
+    size_t    i, label_len, name_pos;
+    uint16_t  dns_id, flags, qdcount, qtype, qclass, rcode;
+
+    if (rc != NGX_DECLINED && rc != NGX_ERROR) {
+        return 0;
+    }
+
+    if (doh->body_start == NULL || doh->body_len < 12) {
+        return 0;
+    }
+
+    start = doh->body_start;
+    end = start + doh->body_len;
+    p = start;
+
+    dns_id = ((uint16_t) p[0] << 8) | p[1];
+    if (dns_id != doh->dns_id) {
+        return 0;
+    }
+
+    flags = ((uint16_t) p[2] << 8) | p[3];
+    rcode = flags & 0x000F;
+
+    if ((flags & 0x8000) == 0 || (flags & 0x0200) != 0) {
+        return 0;
+    }
+
+    if ((rc == NGX_DECLINED && rcode != 0)
+        || (rc == NGX_ERROR && rcode != 3))
+    {
+        return 0;
+    }
+
+    qdcount = ((uint16_t) p[4] << 8) | p[5];
+    if (qdcount != 1) {
+        return 0;
+    }
+
+    p += 12;
+    name_pos = 0;
+
+    for (;;) {
+        if (p >= end) {
+            return 0;
+        }
+
+        label_len = *p++;
+        if (label_len == 0) {
+            break;
+        }
+
+        if ((label_len & 0xC0) != 0
+            || (size_t) (end - p) < label_len
+            || name_pos + label_len > doh->name_len)
+        {
+            return 0;
+        }
+
+        for (i = 0; i < label_len; i++) {
+            if (ngx_stream_trojan_doh_lc(p[i])
+                != ngx_stream_trojan_doh_lc(doh->name[name_pos + i]))
+            {
+                return 0;
+            }
+        }
+
+        name_pos += label_len;
+        p += label_len;
+
+        if (name_pos < doh->name_len) {
+            if (doh->name[name_pos] != '.') {
+                return 0;
+            }
+            name_pos++;
+        }
+    }
+
+    if (name_pos != doh->name_len || (size_t) (end - p) < 4) {
+        return 0;
+    }
+
+    qtype = ((uint16_t) p[0] << 8) | p[1];
+    qclass = ((uint16_t) p[2] << 8) | p[3];
+
+    return qtype == doh->qtype && qclass == 1;
+}
+
+
 static void
 ngx_stream_trojan_doh_parse_done(ngx_stream_trojan_doh_ctx_t *doh)
 {
@@ -1788,13 +1927,18 @@ ngx_stream_trojan_doh_parse_done(ngx_stream_trojan_doh_ctx_t *doh)
                           doh->dns_id);
         }
 
+        if (ngx_stream_trojan_doh_negative_cacheable(doh, rc)) {
+            ngx_stream_trojan_doh_cache_store(doh->conf, doh->name,
+                                              doh->name_len, doh->qtype, rc,
+                                              NULL, 0, 0);
+        }
         ngx_stream_trojan_doh_finish(doh, rc);
         return;
     }
 
     ngx_stream_trojan_doh_cache_store(doh->conf, doh->name, doh->name_len,
-                                      doh->qtype, doh->addrs, doh->naddrs,
-                                      doh->answer_ttl);
+                                      doh->qtype, NGX_OK, doh->addrs,
+                                      doh->naddrs, doh->answer_ttl);
     ngx_stream_trojan_doh_finish(doh, NGX_OK);
 }
 
