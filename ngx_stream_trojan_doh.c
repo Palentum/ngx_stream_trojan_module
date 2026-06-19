@@ -9,7 +9,11 @@
 #include <ngx_event_openssl.h>
 #endif
 
+#define NGX_STREAM_TROJAN_DOH_CACHE_FNV_OFFSET 2166136261u
+#define NGX_STREAM_TROJAN_DOH_CACHE_FNV_PRIME 16777619u
+
 static void ngx_stream_trojan_doh_cleanup(void *data);
+
 
 
 /* ─── DNS query builder (RFC 1035) ─────────────────────────────────────── */
@@ -599,6 +603,62 @@ ngx_stream_trojan_doh_lc(u_char ch)
     return (ch >= 'A' && ch <= 'Z') ? (u_char) (ch | 0x20) : ch;
 }
 
+static ngx_uint_t
+ngx_stream_trojan_doh_cache_hash_byte(ngx_uint_t hash, u_char ch)
+{
+    hash ^= ch;
+    return hash * NGX_STREAM_TROJAN_DOH_CACHE_FNV_PRIME;
+}
+
+static ngx_uint_t ngx_stream_trojan_doh_cache_seed;
+static ngx_uint_t ngx_stream_trojan_doh_cache_seeded;
+
+
+static ngx_uint_t
+ngx_stream_trojan_doh_cache_set(ngx_uint_t hash)
+{
+    if (!ngx_stream_trojan_doh_cache_seeded) {
+        ngx_stream_trojan_doh_cache_seed = ngx_random();
+        if (ngx_stream_trojan_doh_cache_seed == 0) {
+            ngx_stream_trojan_doh_cache_seed =
+                (ngx_uint_t) (uintptr_t) &ngx_stream_trojan_doh_cache_seed;
+        }
+        ngx_stream_trojan_doh_cache_seeded = 1;
+    }
+
+    hash ^= ngx_stream_trojan_doh_cache_seed;
+    hash ^= hash >> 16;
+    hash *= 0x7feb352d;
+    hash ^= hash >> 15;
+    hash *= 0x846ca68b;
+    hash ^= hash >> 16;
+
+    return hash % NGX_STREAM_TROJAN_DOH_CACHE_SETS;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_doh_name_hash(u_char *name, size_t name_len, uint16_t qtype)
+{
+    size_t      i;
+    ngx_uint_t  hash;
+
+    hash = NGX_STREAM_TROJAN_DOH_CACHE_FNV_OFFSET;
+    hash = ngx_stream_trojan_doh_cache_hash_byte(hash, (u_char) qtype);
+    hash = ngx_stream_trojan_doh_cache_hash_byte(hash,
+                                                 (u_char) (qtype >> 8));
+    hash = ngx_stream_trojan_doh_cache_hash_byte(hash, (u_char) name_len);
+    hash = ngx_stream_trojan_doh_cache_hash_byte(hash,
+                                                 (u_char) (name_len >> 8));
+
+    for (i = 0; i < name_len; i++) {
+        hash = ngx_stream_trojan_doh_cache_hash_byte(
+            hash, ngx_stream_trojan_doh_lc(name[i]));
+    }
+
+    return hash;
+}
+
 
 static ngx_uint_t
 ngx_stream_trojan_doh_name_eq(ngx_stream_trojan_doh_cache_entry_t *e,
@@ -624,7 +684,7 @@ static ngx_stream_trojan_doh_cache_entry_t *
 ngx_stream_trojan_doh_cache_lookup(ngx_stream_trojan_doh_conf_t *conf,
     u_char *name, size_t name_len, uint16_t qtype)
 {
-    ngx_uint_t                             i;
+    ngx_uint_t                             i, start, hash;
     ngx_msec_t                            now;
     ngx_stream_trojan_doh_cache_entry_t  *e;
 
@@ -632,24 +692,28 @@ ngx_stream_trojan_doh_cache_lookup(ngx_stream_trojan_doh_conf_t *conf,
         return NULL;
     }
 
+    hash = ngx_stream_trojan_doh_name_hash(name, name_len, qtype);
+    start = ngx_stream_trojan_doh_cache_set(hash)
+            * NGX_STREAM_TROJAN_DOH_CACHE_WAYS;
     now = ngx_current_msec;
     e = conf->cache;
 
-    for (i = 0; i < NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES; i++) {
-        if (!e[i].valid) {
+    for (i = 0; i < NGX_STREAM_TROJAN_DOH_CACHE_WAYS; i++) {
+        if (!e[start + i].valid) {
             continue;
         }
 
-        if ((ngx_msec_int_t) (e[i].expire - now) <= 0) {
-            e[i].valid = 0;
+        if ((ngx_msec_int_t) (e[start + i].expire - now) <= 0) {
+            e[start + i].valid = 0;
             continue;
         }
 
-        if (e[i].qtype == qtype
-            && ngx_stream_trojan_doh_name_eq(&e[i], name, name_len))
+        if (e[start + i].hash == hash
+            && e[start + i].qtype == qtype
+            && ngx_stream_trojan_doh_name_eq(&e[start + i], name, name_len))
         {
-            e[i].accessed = ++conf->cache_generation;
-            return &e[i];
+            e[start + i].accessed = ++conf->cache_generation;
+            return &e[start + i];
         }
     }
 
@@ -662,8 +726,8 @@ ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
     u_char *name, size_t name_len, uint16_t qtype, ngx_int_t status,
     ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, uint32_t ttl)
 {
-    ngx_uint_t                             i, oldest, oldest_negative;
-    ngx_uint_t                             has_negative;
+    ngx_uint_t                             i, start, oldest, oldest_negative;
+    ngx_uint_t                             has_negative, hash;
     ngx_msec_t                            now, ttl_ms;
     ngx_stream_trojan_doh_cache_entry_t  *e, *slot;
 
@@ -694,46 +758,50 @@ ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
 
     ttl_ms = (ngx_msec_t) ttl * 1000;
     now = ngx_current_msec;
+    hash = ngx_stream_trojan_doh_name_hash(name, name_len, qtype);
+    start = ngx_stream_trojan_doh_cache_set(hash)
+            * NGX_STREAM_TROJAN_DOH_CACHE_WAYS;
     e = conf->cache;
     slot = NULL;
-    oldest = 0;
-    oldest_negative = 0;
+    oldest = start;
+    oldest_negative = start;
     has_negative = 0;
 
-    for (i = 0; i < NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES; i++) {
-        if (e[i].valid
-            && e[i].qtype == qtype
-            && ngx_stream_trojan_doh_name_eq(&e[i], name, name_len))
+    for (i = 0; i < NGX_STREAM_TROJAN_DOH_CACHE_WAYS; i++) {
+        if (e[start + i].valid
+            && e[start + i].hash == hash
+            && e[start + i].qtype == qtype
+            && ngx_stream_trojan_doh_name_eq(&e[start + i], name, name_len))
         {
-            if ((ngx_msec_int_t) (e[i].expire - now) <= 0) {
-                slot = &e[i];
+            if ((ngx_msec_int_t) (e[start + i].expire - now) <= 0) {
+                slot = &e[start + i];
                 break;
             }
 
-            if (status != NGX_OK && e[i].status == NGX_OK) {
+            if (status != NGX_OK && e[start + i].status == NGX_OK) {
                 return;
             }
 
-            slot = &e[i];
+            slot = &e[start + i];
             break;
         }
 
-        if (!e[i].valid
-            || (ngx_msec_int_t) (e[i].expire - now) <= 0)
+        if (!e[start + i].valid
+            || (ngx_msec_int_t) (e[start + i].expire - now) <= 0)
         {
-            slot = &e[i];
+            slot = &e[start + i];
             break;
         }
 
-        if (e[i].accessed < e[oldest].accessed) {
-            oldest = i;
+        if (e[start + i].accessed < e[oldest].accessed) {
+            oldest = start + i;
         }
 
-        if (e[i].status != NGX_OK) {
+        if (e[start + i].status != NGX_OK) {
             if (!has_negative
-                || e[i].accessed < e[oldest_negative].accessed)
+                || e[start + i].accessed < e[oldest_negative].accessed)
             {
-                oldest_negative = i;
+                oldest_negative = start + i;
                 has_negative = 1;
             }
         }
@@ -748,6 +816,7 @@ ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
     }
 
     slot->valid = 0;
+    slot->hash = hash;
     slot->qtype = qtype;
     slot->status = status;
     slot->name_len = name_len;

@@ -13,7 +13,11 @@
 #define NGX_STREAM_TROJAN_DOH_MAX_QUERY_SIZE     512
 #define NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE  4096
 #define NGX_STREAM_TROJAN_DOH_DEFAULT_TIMEOUT    10000
-#define NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES     64
+#define NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES     1024
+#define NGX_STREAM_TROJAN_DOH_CACHE_WAYS        4
+#define NGX_STREAM_TROJAN_DOH_CACHE_SETS \
+    (NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES \
+     / NGX_STREAM_TROJAN_DOH_CACHE_WAYS)
 #define NGX_STREAM_TROJAN_DOH_CACHE_ADDRS       8
 #define NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL     600
 #define NGX_STREAM_TROJAN_DOH_CACHE_NEGATIVE_TTL 30
@@ -24,6 +28,7 @@
 typedef struct {
     ngx_uint_t           valid;
     ngx_int_t            status;
+    ngx_uint_t           hash;
     uint16_t             qtype;
     size_t               name_len;
     u_char               name[255];

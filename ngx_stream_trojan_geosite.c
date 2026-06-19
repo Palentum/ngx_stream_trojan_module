@@ -3,7 +3,13 @@
 
 #define NGX_STREAM_TROJAN_GEOSITE_MAX_FILE_SIZE   (64 * 1024 * 1024)
 #define NGX_STREAM_TROJAN_GEOSITE_MAX_VALUE_LEN   4096
-#define NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES 64
+#define NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES 1024
+#define NGX_STREAM_TROJAN_GEOSITE_CACHE_WAYS 4
+#define NGX_STREAM_TROJAN_GEOSITE_CACHE_SETS \
+    (NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES \
+     / NGX_STREAM_TROJAN_GEOSITE_CACHE_WAYS)
+#define NGX_STREAM_TROJAN_GEOSITE_CACHE_FNV_OFFSET 2166136261u
+#define NGX_STREAM_TROJAN_GEOSITE_CACHE_FNV_PRIME 16777619u
 
 
 
@@ -55,6 +61,7 @@ typedef struct {
 typedef struct {
     ngx_uint_t   valid;
     ngx_uint_t   accessed;
+    ngx_uint_t   hash;
     size_t       host_len;
     u_char       host[256];
     ngx_uint_t   result;
@@ -131,27 +138,105 @@ ngx_stream_trojan_geosite_lc(u_char ch)
     return ch;
 }
 
+static ngx_uint_t
+ngx_stream_trojan_geosite_cache_hash_byte(ngx_uint_t hash, u_char ch)
+{
+    hash ^= ch;
+    return hash * NGX_STREAM_TROJAN_GEOSITE_CACHE_FNV_PRIME;
+}
+
+static ngx_uint_t ngx_stream_trojan_geosite_cache_seed;
+static ngx_uint_t ngx_stream_trojan_geosite_cache_seeded;
+
+
+static ngx_uint_t
+ngx_stream_trojan_geosite_cache_set(ngx_uint_t hash)
+{
+    if (!ngx_stream_trojan_geosite_cache_seeded) {
+        ngx_stream_trojan_geosite_cache_seed = ngx_random();
+        if (ngx_stream_trojan_geosite_cache_seed == 0) {
+            ngx_stream_trojan_geosite_cache_seed =
+                (ngx_uint_t) (uintptr_t)
+                &ngx_stream_trojan_geosite_cache_seed;
+        }
+        ngx_stream_trojan_geosite_cache_seeded = 1;
+    }
+
+    hash ^= ngx_stream_trojan_geosite_cache_seed;
+    hash ^= hash >> 16;
+    hash *= 0x7feb352d;
+    hash ^= hash >> 15;
+    hash *= 0x846ca68b;
+    hash ^= hash >> 16;
+
+    return hash % NGX_STREAM_TROJAN_GEOSITE_CACHE_SETS;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_geosite_host_hash(const u_char *host, size_t host_len)
+{
+    size_t      i;
+    ngx_uint_t  hash;
+
+    hash = NGX_STREAM_TROJAN_GEOSITE_CACHE_FNV_OFFSET;
+    hash = ngx_stream_trojan_geosite_cache_hash_byte(hash, (u_char) host_len);
+    hash = ngx_stream_trojan_geosite_cache_hash_byte(
+        hash, (u_char) (host_len >> 8));
+
+    for (i = 0; i < host_len; i++) {
+        hash = ngx_stream_trojan_geosite_cache_hash_byte(
+            hash, ngx_stream_trojan_geosite_lc(host[i]));
+    }
+
+    return hash;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_geosite_host_eq(u_char *cached, const u_char *host,
+    size_t host_len)
+{
+    size_t  i;
+
+    for (i = 0; i < host_len; i++) {
+        if (cached[i] != ngx_stream_trojan_geosite_lc(host[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 static ngx_int_t
 ngx_stream_trojan_geosite_cache_lookup(
     ngx_stream_trojan_geosite_entry_t *entry, const u_char *host,
     size_t host_len, ngx_uint_t *result)
 {
-    ngx_uint_t                                i;
+    ngx_uint_t                                i, start, hash;
     ngx_stream_trojan_geosite_cache_entry_t *e;
 
     if (entry->cache == NULL || host_len > 256) {
         return 0;
     }
 
+    hash = ngx_stream_trojan_geosite_host_hash(host, host_len);
+    start = ngx_stream_trojan_geosite_cache_set(hash)
+            * NGX_STREAM_TROJAN_GEOSITE_CACHE_WAYS;
     e = entry->cache;
-    for (i = 0; i < NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES; i++) {
-        if (!e[i].valid || e[i].host_len != host_len) {
+
+    for (i = 0; i < NGX_STREAM_TROJAN_GEOSITE_CACHE_WAYS; i++) {
+        if (!e[start + i].valid || e[start + i].hash != hash
+            || e[start + i].host_len != host_len)
+        {
             continue;
         }
 
-        if (ngx_strncasecmp(e[i].host, (u_char *) host, host_len) == 0) {
-            e[i].accessed = ++entry->cache_generation;
-            *result = e[i].result;
+        if (ngx_stream_trojan_geosite_host_eq(e[start + i].host, host,
+                                                 host_len))
+        {
+            e[start + i].accessed = ++entry->cache_generation;
+            *result = e[start + i].result;
             return 1;
         }
     }
@@ -165,32 +250,37 @@ ngx_stream_trojan_geosite_cache_store(
     ngx_stream_trojan_geosite_entry_t *entry, const u_char *host,
     size_t host_len, ngx_uint_t result)
 {
-    ngx_uint_t                                i, oldest;
+    ngx_uint_t                                i, start, oldest, hash;
     ngx_stream_trojan_geosite_cache_entry_t *e, *slot;
 
     if (entry->cache == NULL || host_len > 256) {
         return;
     }
 
+    hash = ngx_stream_trojan_geosite_host_hash(host, host_len);
+    start = ngx_stream_trojan_geosite_cache_set(hash)
+            * NGX_STREAM_TROJAN_GEOSITE_CACHE_WAYS;
     e = entry->cache;
     slot = NULL;
-    oldest = 0;
+    oldest = start;
 
-    for (i = 0; i < NGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES; i++) {
-        if (e[i].valid && e[i].host_len == host_len
-            && ngx_strncasecmp(e[i].host, (u_char *) host, host_len) == 0)
+    for (i = 0; i < NGX_STREAM_TROJAN_GEOSITE_CACHE_WAYS; i++) {
+        if (e[start + i].valid && e[start + i].hash == hash
+            && e[start + i].host_len == host_len
+            && ngx_stream_trojan_geosite_host_eq(e[start + i].host, host,
+                                                 host_len))
         {
-            slot = &e[i];
+            slot = &e[start + i];
             break;
         }
 
-        if (!e[i].valid) {
-            slot = &e[i];
+        if (!e[start + i].valid) {
+            slot = &e[start + i];
             break;
         }
 
-        if (e[i].accessed < e[oldest].accessed) {
-            oldest = i;
+        if (e[start + i].accessed < e[oldest].accessed) {
+            oldest = start + i;
         }
     }
 
@@ -199,8 +289,11 @@ ngx_stream_trojan_geosite_cache_store(
     }
 
     slot->valid = 0;
+    slot->hash = hash;
     slot->host_len = host_len;
-    ngx_memcpy(slot->host, host, host_len);
+    for (i = 0; i < host_len; i++) {
+        slot->host[i] = ngx_stream_trojan_geosite_lc(host[i]);
+    }
     slot->result = result;
     slot->accessed = ++entry->cache_generation;
     slot->valid = 1;
