@@ -8399,11 +8399,12 @@ static ngx_int_t
 ngx_stream_trojan_mux_ensure_client_buffer(
     ngx_stream_trojan_mux_stream_t *stream, size_t len)
 {
-    size_t      size, capacity, buffered;
+    size_t      buffered, capacity, required, size;
     ngx_buf_t  *b, *nb;
 
-    b = stream->client_buffer;
-    buffered = b == NULL ? 0 : (size_t) (b->last - b->pos);
+    if (len > NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER) {
+        return NGX_ERROR;
+    }
 
     size = stream->ctx->conf->buffer_size;
     if (size > NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER) {
@@ -8412,28 +8413,47 @@ ngx_stream_trojan_mux_ensure_client_buffer(
     if (size < len) {
         size = len;
     }
-    if (size < buffered + len) {
-        size = buffered + len;
-    }
-    if (size > NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER) {
-        size = NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER;
+
+    b = stream->client_buffer;
+    if (b == NULL) {
+        nb = ngx_stream_trojan_create_temp_buf(stream->pool, size);
+        if (nb == NULL) {
+            return NGX_ERROR;
+        }
+
+        stream->client_buffer = nb;
+        return NGX_OK;
     }
 
-    if (b != NULL) {
-        capacity = b->end - b->start;
-        if (capacity >= size) {
+    buffered = b->last - b->pos;
+    capacity = b->end - b->start;
+    required = size;
+
+    if (buffered) {
+        if (buffered > len
+            || buffered > NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER - len)
+        {
             return NGX_OK;
         }
 
-        if (size < capacity * 2) {
-            size = capacity * 2;
-            if (size > NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER) {
-                size = NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER;
-            }
+        required = buffered + len;
+        if (required < size) {
+            required = size;
         }
     }
 
-    nb = ngx_stream_trojan_create_temp_buf(stream->pool, size);
+    if (capacity >= required) {
+        return NGX_OK;
+    }
+
+    if (required < capacity * 2) {
+        required = capacity * 2;
+        if (required > NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER) {
+            required = NGX_STREAM_TROJAN_MUX_MAX_STREAM_BUFFER;
+        }
+    }
+
+    nb = ngx_stream_trojan_create_temp_buf(stream->pool, required);
     if (nb == NULL) {
         return NGX_ERROR;
     }
