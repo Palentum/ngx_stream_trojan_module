@@ -93,7 +93,7 @@ ngx_int_t ngx_stream_trojan_doh_parse_url(ngx_str_t *url,
  * Callback type for DoH resolution completion.
  */
 typedef void (*ngx_stream_trojan_doh_handler_pt)(void *ctx, ngx_int_t status,
-    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, ngx_msec_t valid);
 
 typedef struct ngx_stream_trojan_doh_ctx_s ngx_stream_trojan_doh_ctx_t;
 

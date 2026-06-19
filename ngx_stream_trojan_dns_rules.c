@@ -3,7 +3,13 @@
 
 
 #define NGX_STREAM_TROJAN_DNS_RULES_MAX_FILE_SIZE  (1024 * 1024)
-#define NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES 64
+#define NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES 1024
+#define NGX_STREAM_TROJAN_DNS_RULES_CACHE_WAYS 4
+#define NGX_STREAM_TROJAN_DNS_RULES_CACHE_SETS \
+    (NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES \
+     / NGX_STREAM_TROJAN_DNS_RULES_CACHE_WAYS)
+#define NGX_STREAM_TROJAN_DNS_RULES_CACHE_FNV_OFFSET 2166136261u
+#define NGX_STREAM_TROJAN_DNS_RULES_CACHE_FNV_PRIME 16777619u
 
 
 
@@ -29,11 +35,11 @@ typedef struct {
 typedef struct {
     ngx_uint_t       valid;
     ngx_uint_t       accessed;
+    ngx_uint_t       hash;
     size_t           host_len;
     u_char           host[256];
     ngx_stream_trojan_dns_rule_group_t *group;
 } ngx_stream_trojan_dns_rules_cache_entry_t;
-
 
 struct ngx_stream_trojan_dns_rules_conf_s {
     ngx_array_t     *groups;
@@ -84,6 +90,62 @@ ngx_stream_trojan_dns_rules_lc(u_char ch)
     return ch;
 }
 
+static ngx_uint_t
+ngx_stream_trojan_dns_rules_hash_byte(ngx_uint_t hash, u_char ch)
+{
+    hash ^= ch;
+    return hash * NGX_STREAM_TROJAN_DNS_RULES_CACHE_FNV_PRIME;
+}
+
+static ngx_uint_t ngx_stream_trojan_dns_rules_cache_seed;
+static ngx_uint_t ngx_stream_trojan_dns_rules_cache_seeded;
+
+
+static ngx_uint_t
+ngx_stream_trojan_dns_rules_cache_set(ngx_uint_t hash)
+{
+    if (!ngx_stream_trojan_dns_rules_cache_seeded) {
+        ngx_stream_trojan_dns_rules_cache_seed = ngx_random();
+        if (ngx_stream_trojan_dns_rules_cache_seed == 0) {
+            ngx_stream_trojan_dns_rules_cache_seed =
+                (ngx_uint_t) (uintptr_t)
+                &ngx_stream_trojan_dns_rules_cache_seed;
+        }
+        ngx_stream_trojan_dns_rules_cache_seeded = 1;
+    }
+
+    hash ^= ngx_stream_trojan_dns_rules_cache_seed;
+    hash ^= hash >> 16;
+    hash *= 0x7feb352d;
+    hash ^= hash >> 15;
+    hash *= 0x846ca68b;
+    hash ^= hash >> 16;
+
+    return hash % NGX_STREAM_TROJAN_DNS_RULES_CACHE_SETS;
+}
+
+
+
+static ngx_uint_t
+ngx_stream_trojan_dns_rules_host_hash(const u_char *host, size_t host_len)
+{
+    size_t      i;
+    ngx_uint_t  hash;
+
+    hash = NGX_STREAM_TROJAN_DNS_RULES_CACHE_FNV_OFFSET;
+    hash = ngx_stream_trojan_dns_rules_hash_byte(hash, (u_char) host_len);
+    hash = ngx_stream_trojan_dns_rules_hash_byte(hash,
+                                                 (u_char) (host_len >> 8));
+
+    for (i = 0; i < host_len; i++) {
+        hash = ngx_stream_trojan_dns_rules_hash_byte(
+            hash, ngx_stream_trojan_dns_rules_lc(host[i]));
+    }
+
+    return hash;
+}
+
+
 
 
 static ngx_int_t
@@ -107,7 +169,7 @@ ngx_stream_trojan_dns_rules_cache_lookup(
     ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *host,
     size_t host_len, ngx_uint_t *found)
 {
-    ngx_uint_t                                  i;
+    ngx_uint_t                                  i, start, hash;
     ngx_stream_trojan_dns_rules_cache_entry_t *e;
 
     *found = 0;
@@ -116,16 +178,24 @@ ngx_stream_trojan_dns_rules_cache_lookup(
         return NULL;
     }
 
+    hash = ngx_stream_trojan_dns_rules_host_hash(host, host_len);
+    start = ngx_stream_trojan_dns_rules_cache_set(hash)
+            * NGX_STREAM_TROJAN_DNS_RULES_CACHE_WAYS;
     e = rules->cache;
-    for (i = 0; i < NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES; i++) {
-        if (!e[i].valid || e[i].host_len != host_len) {
+
+    for (i = 0; i < NGX_STREAM_TROJAN_DNS_RULES_CACHE_WAYS; i++) {
+        if (!e[start + i].valid || e[start + i].hash != hash
+            || e[start + i].host_len != host_len)
+        {
             continue;
         }
 
-        if (ngx_stream_trojan_dns_rules_host_eq(e[i].host, host, host_len)) {
-            e[i].accessed = ++rules->cache_generation;
+        if (ngx_stream_trojan_dns_rules_host_eq(e[start + i].host, host,
+                                                host_len))
+        {
+            e[start + i].accessed = ++rules->cache_generation;
             *found = 1;
-            return e[i].group;
+            return e[start + i].group;
         }
     }
 
@@ -138,32 +208,37 @@ ngx_stream_trojan_dns_rules_cache_store(
     ngx_stream_trojan_dns_rules_conf_t *rules, const u_char *host,
     size_t host_len, ngx_stream_trojan_dns_rule_group_t *group)
 {
-    ngx_uint_t                                  i, oldest;
+    ngx_uint_t                                  i, start, oldest, hash;
     ngx_stream_trojan_dns_rules_cache_entry_t *e, *slot;
 
     if (host_len > 256) {
         return;
     }
 
+    hash = ngx_stream_trojan_dns_rules_host_hash(host, host_len);
+    start = ngx_stream_trojan_dns_rules_cache_set(hash)
+            * NGX_STREAM_TROJAN_DNS_RULES_CACHE_WAYS;
     e = rules->cache;
     slot = NULL;
-    oldest = 0;
+    oldest = start;
 
-    for (i = 0; i < NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES; i++) {
-        if (e[i].valid && e[i].host_len == host_len
-            && ngx_stream_trojan_dns_rules_host_eq(e[i].host, host, host_len))
+    for (i = 0; i < NGX_STREAM_TROJAN_DNS_RULES_CACHE_WAYS; i++) {
+        if (e[start + i].valid && e[start + i].hash == hash
+            && e[start + i].host_len == host_len
+            && ngx_stream_trojan_dns_rules_host_eq(e[start + i].host, host,
+                                                   host_len))
         {
-            slot = &e[i];
+            slot = &e[start + i];
             break;
         }
 
-        if (!e[i].valid) {
-            slot = &e[i];
+        if (!e[start + i].valid) {
+            slot = &e[start + i];
             break;
         }
 
-        if (e[i].accessed < e[oldest].accessed) {
-            oldest = i;
+        if (e[start + i].accessed < e[oldest].accessed) {
+            oldest = start + i;
         }
     }
 
@@ -172,6 +247,7 @@ ngx_stream_trojan_dns_rules_cache_store(
     }
 
     slot->valid = 0;
+    slot->hash = hash;
     slot->host_len = host_len;
     for (i = 0; i < host_len; i++) {
         slot->host[i] = ngx_stream_trojan_dns_rules_lc(host[i]);
@@ -180,6 +256,7 @@ ngx_stream_trojan_dns_rules_cache_store(
     slot->accessed = ++rules->cache_generation;
     slot->valid = 1;
 }
+
 static ngx_uint_t
 ngx_stream_trojan_dns_rules_space(u_char ch)
 {

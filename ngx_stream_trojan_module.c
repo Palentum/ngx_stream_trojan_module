@@ -39,7 +39,19 @@
 #define NGX_STREAM_TROJAN_MUX_STREAM_TABLE_SIZE \
     (NGX_STREAM_TROJAN_MUX_MAX_STREAMS * 2)
 #define NGX_STREAM_TROJAN_MUX_STREAM_POOL_SIZE 2048
-#define NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES 64
+#define NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES 1024
+#define NGX_STREAM_TROJAN_ROUTE_CACHE_WAYS 4
+#define NGX_STREAM_TROJAN_ROUTE_CACHE_SETS \
+    (NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES \
+     / NGX_STREAM_TROJAN_ROUTE_CACHE_WAYS)
+#define NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_ENTRIES 1024
+#define NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_WAYS 4
+#define NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_SETS \
+    (NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_ENTRIES \
+     / NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_WAYS)
+#define NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_MAX_TTL 30000
+#define NGX_STREAM_TROJAN_CACHE_FNV_OFFSET 2166136261u
+#define NGX_STREAM_TROJAN_CACHE_FNV_PRIME 16777619u
 #define NGX_STREAM_TROJAN_KEY_BUCKETS 256
 
 
@@ -107,9 +119,25 @@ typedef struct {
 typedef struct {
     ngx_uint_t                  valid;
     ngx_uint_t                  accessed;
+    ngx_uint_t                  hash;
     ngx_stream_trojan_addr_t    target;
     ngx_stream_trojan_route_t  *route;
 } ngx_stream_trojan_route_cache_entry_t;
+
+
+typedef struct {
+    ngx_uint_t                  valid;
+    ngx_uint_t                  accessed;
+    ngx_uint_t                  hash;
+    ngx_msec_t                  expire;
+    size_t                      host_len;
+    u_char                      host[255];
+    uint16_t                    port;
+    ngx_uint_t                  ip_prefer;
+    uintptr_t                   resolver_id;
+    struct sockaddr_storage     sockaddr;
+    socklen_t                   socklen;
+} ngx_stream_trojan_udp_domain_cache_entry_t;
 
 
 
@@ -200,6 +228,8 @@ struct ngx_stream_trojan_srv_conf_s {
     ngx_array_t *routes;
     ngx_stream_trojan_route_cache_entry_t *route_cache;
     ngx_uint_t   route_cache_generation;
+    ngx_stream_trojan_udp_domain_cache_entry_t *udp_domain_cache;
+    ngx_uint_t   udp_domain_cache_generation;
     ngx_stream_trojan_doh_conf_t *doh_conf;
     ngx_stream_trojan_dns_rules_conf_t *dns_rules;
     ngx_stream_trojan_geosite_t *geosite;
@@ -245,6 +275,8 @@ typedef struct {
     ngx_stream_trojan_ctx_t        *ctx;
     ngx_stream_trojan_resolve_e     type;
     ngx_uint_t                      ip_prefer;
+    uintptr_t                       udp_cache_key;
+    ngx_msec_t                      udp_cache_expire;
     ngx_stream_trojan_doh_conf_t   *doh_conf;
     u_char                         *name;
     size_t                          name_len;
@@ -560,7 +592,7 @@ static ngx_int_t ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_addr_t *addr, ngx_stream_trojan_resolve_e type,
     const u_char *payload, uint16_t payload_len, size_t wire_len,
     ngx_resolver_t *resolver, ngx_msec_t resolver_timeout,
-    ngx_uint_t ip_prefer);
+    ngx_uint_t ip_prefer, uintptr_t udp_cache_key);
 static ngx_int_t ngx_stream_trojan_socks5_connect_next(
     ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx);
@@ -570,7 +602,8 @@ static void ngx_stream_trojan_resolve_complete(
 static ngx_int_t ngx_stream_trojan_start_doh_resolver(
     ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_resolve_data_t *data);
 static void ngx_stream_trojan_doh_resolve_handler(void *cb_data,
-    ngx_int_t status, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
+    ngx_int_t status, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs,
+    ngx_msec_t valid);
 static ngx_int_t ngx_stream_trojan_connect_next(
     ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_connect(ngx_stream_trojan_ctx_t *ctx,
@@ -747,7 +780,8 @@ static ngx_int_t ngx_stream_trojan_mux_start_doh_resolver(
     ngx_stream_trojan_mux_stream_t *stream,
     ngx_stream_trojan_mux_resolve_data_t *data);
 static void ngx_stream_trojan_mux_doh_resolve_handler(void *cb_data,
-    ngx_int_t status, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
+    ngx_int_t status, ngx_resolver_addr_t *addrs, ngx_uint_t naddrs,
+    ngx_msec_t valid);
 static void ngx_stream_trojan_mux_start_socks5_tcp(
     ngx_stream_trojan_mux_stream_t *stream);
 static void ngx_stream_trojan_mux_socks5_connect(
@@ -776,6 +810,8 @@ static ngx_int_t ngx_stream_trojan_resolve_addr(ngx_pool_t *pool,
 static ngx_int_t ngx_stream_trojan_resolve_addr_prefer(ngx_pool_t *pool,
     ngx_log_t *log, ngx_stream_trojan_addr_t *addr, ngx_uint_t ip_prefer,
     ngx_addr_t *out);
+static ngx_resolver_t *ngx_stream_trojan_session_resolver(
+    ngx_stream_session_t *s);
 static ngx_uint_t ngx_stream_trojan_resolver_configured(
     ngx_stream_session_t *s);
 static ngx_resolver_addr_t *ngx_stream_trojan_resolver_pick_addr(
@@ -818,9 +854,8 @@ static ngx_int_t ngx_stream_trojan_socks5_udp_bind_addr(
 static ngx_int_t ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_udp_frame_t *frame);
 static ngx_int_t ngx_stream_trojan_send_udp_resolved(
-    ngx_stream_trojan_ctx_t *ctx, ngx_resolver_addr_t *addrs,
-    ngx_uint_t naddrs, uint16_t port, const u_char *payload,
-    uint16_t payload_len, ngx_uint_t ip_prefer);
+    ngx_stream_trojan_ctx_t *ctx, ngx_stream_trojan_resolve_data_t *data,
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs);
 static ngx_int_t ngx_stream_trojan_send_udp_sockaddr(
     ngx_stream_trojan_ctx_t *ctx, struct sockaddr *sa, socklen_t socklen,
     const u_char *payload, uint16_t payload_len);
@@ -4009,7 +4044,7 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
         if (ngx_stream_trojan_start_resolver(ctx, &ctx->target,
                                              ngx_stream_trojan_resolve_tcp,
                                              NULL, 0, 0, dns_rule->resolver,
-                                             0, dns_rule->ip_prefer)
+                                             0, dns_rule->ip_prefer, 0)
             != NGX_OK)
         {
             ngx_stream_trojan_inbound_connect_failure(ctx,
@@ -4055,7 +4090,8 @@ ngx_stream_trojan_start_tcp(ngx_stream_trojan_ctx_t *ctx)
         if (ngx_stream_trojan_start_resolver(ctx, &ctx->target,
                                              ngx_stream_trojan_resolve_tcp,
                                              NULL, 0, 0, NULL, 0,
-                                             ngx_stream_trojan_current_ip_prefer(ctx))
+                                             ngx_stream_trojan_current_ip_prefer(ctx),
+                                             0)
             != NGX_OK)
         {
             ngx_stream_trojan_inbound_connect_failure(ctx,
@@ -4113,7 +4149,7 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_addr_t *addr, ngx_stream_trojan_resolve_e type,
     const u_char *payload, uint16_t payload_len, size_t wire_len,
     ngx_resolver_t *resolver, ngx_msec_t resolver_timeout,
-    ngx_uint_t ip_prefer)
+    ngx_uint_t ip_prefer, uintptr_t udp_cache_key)
 {
     ngx_str_t                         name;
     ngx_pool_t                       *pool;
@@ -4140,6 +4176,8 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     }
     ngx_memcpy(name.data, addr->host, addr->host_len);
     name.len = addr->host_len;
+    data->name = name.data;
+    data->name_len = name.len;
 
     if (payload_len) {
         data->payload = ngx_pnalloc(pool, payload_len);
@@ -4152,6 +4190,7 @@ ngx_stream_trojan_start_resolver(ngx_stream_trojan_ctx_t *ctx,
     data->ctx = ctx;
     data->type = type;
     data->ip_prefer = ip_prefer;
+    data->udp_cache_key = udp_cache_key;
     data->port = addr->port;
     data->payload_len = payload_len;
 
@@ -4198,6 +4237,8 @@ ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx)
 {
     ngx_stream_trojan_ctx_t           *ctx;
     ngx_stream_trojan_resolve_data_t  *data;
+    ngx_msec_t                         ttl;
+    time_t                             now;
 
     data = rctx->data;
     ctx = data->ctx;
@@ -4217,6 +4258,17 @@ ngx_stream_trojan_resolve_handler(ngx_resolver_ctx_t *rctx)
         ngx_resolve_name_done(rctx);
         ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
+    }
+
+    if (data->type == ngx_stream_trojan_resolve_udp && rctx->valid > 0) {
+        now = ngx_time();
+        if (rctx->valid > now) {
+            ttl = (ngx_msec_t) (rctx->valid - now) * 1000;
+            if (ttl > NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_MAX_TTL) {
+                ttl = NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_MAX_TTL;
+            }
+            data->udp_cache_expire = ngx_current_msec + ttl;
+        }
     }
 
     ngx_stream_trojan_resolve_complete(ctx, data, rctx->addrs, rctx->naddrs);
@@ -4251,10 +4303,7 @@ ngx_stream_trojan_resolve_complete(ngx_stream_trojan_ctx_t *ctx,
         return;
     }
 
-    if (ngx_stream_trojan_send_udp_resolved(ctx, addrs, naddrs,
-                                            data->port, data->payload,
-                                            data->payload_len,
-                                            data->ip_prefer)
+    if (ngx_stream_trojan_send_udp_resolved(ctx, data, addrs, naddrs)
         != NGX_OK)
     {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
@@ -4273,7 +4322,7 @@ ngx_stream_trojan_resolve_complete(ngx_stream_trojan_ctx_t *ctx,
 
 static void
 ngx_stream_trojan_doh_resolve_handler(void *cb_data, ngx_int_t status,
-    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs)
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, ngx_msec_t valid)
 {
     ngx_stream_trojan_resolve_data_t  *data;
     ngx_stream_trojan_ctx_t           *ctx;
@@ -4301,6 +4350,8 @@ ngx_stream_trojan_doh_resolve_handler(void *cb_data, ngx_int_t status,
         ngx_stream_trojan_inbound_connect_failure(ctx, NGX_STREAM_BAD_GATEWAY);
         return;
     }
+
+    data->udp_cache_expire = valid;
 
     ngx_stream_trojan_resolve_complete(ctx, data, addrs, naddrs);
 }
@@ -5089,6 +5140,72 @@ ngx_stream_trojan_route_target_equal(ngx_stream_trojan_addr_t *a,
 }
 
 
+static ngx_uint_t
+ngx_stream_trojan_cache_hash_byte(ngx_uint_t hash, u_char ch)
+{
+    hash ^= ch;
+    return hash * NGX_STREAM_TROJAN_CACHE_FNV_PRIME;
+}
+
+static ngx_uint_t ngx_stream_trojan_cache_seed;
+static ngx_uint_t ngx_stream_trojan_cache_seeded;
+
+
+static ngx_uint_t
+ngx_stream_trojan_cache_set(ngx_uint_t hash, ngx_uint_t sets)
+{
+    if (!ngx_stream_trojan_cache_seeded) {
+        ngx_stream_trojan_cache_seed = ngx_random();
+        if (ngx_stream_trojan_cache_seed == 0) {
+            ngx_stream_trojan_cache_seed =
+                (ngx_uint_t) (uintptr_t) &ngx_stream_trojan_cache_seed;
+        }
+        ngx_stream_trojan_cache_seeded = 1;
+    }
+
+    hash ^= ngx_stream_trojan_cache_seed;
+    hash ^= hash >> 16;
+    hash *= 0x7feb352d;
+    hash ^= hash >> 15;
+    hash *= 0x846ca68b;
+    hash ^= hash >> 16;
+
+    return hash % sets;
+}
+
+
+
+static ngx_uint_t
+ngx_stream_trojan_route_target_hash(ngx_stream_trojan_addr_t *target)
+{
+    size_t      i;
+    ngx_uint_t  hash;
+    u_char      ch;
+
+    hash = NGX_STREAM_TROJAN_CACHE_FNV_OFFSET;
+    hash = ngx_stream_trojan_cache_hash_byte(hash, target->type);
+    hash = ngx_stream_trojan_cache_hash_byte(hash,
+                                             (u_char) target->host_len);
+    hash = ngx_stream_trojan_cache_hash_byte(hash,
+                                             (u_char) (target->host_len >> 8));
+    hash = ngx_stream_trojan_cache_hash_byte(hash,
+                                             (u_char) (target->port >> 8));
+    hash = ngx_stream_trojan_cache_hash_byte(hash,
+                                             (u_char) target->port);
+
+    for (i = 0; i < target->host_len; i++) {
+        ch = target->host[i];
+        if (target->type == NGX_STREAM_TROJAN_ADDR_DOMAIN) {
+            ch = ngx_stream_trojan_route_lc(ch);
+        }
+
+        hash = ngx_stream_trojan_cache_hash_byte(hash, ch);
+    }
+
+    return hash;
+}
+
+
 static void
 ngx_stream_trojan_route_cache_copy_target(ngx_stream_trojan_addr_t *dst,
     ngx_stream_trojan_addr_t *src)
@@ -5119,7 +5236,7 @@ static ngx_stream_trojan_route_t *
 ngx_stream_trojan_route_cache_lookup(ngx_stream_trojan_srv_conf_t *conf,
     ngx_stream_trojan_addr_t *target, ngx_uint_t *found)
 {
-    ngx_uint_t                             i;
+    ngx_uint_t                             i, start, hash;
     ngx_stream_trojan_route_cache_entry_t *e;
 
     *found = 0;
@@ -5128,16 +5245,23 @@ ngx_stream_trojan_route_cache_lookup(ngx_stream_trojan_srv_conf_t *conf,
         return NULL;
     }
 
+    hash = ngx_stream_trojan_route_target_hash(target);
+    start = ngx_stream_trojan_cache_set(
+                hash, NGX_STREAM_TROJAN_ROUTE_CACHE_SETS)
+            * NGX_STREAM_TROJAN_ROUTE_CACHE_WAYS;
     e = conf->route_cache;
-    for (i = 0; i < NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES; i++) {
-        if (!e[i].valid) {
+
+    for (i = 0; i < NGX_STREAM_TROJAN_ROUTE_CACHE_WAYS; i++) {
+        if (!e[start + i].valid || e[start + i].hash != hash) {
             continue;
         }
 
-        if (ngx_stream_trojan_route_target_equal(&e[i].target, target)) {
-            e[i].accessed = ++conf->route_cache_generation;
+        if (ngx_stream_trojan_route_target_equal(&e[start + i].target,
+                                                 target))
+        {
+            e[start + i].accessed = ++conf->route_cache_generation;
             *found = 1;
-            return e[i].route;
+            return e[start + i].route;
         }
     }
 
@@ -5149,32 +5273,38 @@ static void
 ngx_stream_trojan_route_cache_store(ngx_stream_trojan_srv_conf_t *conf,
     ngx_stream_trojan_addr_t *target, ngx_stream_trojan_route_t *route)
 {
-    ngx_uint_t                             i, oldest;
+    ngx_uint_t                             i, start, oldest, hash;
     ngx_stream_trojan_route_cache_entry_t *e, *slot;
 
     if (conf->route_cache == NULL) {
         return;
     }
 
+    hash = ngx_stream_trojan_route_target_hash(target);
+    start = ngx_stream_trojan_cache_set(
+                hash, NGX_STREAM_TROJAN_ROUTE_CACHE_SETS)
+            * NGX_STREAM_TROJAN_ROUTE_CACHE_WAYS;
     e = conf->route_cache;
     slot = NULL;
-    oldest = 0;
+    oldest = start;
 
-    for (i = 0; i < NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES; i++) {
-        if (e[i].valid
-            && ngx_stream_trojan_route_target_equal(&e[i].target, target))
+    for (i = 0; i < NGX_STREAM_TROJAN_ROUTE_CACHE_WAYS; i++) {
+        if (e[start + i].valid
+            && e[start + i].hash == hash
+            && ngx_stream_trojan_route_target_equal(&e[start + i].target,
+                                                    target))
         {
-            slot = &e[i];
+            slot = &e[start + i];
             break;
         }
 
-        if (!e[i].valid) {
-            slot = &e[i];
+        if (!e[start + i].valid) {
+            slot = &e[start + i];
             break;
         }
 
-        if (e[i].accessed < e[oldest].accessed) {
-            oldest = i;
+        if (e[start + i].accessed < e[oldest].accessed) {
+            oldest = start + i;
         }
     }
 
@@ -5183,9 +5313,209 @@ ngx_stream_trojan_route_cache_store(ngx_stream_trojan_srv_conf_t *conf,
     }
 
     slot->valid = 0;
+    slot->hash = hash;
     ngx_stream_trojan_route_cache_copy_target(&slot->target, target);
     slot->route = route;
     slot->accessed = ++conf->route_cache_generation;
+    slot->valid = 1;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_udp_domain_cache_hash(const u_char *host, size_t host_len,
+    uint16_t port, ngx_uint_t ip_prefer, uintptr_t resolver_id)
+{
+    size_t      i;
+    ngx_uint_t  hash;
+
+    hash = NGX_STREAM_TROJAN_CACHE_FNV_OFFSET;
+    hash = ngx_stream_trojan_cache_hash_byte(hash,
+                                             NGX_STREAM_TROJAN_ADDR_DOMAIN);
+    hash = ngx_stream_trojan_cache_hash_byte(hash, (u_char) host_len);
+    hash = ngx_stream_trojan_cache_hash_byte(hash, (u_char) (host_len >> 8));
+    hash = ngx_stream_trojan_cache_hash_byte(hash, (u_char) (port >> 8));
+    hash = ngx_stream_trojan_cache_hash_byte(hash, (u_char) port);
+    hash = ngx_stream_trojan_cache_hash_byte(hash, (u_char) ip_prefer);
+    hash = ngx_stream_trojan_cache_hash_byte(hash,
+                                             (u_char) (ip_prefer >> 8));
+    for (i = 0; i < sizeof(uintptr_t); i++) {
+        hash = ngx_stream_trojan_cache_hash_byte(
+            hash, (u_char) (resolver_id >> (i * 8)));
+    }
+
+    for (i = 0; i < host_len; i++) {
+        hash = ngx_stream_trojan_cache_hash_byte(
+            hash, ngx_stream_trojan_route_lc(host[i]));
+    }
+
+    return hash;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_udp_domain_cache_host_equal(u_char *cached,
+    const u_char *host, size_t host_len)
+{
+    size_t  i;
+
+    for (i = 0; i < host_len; i++) {
+        if (cached[i] != ngx_stream_trojan_route_lc(host[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_udp_domain_cache_lookup(
+    ngx_stream_trojan_srv_conf_t *conf, ngx_stream_trojan_addr_t *target,
+    ngx_uint_t ip_prefer, uintptr_t resolver_id,
+    struct sockaddr_storage *sockaddr, socklen_t *socklen)
+{
+    ngx_uint_t                                  i, start, hash;
+    ngx_msec_t                                 now;
+    ngx_stream_trojan_udp_domain_cache_entry_t *e;
+
+    if (conf->udp_domain_cache == NULL
+        || target->type != NGX_STREAM_TROJAN_ADDR_DOMAIN
+        || target->host_len == 0 || target->host_len > 255)
+    {
+        return NGX_DECLINED;
+    }
+
+    hash = ngx_stream_trojan_udp_domain_cache_hash(
+        target->host, target->host_len, target->port, ip_prefer, resolver_id);
+    start = ngx_stream_trojan_cache_set(
+                hash, NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_SETS)
+            * NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_WAYS;
+    now = ngx_current_msec;
+    e = conf->udp_domain_cache;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_WAYS; i++) {
+        if (!e[start + i].valid) {
+            continue;
+        }
+
+        if ((ngx_msec_int_t) (e[start + i].expire - now) <= 0) {
+            e[start + i].valid = 0;
+            continue;
+        }
+
+        if (e[start + i].hash == hash
+            && e[start + i].port == target->port
+            && e[start + i].ip_prefer == ip_prefer
+            && e[start + i].resolver_id == resolver_id
+            && e[start + i].host_len == target->host_len
+            && ngx_stream_trojan_udp_domain_cache_host_equal(
+                   e[start + i].host, target->host, target->host_len))
+        {
+            if (e[start + i].socklen == 0
+                || e[start + i].socklen
+                   > (socklen_t) sizeof(struct sockaddr_storage))
+            {
+                e[start + i].valid = 0;
+                return NGX_DECLINED;
+            }
+
+            ngx_memcpy(sockaddr, &e[start + i].sockaddr,
+                       e[start + i].socklen);
+            *socklen = e[start + i].socklen;
+            e[start + i].accessed = ++conf->udp_domain_cache_generation;
+            return NGX_OK;
+        }
+    }
+
+    return NGX_DECLINED;
+}
+
+
+static void
+ngx_stream_trojan_udp_domain_cache_store(
+    ngx_stream_trojan_srv_conf_t *conf, const u_char *host, size_t host_len,
+    uint16_t port, ngx_uint_t ip_prefer, uintptr_t resolver_id,
+    ngx_msec_t expire, struct sockaddr *sockaddr, socklen_t socklen)
+{
+    ngx_uint_t                                  i, start, oldest, hash;
+    ngx_msec_t                                 now;
+    ngx_stream_trojan_udp_domain_cache_entry_t *e, *slot;
+
+    if (conf->udp_domain_cache == NULL
+        || host == NULL || host_len == 0 || host_len > 255
+        || expire == 0 || sockaddr == NULL || socklen == 0
+        || socklen > (socklen_t) sizeof(struct sockaddr_storage))
+    {
+        return;
+    }
+
+    now = ngx_current_msec;
+    if ((ngx_msec_int_t) (expire - now) <= 0) {
+        return;
+    }
+
+    if ((ngx_msec_int_t) (expire - now)
+        > NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_MAX_TTL)
+    {
+        expire = now + NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_MAX_TTL;
+    }
+
+    hash = ngx_stream_trojan_udp_domain_cache_hash(host, host_len, port,
+                                                   ip_prefer, resolver_id);
+    start = ngx_stream_trojan_cache_set(
+                hash, NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_SETS)
+            * NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_WAYS;
+    e = conf->udp_domain_cache;
+    slot = NULL;
+    oldest = start;
+
+    for (i = 0; i < NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_WAYS; i++) {
+        if (e[start + i].valid
+            && (ngx_msec_int_t) (e[start + i].expire - now) <= 0)
+        {
+            e[start + i].valid = 0;
+        }
+
+        if (e[start + i].valid
+            && e[start + i].hash == hash
+            && e[start + i].port == port
+            && e[start + i].ip_prefer == ip_prefer
+            && e[start + i].resolver_id == resolver_id
+            && e[start + i].host_len == host_len
+            && ngx_stream_trojan_udp_domain_cache_host_equal(
+                   e[start + i].host, host, host_len))
+        {
+            slot = &e[start + i];
+            break;
+        }
+
+        if (!e[start + i].valid) {
+            slot = &e[start + i];
+            break;
+        }
+
+        if (e[start + i].accessed < e[oldest].accessed) {
+            oldest = start + i;
+        }
+    }
+
+    if (slot == NULL) {
+        slot = &e[oldest];
+    }
+
+    slot->valid = 0;
+    slot->hash = hash;
+    slot->host_len = host_len;
+    for (i = 0; i < host_len; i++) {
+        slot->host[i] = ngx_stream_trojan_route_lc(host[i]);
+    }
+    slot->port = port;
+    slot->ip_prefer = ip_prefer;
+    slot->resolver_id = resolver_id;
+    ngx_memcpy(&slot->sockaddr, sockaddr, socklen);
+    slot->socklen = socklen;
+    slot->expire = expire;
+    slot->accessed = ++conf->udp_domain_cache_generation;
     slot->valid = 1;
 }
 
@@ -8346,10 +8676,12 @@ ngx_stream_trojan_mux_start_doh_resolver(
 
 static void
 ngx_stream_trojan_mux_doh_resolve_handler(void *cb_data, ngx_int_t status,
-    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs)
+    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, ngx_msec_t valid)
 {
     ngx_stream_trojan_mux_stream_t       *stream;
     ngx_stream_trojan_mux_resolve_data_t *data;
+    (void) valid;
+
 
     data = cb_data;
     stream = data->stream;
@@ -9427,14 +9759,25 @@ ngx_stream_trojan_resolve_addr_prefer(ngx_pool_t *pool, ngx_log_t *log,
 }
 
 
-static ngx_uint_t
-ngx_stream_trojan_resolver_configured(ngx_stream_session_t *s)
+static ngx_resolver_t *
+ngx_stream_trojan_session_resolver(ngx_stream_session_t *s)
 {
     ngx_stream_core_srv_conf_t *cscf;
 
     cscf = ngx_stream_get_module_srv_conf(s, ngx_stream_core_module);
 
-    return cscf->resolver != NULL && cscf->resolver->connections.nelts != 0;
+    if (cscf->resolver == NULL || cscf->resolver->connections.nelts == 0) {
+        return NULL;
+    }
+
+    return cscf->resolver;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_resolver_configured(ngx_stream_session_t *s)
+{
+    return ngx_stream_trojan_session_resolver(s) != NULL;
 }
 
 
@@ -9877,13 +10220,16 @@ static ngx_int_t
 ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     ngx_stream_trojan_udp_frame_t *frame)
 {
-    struct sockaddr_in   sin;
+    struct sockaddr_in       sin;
 #if (NGX_HAVE_INET6)
-    struct sockaddr_in6  sin6;
+    struct sockaddr_in6      sin6;
 #endif
-    struct sockaddr     *sa;
-    socklen_t            socklen;
-    ngx_int_t           rc;
+    struct sockaddr_storage  ss;
+    struct sockaddr         *sa;
+    socklen_t                socklen;
+    ngx_int_t                rc;
+    ngx_uint_t               ip_prefer;
+    ngx_resolver_t          *resolver;
     ngx_stream_trojan_dns_rule_group_t *dns_rule;
 
     if (ngx_stream_trojan_outbound_type(ctx)
@@ -9924,6 +10270,16 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
     case NGX_STREAM_TROJAN_ADDR_DOMAIN:
         dns_rule = ngx_stream_trojan_match_dns_rule(ctx->conf, &frame->addr);
         if (dns_rule != NULL) {
+            if (ngx_stream_trojan_udp_domain_cache_lookup(
+                    ctx->conf, &frame->addr, dns_rule->ip_prefer,
+                    (uintptr_t) dns_rule, &ss, &socklen)
+                == NGX_OK)
+            {
+                return ngx_stream_trojan_send_udp_sockaddr(
+                    ctx, (struct sockaddr *) &ss, socklen,
+                    frame->payload, frame->payload_len);
+            }
+
             if (dns_rule->doh_conf != NULL) {
                 ngx_stream_trojan_resolve_data_t  *udata;
 
@@ -9935,7 +10291,7 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
                 if (udata == NULL) {
                     return NGX_ERROR;
                 }
-
+                udata->udp_cache_key = (uintptr_t) dns_rule;
                 rc = ngx_stream_trojan_start_doh_resolver(ctx, udata);
                 if (rc == NGX_BUSY || rc == NGX_AGAIN) {
                     return NGX_AGAIN;
@@ -9954,7 +10310,8 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
                                                  frame->payload_len,
                                                  frame->wire_len,
                                                  dns_rule->resolver, 0,
-                                                 dns_rule->ip_prefer)
+                                                 dns_rule->ip_prefer,
+                                                 (uintptr_t) dns_rule)
                 != NGX_OK)
             {
                 return NGX_ERROR;
@@ -9963,20 +10320,32 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
             return NGX_AGAIN;
         }
 
+        ip_prefer = ngx_stream_trojan_current_ip_prefer(ctx);
+
         /* try DoH first */
         if (ctx->conf->doh_conf != NULL
             && frame->addr.host_len > 0 && frame->addr.host_len <= 255)
         {
             ngx_stream_trojan_resolve_data_t  *udata;
 
+            if (ngx_stream_trojan_udp_domain_cache_lookup(
+                    ctx->conf, &frame->addr, ip_prefer,
+                    (uintptr_t) ctx->conf->doh_conf, &ss, &socklen)
+                == NGX_OK)
+            {
+                return ngx_stream_trojan_send_udp_sockaddr(
+                    ctx, (struct sockaddr *) &ss, socklen,
+                    frame->payload, frame->payload_len);
+            }
+
             udata = ngx_stream_trojan_create_doh_resolve_data(ctx,
                         &frame->addr, ngx_stream_trojan_resolve_udp,
                         frame->payload, frame->payload_len, frame->wire_len,
-                        ngx_stream_trojan_current_ip_prefer(ctx),
-                        ctx->conf->doh_conf);
+                        ip_prefer, ctx->conf->doh_conf);
             if (udata == NULL) {
                 return NGX_ERROR;
             }
+            udata->udp_cache_key = (uintptr_t) ctx->conf->doh_conf;
 
             rc = ngx_stream_trojan_start_doh_resolver(ctx, udata);
             if (rc == NGX_BUSY || rc == NGX_AGAIN) {
@@ -9990,16 +10359,27 @@ ngx_stream_trojan_send_udp_frame(ngx_stream_trojan_ctx_t *ctx,
             return NGX_AGAIN;
         }
 
-        if (ngx_stream_trojan_use_nginx_resolver(
-                frame->addr.type,
-                ngx_stream_trojan_resolver_configured(ctx->session)))
+        resolver = ngx_stream_trojan_session_resolver(ctx->session);
+        if (ngx_stream_trojan_use_nginx_resolver(frame->addr.type,
+                                                 resolver != NULL))
         {
+            if (ngx_stream_trojan_udp_domain_cache_lookup(
+                    ctx->conf, &frame->addr, ip_prefer,
+                    (uintptr_t) resolver, &ss, &socklen)
+                == NGX_OK)
+            {
+                return ngx_stream_trojan_send_udp_sockaddr(
+                    ctx, (struct sockaddr *) &ss, socklen,
+                    frame->payload, frame->payload_len);
+            }
+
             if (ngx_stream_trojan_start_resolver(ctx, &frame->addr,
                                                  ngx_stream_trojan_resolve_udp,
                                                  frame->payload,
                                                  frame->payload_len,
                                                  frame->wire_len, NULL, 0,
-                                                 ngx_stream_trojan_current_ip_prefer(ctx))
+                                                 ip_prefer,
+                                                 (uintptr_t) resolver)
                 != NGX_OK)
             {
                 return NGX_ERROR;
@@ -10200,23 +10580,35 @@ ngx_stream_trojan_flush_socks5_udp_packet(ngx_stream_trojan_ctx_t *ctx)
 
 static ngx_int_t
 ngx_stream_trojan_send_udp_resolved(ngx_stream_trojan_ctx_t *ctx,
-    ngx_resolver_addr_t *addrs, ngx_uint_t naddrs, uint16_t port,
-    const u_char *payload, uint16_t payload_len, ngx_uint_t ip_prefer)
+    ngx_stream_trojan_resolve_data_t *data, ngx_resolver_addr_t *addrs,
+    ngx_uint_t naddrs)
 {
     ngx_resolver_addr_t     *resolved;
     struct sockaddr_storage  ss;
+    ngx_int_t                rc;
 
-    resolved = ngx_stream_trojan_resolver_pick_addr(addrs, naddrs, ip_prefer);
-    if (resolved == NULL || resolved->socklen > sizeof(ss)) {
+    resolved = ngx_stream_trojan_resolver_pick_addr(addrs, naddrs,
+                                                    data->ip_prefer);
+    if (resolved == NULL || resolved->socklen == 0
+        || resolved->socklen > sizeof(ss))
+    {
         return NGX_ERROR;
     }
 
     ngx_memcpy(&ss, resolved->sockaddr, resolved->socklen);
-    ngx_inet_set_port((struct sockaddr *) &ss, port);
+    ngx_inet_set_port((struct sockaddr *) &ss, data->port);
 
-    return ngx_stream_trojan_send_udp_sockaddr(ctx, (struct sockaddr *) &ss,
-                                               resolved->socklen, payload,
-                                               payload_len);
+    rc = ngx_stream_trojan_send_udp_sockaddr(ctx, (struct sockaddr *) &ss,
+                                             resolved->socklen, data->payload,
+                                             data->payload_len);
+    if (rc == NGX_OK) {
+        ngx_stream_trojan_udp_domain_cache_store(
+            ctx->conf, data->name, data->name_len, data->port,
+            data->ip_prefer, data->udp_cache_key, data->udp_cache_expire,
+            (struct sockaddr *) &ss, resolved->socklen);
+    }
+
+    return rc;
 }
 
 
@@ -11420,6 +11812,17 @@ ngx_stream_trojan_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
             NGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES
             * sizeof(ngx_stream_trojan_route_cache_entry_t));
         if (conf->route_cache == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    if ((conf->enable || (conf->socks5_enable && conf->socks5_udp_enable))
+        && conf->udp_domain_cache == NULL)
+    {
+        conf->udp_domain_cache = ngx_pcalloc(cf->pool,
+            NGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_ENTRIES
+            * sizeof(ngx_stream_trojan_udp_domain_cache_entry_t));
+        if (conf->udp_domain_cache == NULL) {
             return NGX_CONF_ERROR;
         }
     }

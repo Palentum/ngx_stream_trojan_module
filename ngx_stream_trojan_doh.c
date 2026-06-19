@@ -1372,9 +1372,9 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     ce = ngx_stream_trojan_doh_cache_lookup(doh_conf, name, name_len, qtype);
     if (ce != NULL) {
         if (ce->status == NGX_OK && ce->naddrs > 0) {
-            handler(data, NGX_OK, ce->addrs, ce->naddrs);
+            handler(data, NGX_OK, ce->addrs, ce->naddrs, ce->expire);
         } else {
-            handler(data, ce->status, NULL, 0);
+            handler(data, ce->status, NULL, 0, 0);
         }
 
         return NGX_OK;
@@ -2280,6 +2280,8 @@ ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
     ngx_stream_trojan_doh_handler_pt  cb_handler;
     ngx_resolver_addr_t              *addrs;
     ngx_uint_t                        naddrs, run_pending;
+    ngx_msec_t                        valid;
+    uint32_t                          ttl;
     ngx_stream_trojan_doh_conf_t     *conf;
 
     if (doh->read_state == DOH_DONE) return;
@@ -2318,11 +2320,20 @@ ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
     cb_handler = doh->cb_handler;
     addrs = doh->addrs;
     naddrs = doh->naddrs;
+    valid = 0;
 
     if (status == NGX_OK && addrs && naddrs > 0) {
-        cb_handler(cb_data, NGX_OK, addrs, naddrs);
+        if (doh->answer_ttl != 0) {
+            ttl = doh->answer_ttl;
+            if (ttl > NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL) {
+                ttl = NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL;
+            }
+            valid = ngx_current_msec + (ngx_msec_t) ttl * 1000;
+        }
+
+        cb_handler(cb_data, NGX_OK, addrs, naddrs, valid);
     } else {
-        cb_handler(cb_data, status, NULL, 0);
+        cb_handler(cb_data, status, NULL, 0, 0);
     }
 
     pool = doh->pool;
