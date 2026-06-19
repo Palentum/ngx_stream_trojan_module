@@ -12,6 +12,9 @@
 #define NGX_STREAM_TROJAN_DOH_CACHE_FNV_OFFSET 2166136261u
 #define NGX_STREAM_TROJAN_DOH_CACHE_FNV_PRIME 16777619u
 
+#define NGX_STREAM_TROJAN_DOH_POOL_SIZE 4096
+#define NGX_STREAM_TROJAN_DOH_MAX_FREE_CTX NGX_STREAM_TROJAN_DOH_MAX_ACTIVE
+
 static void ngx_stream_trojan_doh_cleanup(void *data);
 
 
@@ -283,8 +286,10 @@ ngx_stream_trojan_doh_parse_url(ngx_str_t *url,
     ngx_pool_cleanup_t  *cln;
 
     ngx_memzero(doh_conf, sizeof(ngx_stream_trojan_doh_conf_t));
+    doh_conf->log = log;
     ngx_queue_init(&doh_conf->pending);
     ngx_queue_init(&doh_conf->idle);
+    ngx_queue_init(&doh_conf->free_ctx);
 
     doh_conf->port = 443;
     doh_conf->https = 1;
@@ -581,6 +586,10 @@ static ngx_uint_t ngx_stream_trojan_doh_reusable(
     ngx_stream_trojan_doh_ctx_t *doh);
 static void ngx_stream_trojan_doh_close(
     ngx_stream_trojan_doh_ctx_t *doh);
+static ngx_stream_trojan_doh_ctx_t *ngx_stream_trojan_doh_alloc_ctx(
+    ngx_stream_trojan_doh_conf_t *conf, ngx_log_t *log);
+static void ngx_stream_trojan_doh_recycle_ctx(
+    ngx_stream_trojan_doh_ctx_t *doh);
 static ngx_int_t ngx_stream_trojan_doh_get_peer(
     ngx_peer_connection_t *pc, void *data);
 static void ngx_stream_trojan_doh_connected(ngx_stream_trojan_doh_ctx_t *doh);
@@ -596,6 +605,93 @@ static void ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
 static void ngx_stream_trojan_doh_ssl_handshake_handler(ngx_connection_t *c);
 #endif
 
+/*
+ * The ctx is larger than NGX_MAX_ALLOC_FROM_POOL because it carries fixed
+ * DNS/HTTP buffers. Keep it outside the transient pool so recycle can
+ * reset per-query allocations without reallocating the ctx itself.
+ */
+
+
+static ngx_stream_trojan_doh_ctx_t *
+ngx_stream_trojan_doh_alloc_ctx(ngx_stream_trojan_doh_conf_t *conf,
+    ngx_log_t *log)
+{
+    ngx_queue_t                 *q;
+    ngx_pool_t                  *pool;
+    ngx_stream_trojan_doh_ctx_t *doh;
+
+    if (!ngx_queue_empty(&conf->free_ctx)) {
+        q = ngx_queue_head(&conf->free_ctx);
+        ngx_queue_remove(q);
+        if (conf->free_ctx_n) {
+            conf->free_ctx_n--;
+        }
+
+        doh = ngx_queue_data(q, ngx_stream_trojan_doh_ctx_t, queue);
+        pool = doh->pool;
+        if (pool == NULL) {
+            ngx_free(doh);
+            return NULL;
+        }
+
+        ngx_memzero(doh, sizeof(ngx_stream_trojan_doh_ctx_t));
+        pool->log = log;
+
+    } else {
+        pool = ngx_create_pool(NGX_STREAM_TROJAN_DOH_POOL_SIZE, log);
+        if (pool == NULL) {
+            return NULL;
+        }
+
+        doh = ngx_alloc(sizeof(ngx_stream_trojan_doh_ctx_t), log);
+        if (doh == NULL) {
+            ngx_destroy_pool(pool);
+            return NULL;
+        }
+
+        ngx_memzero(doh, sizeof(ngx_stream_trojan_doh_ctx_t));
+    }
+
+    doh->pool = pool;
+    doh->conf = conf;
+    doh->log = log;
+    ngx_queue_init(&doh->queue);
+
+    return doh;
+}
+
+
+static void
+ngx_stream_trojan_doh_recycle_ctx(ngx_stream_trojan_doh_ctx_t *doh)
+{
+    ngx_pool_t                   *pool;
+    ngx_stream_trojan_doh_conf_t *conf;
+
+    if (doh == NULL) {
+        return;
+    }
+
+    pool = doh->pool;
+    conf = doh->conf;
+
+    if (pool == NULL) {
+        ngx_free(doh);
+        return;
+    }
+
+    if (conf != NULL
+        && conf->free_ctx_n < NGX_STREAM_TROJAN_DOH_MAX_FREE_CTX)
+    {
+        ngx_reset_pool(pool);
+        pool->log = conf->log ? conf->log : doh->log;
+        ngx_queue_insert_tail(&conf->free_ctx, &doh->queue);
+        conf->free_ctx_n++;
+        return;
+    }
+
+    ngx_destroy_pool(pool);
+    ngx_free(doh);
+}
 
 static u_char
 ngx_stream_trojan_doh_lc(u_char ch)
@@ -845,7 +941,9 @@ static void
 ngx_stream_trojan_doh_cleanup(void *data)
 {
     ngx_queue_t                       *q;
+    ngx_pool_t                        *pool;
     ngx_stream_trojan_doh_conf_t      *conf;
+    ngx_stream_trojan_doh_ctx_t       *doh;
     ngx_stream_trojan_doh_keepalive_t *ka;
 
     conf = data;
@@ -855,6 +953,21 @@ ngx_stream_trojan_doh_cleanup(void *data)
         ka = ngx_queue_data(q, ngx_stream_trojan_doh_keepalive_t, queue);
         ngx_stream_trojan_doh_close_keepalive(ka);
     }
+
+    while (!ngx_queue_empty(&conf->free_ctx)) {
+        q = ngx_queue_head(&conf->free_ctx);
+        ngx_queue_remove(q);
+        doh = ngx_queue_data(q, ngx_stream_trojan_doh_ctx_t, queue);
+        pool = doh->pool;
+        doh->pool = NULL;
+
+        if (pool) {
+            ngx_destroy_pool(pool);
+        }
+
+        ngx_free(doh);
+    }
+    conf->free_ctx_n = 0;
 }
 
 
@@ -1430,7 +1543,6 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
 {
     ngx_stream_trojan_doh_ctx_t         *doh;
     ngx_stream_trojan_doh_cache_entry_t *ce;
-    ngx_pool_t                          *pool;
     uint16_t                             dns_id;
     size_t                               qlen;
 
@@ -1449,30 +1561,21 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
         return NGX_OK;
     }
 
-    pool = ngx_create_pool(4096, log);
-    if (pool == NULL) return NGX_ERROR;
-
-    doh = ngx_pcalloc(pool, sizeof(ngx_stream_trojan_doh_ctx_t));
+    doh = ngx_stream_trojan_doh_alloc_ctx(doh_conf, log);
     if (doh == NULL) {
-        ngx_destroy_pool(pool);
         return NGX_ERROR;
     }
 
-    doh->pool = pool;
-    doh->conf = doh_conf;
-    doh->log = log;
     doh->cb_data = data;
     doh->cb_handler = handler;
     doh->owner = ctxp;
-    ngx_queue_init(&doh->queue);
-
     dns_id = (uint16_t) ngx_random();
 
     qlen = ngx_stream_trojan_doh_build_query(doh->query,
                                              NGX_STREAM_TROJAN_DOH_MAX_QUERY_SIZE,
                                              name, name_len, qtype, dns_id);
     if (qlen == 0) {
-        ngx_destroy_pool(pool);
+        ngx_stream_trojan_doh_recycle_ctx(doh);
         return NGX_ERROR;
     }
 
@@ -1487,7 +1590,7 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
     if (doh_conf->active >= NGX_STREAM_TROJAN_DOH_MAX_ACTIVE) {
         if (doh_conf->pending_n >= NGX_STREAM_TROJAN_DOH_MAX_PENDING) {
             *ctxp = NULL;
-            ngx_destroy_pool(pool);
+            ngx_stream_trojan_doh_recycle_ctx(doh);
             return NGX_BUSY;
         }
 
@@ -1499,7 +1602,7 @@ ngx_stream_trojan_doh_resolve(ngx_stream_trojan_doh_conf_t *doh_conf,
 
     if (ngx_stream_trojan_doh_start_request(doh) != NGX_OK) {
         *ctxp = NULL;
-        ngx_destroy_pool(pool);
+        ngx_stream_trojan_doh_recycle_ctx(doh);
         return NGX_ERROR;
     }
 
@@ -2299,7 +2402,6 @@ ngx_stream_trojan_doh_close(ngx_stream_trojan_doh_ctx_t *doh)
 void
 ngx_stream_trojan_doh_cancel(ngx_stream_trojan_doh_ctx_t *doh)
 {
-    ngx_pool_t                     *pool;
     ngx_stream_trojan_doh_conf_t   *conf;
     ngx_uint_t                      run_pending;
 
@@ -2329,10 +2431,7 @@ ngx_stream_trojan_doh_cancel(ngx_stream_trojan_doh_ctx_t *doh)
     doh->read_state = DOH_DONE;
     ngx_stream_trojan_doh_close(doh);
 
-    pool = doh->pool;
-    if (pool) {
-        ngx_destroy_pool(pool);
-    }
+    ngx_stream_trojan_doh_recycle_ctx(doh);
 
     if (run_pending) {
         ngx_stream_trojan_doh_run_pending(conf);
@@ -2344,7 +2443,6 @@ static void
 ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
     ngx_int_t status)
 {
-    ngx_pool_t                       *pool;
     void                             *cb_data;
     ngx_stream_trojan_doh_handler_pt  cb_handler;
     ngx_resolver_addr_t              *addrs;
@@ -2405,10 +2503,7 @@ ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
         cb_handler(cb_data, status, NULL, 0, 0);
     }
 
-    pool = doh->pool;
-    if (pool) {
-        ngx_destroy_pool(pool);
-    }
+    ngx_stream_trojan_doh_recycle_ctx(doh);
 
     if (run_pending) {
         ngx_stream_trojan_doh_run_pending(conf);

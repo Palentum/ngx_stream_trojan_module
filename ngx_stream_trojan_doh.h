@@ -49,6 +49,7 @@ typedef struct {
     in_port_t     port;
     ngx_uint_t    https;        /* 1 if HTTPS */
     ngx_msec_t    timeout;
+    ngx_log_t    *log;
 
     /* pre-resolved server addresses (populated at config time) */
     ngx_addr_t   *addrs;
@@ -59,9 +60,11 @@ typedef struct {
     ngx_uint_t    cache_generation;
     ngx_queue_t   pending;
     ngx_queue_t   idle;
+    ngx_queue_t   free_ctx;
     ngx_uint_t    active;
     ngx_uint_t    pending_n;
     ngx_uint_t    idle_n;
+    ngx_uint_t    free_ctx_n;
 
 #if (NGX_SSL)
     ngx_ssl_t     ssl;          /* SSL client context */
