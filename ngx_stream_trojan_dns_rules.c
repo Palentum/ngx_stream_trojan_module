@@ -60,6 +60,8 @@ struct ngx_stream_trojan_dns_rules_conf_s {
     ngx_stream_trojan_dns_rules_cache_entry_t
                      cache[NGX_STREAM_TROJAN_DNS_RULES_CACHE_ENTRIES];
     ngx_uint_t       cache_generation;
+    ngx_stream_trojan_geosite_t *prepared_geosite;
+    ngx_uint_t       geosite_prepared;
 };
 
 
@@ -1291,6 +1293,9 @@ ngx_stream_trojan_dns_rules_prepare_geosite(ngx_conf_t *cf,
     if (rules == NULL || rules->groups == NULL) {
         return NGX_OK;
     }
+    if (rules->geosite_prepared && rules->prepared_geosite == geosite) {
+        return NGX_OK;
+    }
 
     groups = rules->groups->elts;
     for (i = 0; i < rules->groups->nelts; i++) {
@@ -1310,6 +1315,9 @@ ngx_stream_trojan_dns_rules_prepare_geosite(ngx_conf_t *cf,
             }
         }
     }
+
+    rules->prepared_geosite = geosite;
+    rules->geosite_prepared = 1;
 
     return NGX_OK;
 }
