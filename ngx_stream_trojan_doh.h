@@ -18,6 +18,7 @@
 #define NGX_STREAM_TROJAN_DOH_CACHE_MAX_TTL     600
 #define NGX_STREAM_TROJAN_DOH_MAX_ACTIVE        32
 #define NGX_STREAM_TROJAN_DOH_MAX_PENDING       256
+#define NGX_STREAM_TROJAN_DOH_MAX_IDLE          NGX_STREAM_TROJAN_DOH_MAX_ACTIVE
 
 typedef struct {
     ngx_uint_t           valid;
@@ -50,8 +51,10 @@ typedef struct {
                   cache[NGX_STREAM_TROJAN_DOH_CACHE_ENTRIES];
     ngx_uint_t    cache_generation;
     ngx_queue_t   pending;
+    ngx_queue_t   idle;
     ngx_uint_t    active;
     ngx_uint_t    pending_n;
+    ngx_uint_t    idle_n;
 
 #if (NGX_SSL)
     ngx_ssl_t     ssl;          /* SSL client context */

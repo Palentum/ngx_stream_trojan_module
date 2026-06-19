@@ -9,6 +9,8 @@
 #include <ngx_event_openssl.h>
 #endif
 
+static void ngx_stream_trojan_doh_cleanup(void *data);
+
 
 /* ─── DNS query builder (RFC 1035) ─────────────────────────────────────── */
 
@@ -274,12 +276,12 @@ ngx_stream_trojan_doh_parse_url(ngx_str_t *url,
     size_t               host_len;
     ngx_uint_t           port, port_set;
     ngx_url_t            u;
-#if (NGX_SSL)
     ngx_pool_cleanup_t  *cln;
-#endif
 
     ngx_memzero(doh_conf, sizeof(ngx_stream_trojan_doh_conf_t));
     ngx_queue_init(&doh_conf->pending);
+    ngx_queue_init(&doh_conf->idle);
+
     doh_conf->port = 443;
     doh_conf->https = 1;
     doh_conf->timeout = NGX_STREAM_TROJAN_DOH_DEFAULT_TIMEOUT;
@@ -463,11 +465,31 @@ ngx_stream_trojan_doh_parse_url(ngx_str_t *url,
     }
 #endif
 
+    cln = ngx_pool_cleanup_add(pool, 0);
+    if (cln == NULL) {
+        return NGX_ERROR;
+    }
+    cln->handler = ngx_stream_trojan_doh_cleanup;
+    cln->data = doh_conf;
+
     return NGX_OK;
 }
 
 
 /* ─── DoH async resolution engine ─────────────────────────────────────── */
+
+typedef struct ngx_stream_trojan_doh_keepalive_s
+    ngx_stream_trojan_doh_keepalive_t;
+
+struct ngx_stream_trojan_doh_keepalive_s {
+    ngx_queue_t                  queue;
+    ngx_stream_trojan_doh_conf_t *conf;
+    ngx_connection_t             *connection;
+    ngx_pool_t                   *pool;
+    ngx_log_t                    log;
+    unsigned                     idle:1;
+};
+
 
 struct ngx_stream_trojan_doh_ctx_s {
     ngx_stream_trojan_doh_conf_t *conf;
@@ -480,11 +502,15 @@ struct ngx_stream_trojan_doh_ctx_s {
     uint16_t                     dns_id;
 
     ngx_peer_connection_t        peer;
+    ngx_stream_trojan_doh_keepalive_t *keepalive;
     ngx_stream_trojan_doh_ctx_t **owner;
     ngx_queue_t                  queue;
     unsigned                     peer_initialized:1;
     unsigned                     queued:1;
     unsigned                     active:1;
+    unsigned                     reused_keepalive:1;
+    unsigned                     retried_keepalive:1;
+    unsigned                     request_started:1;
     ngx_uint_t                   addr_idx;
 
 
@@ -510,6 +536,9 @@ struct ngx_stream_trojan_doh_ctx_s {
     ngx_uint_t                   http_status;
     unsigned                     content_length_set:1;
     unsigned                     chunked:1;
+    unsigned                     close_after_response:1;
+    unsigned                     connection_close_seen:1;
+    unsigned                     response_eof:1;
 
     ngx_resolver_addr_t         *addrs;
     ngx_uint_t                   naddrs;
@@ -533,6 +562,21 @@ static ngx_int_t ngx_stream_trojan_doh_start_request(
     ngx_stream_trojan_doh_ctx_t *doh);
 static void ngx_stream_trojan_doh_run_pending(
     ngx_stream_trojan_doh_conf_t *conf);
+static ngx_int_t ngx_stream_trojan_doh_get_keepalive(
+    ngx_stream_trojan_doh_ctx_t *doh);
+static ngx_int_t ngx_stream_trojan_doh_create_keepalive(
+    ngx_stream_trojan_doh_ctx_t *doh);
+static ngx_int_t ngx_stream_trojan_doh_save_keepalive(
+    ngx_stream_trojan_doh_ctx_t *doh);
+static void ngx_stream_trojan_doh_close_keepalive(
+    ngx_stream_trojan_doh_keepalive_t *ka);
+static void ngx_stream_trojan_doh_keepalive_handler(ngx_event_t *ev);
+static ngx_int_t ngx_stream_trojan_doh_retry(
+    ngx_stream_trojan_doh_ctx_t *doh);
+static ngx_uint_t ngx_stream_trojan_doh_reusable(
+    ngx_stream_trojan_doh_ctx_t *doh);
+static void ngx_stream_trojan_doh_close(
+    ngx_stream_trojan_doh_ctx_t *doh);
 static ngx_int_t ngx_stream_trojan_doh_get_peer(
     ngx_peer_connection_t *pc, void *data);
 static void ngx_stream_trojan_doh_connected(ngx_stream_trojan_doh_ctx_t *doh);
@@ -687,6 +731,297 @@ ngx_stream_trojan_doh_cache_store(ngx_stream_trojan_doh_conf_t *conf,
     slot->valid = 1;
 }
 
+static void
+ngx_stream_trojan_doh_cleanup(void *data)
+{
+    ngx_queue_t                       *q;
+    ngx_stream_trojan_doh_conf_t      *conf;
+    ngx_stream_trojan_doh_keepalive_t *ka;
+
+    conf = data;
+
+    while (!ngx_queue_empty(&conf->idle)) {
+        q = ngx_queue_head(&conf->idle);
+        ka = ngx_queue_data(q, ngx_stream_trojan_doh_keepalive_t, queue);
+        ngx_stream_trojan_doh_close_keepalive(ka);
+    }
+}
+
+
+static void
+ngx_stream_trojan_doh_close_keepalive(
+    ngx_stream_trojan_doh_keepalive_t *ka)
+{
+    ngx_pool_t                        *pool;
+    ngx_connection_t                  *c;
+    ngx_stream_trojan_doh_conf_t      *conf;
+
+    if (ka == NULL) {
+        return;
+    }
+
+    conf = ka->conf;
+
+    if (ka->idle) {
+        ngx_queue_remove(&ka->queue);
+        ka->idle = 0;
+        if (conf && conf->idle_n) {
+            conf->idle_n--;
+        }
+    }
+
+    c = ka->connection;
+    pool = ka->pool;
+    ka->connection = NULL;
+    ka->pool = NULL;
+
+    if (c) {
+        if (c->read->timer_set) {
+            ngx_del_timer(c->read);
+        }
+
+        if (c->write->timer_set) {
+            ngx_del_timer(c->write);
+        }
+
+#if (NGX_SSL)
+        if (c->ssl) {
+            c->ssl->no_wait_shutdown = 1;
+            c->ssl->no_send_shutdown = 1;
+            (void) ngx_ssl_shutdown(c);
+        }
+#endif
+
+        ngx_close_connection(c);
+    }
+
+    if (pool) {
+        ngx_destroy_pool(pool);
+    }
+}
+
+
+static void
+ngx_stream_trojan_doh_keepalive_handler(ngx_event_t *ev)
+{
+    ngx_connection_t                  *c;
+    ngx_stream_trojan_doh_keepalive_t *ka;
+
+    c = ev->data;
+    ka = c->data;
+
+    ngx_stream_trojan_doh_close_keepalive(ka);
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_doh_create_keepalive(ngx_stream_trojan_doh_ctx_t *doh)
+{
+    ngx_pool_t                        *pool;
+    ngx_connection_t                  *c;
+    ngx_stream_trojan_doh_keepalive_t *ka;
+
+    c = doh->peer.connection;
+    if (c == NULL) {
+        return NGX_ERROR;
+    }
+
+    pool = ngx_create_pool(4096, doh->log);
+    if (pool == NULL) {
+        return NGX_ERROR;
+    }
+
+    ka = ngx_pcalloc(pool, sizeof(ngx_stream_trojan_doh_keepalive_t));
+    if (ka == NULL) {
+        ngx_destroy_pool(pool);
+        return NGX_ERROR;
+    }
+
+    ngx_queue_init(&ka->queue);
+    ka->conf = doh->conf;
+    ka->connection = c;
+    ka->pool = pool;
+    ka->log = *doh->log;
+    ka->log.connection = 0;
+    ka->log.handler = NULL;
+    ka->log.data = NULL;
+    ka->log.writer = NULL;
+    ka->log.wdata = NULL;
+    ka->log.action = NULL;
+    ka->log.next = NULL;
+
+    c->pool = pool;
+    doh->keepalive = ka;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_doh_get_keepalive(ngx_stream_trojan_doh_ctx_t *doh)
+{
+    ngx_queue_t                       *q;
+    ngx_connection_t                  *c;
+    ngx_stream_trojan_doh_conf_t      *conf;
+    ngx_stream_trojan_doh_keepalive_t *ka;
+
+    conf = doh->conf;
+
+    while (!ngx_queue_empty(&conf->idle)) {
+        q = ngx_queue_head(&conf->idle);
+        ngx_queue_remove(q);
+        if (conf->idle_n) {
+            conf->idle_n--;
+        }
+
+        ka = ngx_queue_data(q, ngx_stream_trojan_doh_keepalive_t, queue);
+        ka->idle = 0;
+        c = ka->connection;
+
+        if (c == NULL || c->error || c->read->timedout
+            || c->write->timedout || c->read->eof)
+        {
+            ngx_stream_trojan_doh_close_keepalive(ka);
+            continue;
+        }
+
+#if (NGX_HAVE_KQUEUE)
+        if (c->read->pending_eof) {
+            ngx_stream_trojan_doh_close_keepalive(ka);
+            continue;
+        }
+#endif
+
+        if (c->read->timer_set) {
+            ngx_del_timer(c->read);
+        }
+
+        if (c->write->timer_set) {
+            ngx_del_timer(c->write);
+        }
+
+        c->data = doh;
+        c->log = doh->log;
+        c->read->log = doh->log;
+        c->write->log = doh->log;
+
+        doh->peer.connection = c;
+        doh->keepalive = ka;
+        doh->peer_initialized = 1;
+        doh->reused_keepalive = 1;
+
+        return NGX_OK;
+    }
+
+    return NGX_DECLINED;
+}
+
+
+static ngx_uint_t
+ngx_stream_trojan_doh_reusable(ngx_stream_trojan_doh_ctx_t *doh)
+{
+    return doh->peer_initialized
+           && doh->peer.connection != NULL
+           && doh->keepalive != NULL
+           && !doh->close_after_response
+           && !doh->response_eof
+           && (doh->content_length_set || doh->chunked)
+           && doh->conf->idle_n < NGX_STREAM_TROJAN_DOH_MAX_IDLE;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_doh_save_keepalive(ngx_stream_trojan_doh_ctx_t *doh)
+{
+    ngx_connection_t                  *c;
+    ngx_stream_trojan_doh_conf_t      *conf;
+    ngx_stream_trojan_doh_keepalive_t *ka;
+
+    if (!ngx_stream_trojan_doh_reusable(doh)) {
+        return NGX_DECLINED;
+    }
+
+    conf = doh->conf;
+    c = doh->peer.connection;
+    ka = doh->keepalive;
+
+    if (c->read->timer_set) {
+        ngx_del_timer(c->read);
+    }
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+
+    doh->peer.connection = NULL;
+    doh->peer_initialized = 0;
+    doh->keepalive = NULL;
+
+    c->data = ka;
+    c->log = &ka->log;
+    c->read->log = &ka->log;
+    c->write->log = &ka->log;
+    c->read->handler = ngx_stream_trojan_doh_keepalive_handler;
+    c->write->handler = ngx_stream_trojan_doh_dummy_write_handler;
+
+    ka->connection = c;
+    ka->idle = 1;
+    ngx_queue_insert_tail(&conf->idle, &ka->queue);
+    conf->idle_n++;
+
+    ngx_add_timer(c->read, conf->timeout);
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        ngx_stream_trojan_doh_close_keepalive(ka);
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_doh_retry(ngx_stream_trojan_doh_ctx_t *doh)
+{
+    if (!doh->reused_keepalive || doh->retried_keepalive
+        || doh->request_started)
+    {
+        return NGX_DECLINED;
+    }
+
+    doh->retried_keepalive = 1;
+    doh->reused_keepalive = 0;
+    doh->addr_idx = 0;
+
+    if (doh->keepalive) {
+        ngx_stream_trojan_doh_close_keepalive(doh->keepalive);
+        doh->keepalive = NULL;
+    } else if (doh->peer.connection) {
+        ngx_close_connection(doh->peer.connection);
+    }
+
+    doh->peer.connection = NULL;
+    doh->peer_initialized = 0;
+    doh->send_ptr = NULL;
+    doh->send_len = 0;
+    doh->recv_pos = 0;
+    doh->read_state = DOH_READ_STATUS;
+    doh->header_start = NULL;
+    doh->header_bytes = 0;
+    doh->body_start = NULL;
+    doh->chunked_decoded_len = 0;
+    doh->body_len = 0;
+    doh->content_length = 0;
+    doh->http_status = 0;
+    doh->content_length_set = 0;
+    doh->chunked = 0;
+    doh->close_after_response = 0;
+    doh->connection_close_seen = 0;
+    doh->response_eof = 0;
+
+    return ngx_stream_trojan_doh_start_request(doh);
+}
+
 
 static ngx_int_t
 ngx_stream_trojan_doh_get_peer(ngx_peer_connection_t *pc, void *data)
@@ -725,7 +1060,7 @@ ngx_stream_trojan_doh_ssl_set_name(ngx_stream_trojan_doh_ctx_t *doh,
         return NGX_OK;
     }
 
-    p = ngx_pnalloc(doh->pool, name.len + 1);
+    p = ngx_pnalloc(c->pool, name.len + 1);
     if (p == NULL) {
         return NGX_ERROR;
     }
@@ -888,6 +1223,18 @@ ngx_stream_trojan_doh_start_request(ngx_stream_trojan_doh_ctx_t *doh)
     ngx_int_t                     rc;
 
     conf = doh->conf;
+    if (!doh->retried_keepalive
+        && ngx_stream_trojan_doh_get_keepalive(doh) == NGX_OK)
+    {
+        if (!doh->active) {
+            doh->active = 1;
+            conf->active++;
+        }
+
+        ngx_stream_trojan_doh_start_http(doh);
+        return NGX_OK;
+    }
+
 
     ngx_memzero(&doh->peer, sizeof(ngx_peer_connection_t));
     doh->peer.log = doh->log;
@@ -914,11 +1261,18 @@ ngx_stream_trojan_doh_start_request(ngx_stream_trojan_doh_ctx_t *doh)
         return NGX_ERROR;
     }
 
-    doh->active = 1;
-    conf->active++;
+    if (ngx_stream_trojan_doh_create_keepalive(doh) != NGX_OK) {
+        ngx_close_connection(c);
+        doh->peer.connection = NULL;
+        return NGX_ERROR;
+    }
+
+    if (!doh->active) {
+        doh->active = 1;
+        conf->active++;
+    }
 
     c->data = doh;
-    c->pool = doh->pool;
     c->log = doh->log;
     c->read->log = doh->log;
     c->write->log = doh->log;
@@ -1115,6 +1469,9 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
     doh = c->data;
 
     if (ev->timedout) {
+        if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+            return;
+        }
         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
         return;
     }
@@ -1131,7 +1488,7 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
 
         cl_len = (size_t) (ngx_sprintf(cl_buf, "%uz", doh->query_len)
                            - cl_buf);
-        alloc = 128 + doh->conf->host_header.len + doh->conf->path.len
+        alloc = 160 + doh->conf->host_header.len + doh->conf->path.len
                 + doh->query_len + cl_len;
 
         req = ngx_palloc(doh->pool, alloc);
@@ -1156,8 +1513,8 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
                        sizeof("Content-Length: ") - 1);
         p = ngx_cpymem(p, cl_buf, cl_len);
         p = ngx_cpymem(p, "\r\n", sizeof("\r\n") - 1);
-        p = ngx_cpymem(p, "Connection: close\r\n",
-                       sizeof("Connection: close\r\n") - 1);
+        p = ngx_cpymem(p, "Connection: keep-alive\r\n",
+                       sizeof("Connection: keep-alive\r\n") - 1);
         p = ngx_cpymem(p, "\r\n", sizeof("\r\n") - 1);
         p = ngx_cpymem(p, doh->query, doh->query_len);
 
@@ -1168,12 +1525,18 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
     while (doh->send_len) {
         n = c->send(c, doh->send_ptr, doh->send_len);
         if (n == NGX_ERROR) {
+            if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+                return;
+            }
             ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
             return;
         }
 
         if (n == NGX_AGAIN || n == 0) {
             if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
+                if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+                    return;
+                }
                 ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
                 return;
             }
@@ -1184,6 +1547,7 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
             return;
         }
 
+        doh->request_started = 1;
         doh->send_ptr += n;
         doh->send_len -= (size_t) n;
     }
@@ -1196,6 +1560,9 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
 
     if (c->write->active && (ngx_event_flags & NGX_USE_LEVEL_EVENT)) {
         if (ngx_del_event(c->write, NGX_WRITE_EVENT, 0) != NGX_OK) {
+            if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+                return;
+            }
             ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
             return;
         }
@@ -1206,6 +1573,9 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
         ngx_add_timer(c->read, doh->conf->timeout);
     }
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+            return;
+        }
         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
     }
 }
@@ -1334,6 +1704,9 @@ ngx_stream_trojan_doh_decode_chunked(ngx_stream_trojan_doh_ctx_t *doh)
                 }
 
                 if (p == trailers) {
+                    if (p + 2 < end) {
+                        doh->close_after_response = 1;
+                    }
                     doh->chunked_decoded_len = decoded_len;
                     doh->body_len = decoded_len;
                     doh->recv_pos = (size_t) (data - doh->recv_buf)
@@ -1381,6 +1754,10 @@ ngx_stream_trojan_doh_body_ready(ngx_stream_trojan_doh_ctx_t *doh,
     if (doh->content_length_set) {
         if (doh->body_len < doh->content_length) {
             return NGX_AGAIN;
+        }
+
+        if (doh->body_len > doh->content_length) {
+            doh->close_after_response = 1;
         }
 
         doh->body_len = doh->content_length;
@@ -1436,6 +1813,9 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
     doh = c->data;
 
     if (ev->timedout) {
+        if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+            return;
+        }
         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
         return;
     }
@@ -1448,6 +1828,9 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
 
     n = c->recv(c, doh->recv_buf + doh->recv_pos, avail);
     if (n == NGX_ERROR) {
+        if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+            return;
+        }
         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
         return;
     }
@@ -1457,6 +1840,7 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
     }
 
     if (n == 0) {
+        doh->response_eof = 1;
         if (doh->read_state == DOH_READ_BODY && doh->body_start) {
             end = doh->recv_buf + doh->recv_pos;
             doh->body_len = (size_t) (end - doh->body_start);
@@ -1467,6 +1851,9 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
             }
         }
 
+        if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+            return;
+        }
         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
         return;
     }
@@ -1497,6 +1884,9 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
                 }
 
                 doh->http_status = (ngx_uint_t) status;
+                if (ngx_strncmp(doh->recv_buf, "HTTP/1.0", 8) == 0) {
+                    doh->close_after_response = 1;
+                }
                 line_len = (size_t) (p + 2 - doh->recv_buf);
                 if (line_len > NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE) {
                     ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
@@ -1590,6 +1980,26 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
                 doh->content_length_set = 1;
             }
 
+            if ((size_t) (p - line) >= 11
+                && ngx_strncasecmp(line, (u_char *) "Connection:", 11)
+                   == 0)
+            {
+                vp = line + 11;
+                if (ngx_stream_trojan_doh_header_has_token(
+                        vp, p, (u_char *) "close", 5)
+                    == NGX_OK)
+                {
+                    doh->close_after_response = 1;
+                    doh->connection_close_seen = 1;
+                } else if (!doh->connection_close_seen
+                           && ngx_stream_trojan_doh_header_has_token(
+                                  vp, p, (u_char *) "keep-alive", 10)
+                              == NGX_OK)
+                {
+                    doh->close_after_response = 0;
+                }
+            }
+
             if ((size_t) (p - line) >= 18
                 && ngx_strncasecmp(line, (u_char *) "Transfer-Encoding:", 18)
                    == 0)
@@ -1627,6 +2037,9 @@ need_more:
     }
 
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        if (ngx_stream_trojan_doh_retry(doh) == NGX_OK) {
+            return;
+        }
         ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
     }
 }
@@ -1641,20 +2054,32 @@ ngx_stream_trojan_doh_close(ngx_stream_trojan_doh_ctx_t *doh)
         *doh->owner = NULL;
     }
 
-    if (doh->peer_initialized) {
-        c = doh->peer.connection;
-        if (c) {
-#if (NGX_SSL)
-            if (c->ssl) {
-                c->ssl->no_wait_shutdown = 1;
-                c->ssl->no_send_shutdown = 1;
-                (void) ngx_ssl_shutdown(c);
-            }
-#endif
-            ngx_close_connection(c);
-            doh->peer.connection = NULL;
-        }
+    if (!doh->peer_initialized) {
+        return;
     }
+
+    if (doh->keepalive) {
+        ngx_stream_trojan_doh_close_keepalive(doh->keepalive);
+        doh->keepalive = NULL;
+        doh->peer.connection = NULL;
+        doh->peer_initialized = 0;
+        return;
+    }
+
+    c = doh->peer.connection;
+    if (c) {
+#if (NGX_SSL)
+        if (c->ssl) {
+            c->ssl->no_wait_shutdown = 1;
+            c->ssl->no_send_shutdown = 1;
+            (void) ngx_ssl_shutdown(c);
+        }
+#endif
+        ngx_close_connection(c);
+        doh->peer.connection = NULL;
+    }
+
+    doh->peer_initialized = 0;
 }
 
 
@@ -1735,7 +2160,15 @@ ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
         run_pending = 1;
     }
 
-    ngx_stream_trojan_doh_close(doh);
+    if (doh->owner && *doh->owner == doh) {
+        *doh->owner = NULL;
+    }
+
+    if (status != NGX_OK
+        || ngx_stream_trojan_doh_save_keepalive(doh) != NGX_OK)
+    {
+        ngx_stream_trojan_doh_close(doh);
+    }
 
     cb_data = doh->cb_data;
     cb_handler = doh->cb_handler;
