@@ -228,6 +228,7 @@ trojan_routes {
 - 101 WebSocket 握手完成后的 Trojan 鉴权失败会关闭 WebSocket，不再 fallback。
 - server 级 `trojan_doh` 或命中的 DoH 规则组查询失败都会结束本次请求，不回退到其他解析层。
 - `trojan_geosite` / `trojan_geoip` 文件只在加载或 reload NGINX 配置时读取；替换文件后需要 reload。
+- 路由、geosite host、UDP 域名缓存默认各为 1024 entries、4-way set associative；高基数目标流量可在编译时通过 `--with-cc-opt="-DNGX_STREAM_TROJAN_ROUTE_CACHE_ENTRIES=8192 -DNGX_STREAM_TROJAN_GEOSITE_CACHE_ENTRIES=8192 -DNGX_STREAM_TROJAN_UDP_DOMAIN_CACHE_ENTRIES=8192"` 按规则规模或预期并发放大，entries 必须不小于 4 且能被 4 整除。
 - 本仓库没有自带 Makefile、测试框架、lint、formatter 或 CI。非平凡代码改动应在 NGINX 源码树中完成 `./configure ... --add-module=/path/to/ngx_stream_trojan_module && make` 验证。
 
 ## 文件结构
