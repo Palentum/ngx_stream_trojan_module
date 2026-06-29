@@ -537,6 +537,7 @@ struct ngx_stream_trojan_doh_ctx_s {
         DOH_DONE
     } read_state;
     u_char                      *header_start;
+    size_t                       header_scan;
     size_t                       header_bytes;
     u_char                      *body_start;
     size_t                       chunked_decoded_len;
@@ -597,6 +598,8 @@ static void ngx_stream_trojan_doh_start_http(ngx_stream_trojan_doh_ctx_t *doh);
 static void ngx_stream_trojan_doh_write_handler(ngx_event_t *ev);
 static void ngx_stream_trojan_doh_dummy_write_handler(ngx_event_t *ev);
 static void ngx_stream_trojan_doh_read_handler(ngx_event_t *ev);
+static u_char *ngx_stream_trojan_doh_find_crlf(u_char *buf, size_t len,
+    size_t *scan);
 static void ngx_stream_trojan_doh_event_handler(ngx_event_t *ev);
 static void ngx_stream_trojan_doh_finish(ngx_stream_trojan_doh_ctx_t *doh,
     ngx_int_t status);
@@ -1230,6 +1233,7 @@ ngx_stream_trojan_doh_retry(ngx_stream_trojan_doh_ctx_t *doh)
     doh->recv_pos = 0;
     doh->read_state = DOH_READ_STATUS;
     doh->header_start = NULL;
+    doh->header_scan = 0;
     doh->header_bytes = 0;
     doh->body_start = NULL;
     doh->chunked_decoded_len = 0;
@@ -1787,6 +1791,7 @@ ngx_stream_trojan_doh_write_handler(ngx_event_t *ev)
     }
 
     doh->read_state = DOH_READ_STATUS;
+    doh->header_scan = 0;
     if (!c->read->timer_set) {
         ngx_add_timer(c->read, doh->conf->timeout);
     }
@@ -2114,6 +2119,32 @@ ngx_stream_trojan_doh_parse_done(ngx_stream_trojan_doh_ctx_t *doh)
     ngx_stream_trojan_doh_finish(doh, NGX_OK);
 }
 
+static u_char *
+ngx_stream_trojan_doh_find_crlf(u_char *buf, size_t len, size_t *scan)
+{
+    size_t  i;
+
+    if (len < 2) {
+        *scan = 0;
+        return NULL;
+    }
+
+    i = *scan;
+    if (i != 0) {
+        i--;
+    }
+
+    for (; i + 1 < len; i++) {
+        if (buf[i] == '\r' && buf[i + 1] == '\n') {
+            return buf + i;
+        }
+    }
+
+    *scan = len - 1;
+    return NULL;
+}
+
+
 
 static void
 ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
@@ -2178,41 +2209,41 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
     end = doh->recv_buf + doh->recv_pos;
 
     if (doh->read_state == DOH_READ_STATUS) {
-        for (p = doh->recv_buf; p + 1 < end; p++) {
-            if (p[0] == '\r' && p[1] == '\n') {
-                if (p - doh->recv_buf < 12
-                    || ngx_strncmp(doh->recv_buf, "HTTP/", 5) != 0)
-                {
-                    ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
-                    return;
-                }
-
-                sp = ngx_strlchr(doh->recv_buf + 5, p, ' ');
-                if (sp == NULL || p - sp < 4) {
-                    ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
-                    return;
-                }
-
-                status = ngx_atoi(sp + 1, 3);
-                if (status == NGX_ERROR) {
-                    ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
-                    return;
-                }
-
-                doh->http_status = (ngx_uint_t) status;
-                if (ngx_strncmp(doh->recv_buf, "HTTP/1.0", 8) == 0) {
-                    doh->close_after_response = 1;
-                }
-                line_len = (size_t) (p + 2 - doh->recv_buf);
-                if (line_len > NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE) {
-                    ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
-                    return;
-                }
-                doh->header_bytes = line_len;
-                doh->header_start = p + 2;
-                doh->read_state = DOH_READ_HEADERS;
-                break;
+        p = ngx_stream_trojan_doh_find_crlf(doh->recv_buf, doh->recv_pos,
+                                            &doh->header_scan);
+        if (p != NULL) {
+            if (p - doh->recv_buf < 12
+                || ngx_strncmp(doh->recv_buf, "HTTP/", 5) != 0)
+            {
+                ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+                return;
             }
+
+            sp = ngx_strlchr(doh->recv_buf + 5, p, ' ');
+            if (sp == NULL || p - sp < 4) {
+                ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+                return;
+            }
+
+            status = ngx_atoi(sp + 1, 3);
+            if (status == NGX_ERROR) {
+                ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+                return;
+            }
+
+            doh->http_status = (ngx_uint_t) status;
+            if (ngx_strncmp(doh->recv_buf, "HTTP/1.0", 8) == 0) {
+                doh->close_after_response = 1;
+            }
+            line_len = (size_t) (p + 2 - doh->recv_buf);
+            if (line_len > NGX_STREAM_TROJAN_DOH_MAX_RESPONSE_SIZE) {
+                ngx_stream_trojan_doh_finish(doh, NGX_ERROR);
+                return;
+            }
+            doh->header_bytes = line_len;
+            doh->header_scan = 0;
+            doh->header_start = p + 2;
+            doh->read_state = DOH_READ_HEADERS;
         }
 
         if (doh->read_state == DOH_READ_STATUS) {
@@ -2224,13 +2255,10 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
         line = doh->header_start;
 
         for (;;) {
-            for (p = line; p + 1 < end; p++) {
-                if (p[0] == '\r' && p[1] == '\n') {
-                    break;
-                }
-            }
+            p = ngx_stream_trojan_doh_find_crlf(line, (size_t) (end - line),
+                                                &doh->header_scan);
 
-            if (p + 1 >= end) {
+            if (p == NULL) {
                 tail_len = (size_t) (end - line);
                 if (tail_len != 0 && line != doh->recv_buf) {
                     ngx_memmove(doh->recv_buf, line, tail_len);
@@ -2329,6 +2357,7 @@ ngx_stream_trojan_doh_read_handler(ngx_event_t *ev)
                 }
             }
 
+            doh->header_scan = 0;
             line = p + 2;
         }
     }
