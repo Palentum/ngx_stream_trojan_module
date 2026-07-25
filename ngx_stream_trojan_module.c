@@ -3214,7 +3214,7 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
 {
     int          prc;
     ssize_t      n;
-    size_t       needed, chunk, produced;
+    size_t       needed, chunk, produced, raw_pending;
     ngx_int_t    rc;
     ngx_uint_t   frames;
 
@@ -3314,8 +3314,18 @@ ngx_stream_trojan_client_recv(ngx_stream_trojan_ctx_t *ctx, u_char *dst,
         }
 
         for ( ;; ) {
-            prc = ngx_stream_trojan_ws_parse_frame_header(
-                ctx->ws_header, ctx->ws_header_len, &needed, &ctx->ws_frame);
+            raw_pending = ngx_stream_trojan_websocket_raw_pending(ctx);
+            if (ctx->ws_header_len == 0 && raw_pending >= 2) {
+                prc = ngx_stream_trojan_ws_parse_frame_header(
+                    ctx->ws_raw->pos, raw_pending, &needed, &ctx->ws_frame);
+                if (prc == NGX_STREAM_TROJAN_WS_OK) {
+                    ctx->ws_raw->pos += ctx->ws_frame.header_len;
+                }
+            } else {
+                prc = ngx_stream_trojan_ws_parse_frame_header(
+                    ctx->ws_header, ctx->ws_header_len, &needed,
+                    &ctx->ws_frame);
+            }
 
             if (prc == NGX_STREAM_TROJAN_WS_OK) {
                 ctx->ws_header_len = 0;
