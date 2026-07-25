@@ -2791,7 +2791,16 @@ ngx_stream_trojan_flush_websocket_response(ngx_stream_trojan_ctx_t *ctx)
         return;
     }
 
-    ctx->ws_out = b;
+    ctx->ws_out = ngx_stream_trojan_create_temp_buf(
+        c->pool, NGX_STREAM_TROJAN_WS_SEND_HEADER_SIZE
+                     + NGX_STREAM_TROJAN_WS_MAX_CONTROL_PAYLOAD);
+    if (ctx->ws_out == NULL) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    (void) ngx_pfree(c->pool, b->start);
+    ctx->ws_buffer = NULL;
 
     ctx->websocket = 1;
     ctx->state = ngx_stream_trojan_state_prefix;
