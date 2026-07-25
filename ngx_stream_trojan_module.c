@@ -33,6 +33,26 @@
     (NGX_STREAM_TROJAN_DEFAULT_UDP_PAYLOAD_SIZE \
      + NGX_STREAM_TROJAN_MAX_ADDR_LEN + 3)
 #define NGX_STREAM_TROJAN_SOCKS5_UDP_SESSION_BUCKETS 64
+
+#if (NGX_LINUX)
+#define NGX_STREAM_TROJAN_SOCKS5_UDP_HEADER_SIZE \
+    (NGX_STREAM_TROJAN_MAX_ADDR_LEN + 3)
+
+typedef struct {
+    struct mmsghdr             messages[
+        NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT];
+    struct iovec               iov[
+        NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT * 2];
+    struct sockaddr_storage    sockaddrs[
+        NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT];
+    u_char                     headers[
+        NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT]
+        [NGX_STREAM_TROJAN_SOCKS5_UDP_HEADER_SIZE];
+    u_char                     payloads[
+        NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT]
+        [NGX_STREAM_TROJAN_SOCKS5_UDP_BUFFER_SIZE];
+} ngx_stream_trojan_udp_batch_t;
+#endif
 #define NGX_STREAM_TROJAN_WS_HANDSHAKE_BUFFER_SIZE 4096
 #define NGX_STREAM_TROJAN_WS_MIN_RAW_BUFFER_SIZE 4096
 #define NGX_STREAM_TROJAN_WS_MAX_FRAMES_PER_RECV 32
@@ -489,6 +509,13 @@ struct ngx_stream_trojan_ctx_s {
     ngx_err_t                   udp_error_log_err;
     ngx_msec_t                  udp_error_log_time;
     ngx_uint_t                  udp_error_log_suppressed;
+#if (NGX_LINUX)
+    ngx_stream_trojan_udp_batch_t *udp_batch;
+    ngx_connection_t           *udp_batch_connection;
+    ngx_uint_t                  udp_batch_count;
+    ngx_uint_t                  udp_batch_pos;
+    ngx_uint_t                  udp_batch_full;
+#endif
 
     ngx_buf_t                  *socks5_buffer;
     ngx_buf_t                  *http_buffer;
@@ -598,6 +625,22 @@ static ngx_int_t ngx_stream_trojan_init_udp_buffers(
     ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_refresh_udp_timeout(
     ngx_stream_trojan_ctx_t *ctx);
+#if (NGX_LINUX)
+static void ngx_stream_trojan_clear_udp_batch(
+    ngx_stream_trojan_ctx_t *ctx);
+static void ngx_stream_trojan_post_udp_batch(
+    ngx_stream_trojan_ctx_t *ctx);
+static ngx_int_t ngx_stream_trojan_recv_udp_batch(
+    ngx_stream_trojan_ctx_t *ctx, ngx_connection_t *uc,
+    size_t buffer_size, ngx_uint_t vlen);
+static void ngx_stream_trojan_prepare_udp_batch_send(
+    ngx_stream_trojan_ctx_t *ctx, ngx_uint_t index, u_char *header,
+    size_t header_len, u_char *payload, size_t payload_len,
+    struct sockaddr *sockaddr, socklen_t socklen);
+static ngx_int_t ngx_stream_trojan_send_udp_batch(
+    ngx_stream_trojan_ctx_t *ctx, ngx_connection_t *uc, ngx_uint_t count,
+    const char *message, const char *short_message);
+#endif
 static void ngx_stream_trojan_process_request(ngx_stream_trojan_ctx_t *ctx);
 static void ngx_stream_trojan_process_websocket_handshake(
     ngx_stream_trojan_ctx_t *ctx);
@@ -2257,6 +2300,15 @@ ngx_stream_trojan_init_udp_buffers(ngx_stream_trojan_ctx_t *ctx)
         }
     }
 
+#if (NGX_LINUX)
+    if (ctx->udp_batch == NULL) {
+        ctx->udp_batch = ngx_pnalloc(pool,
+                                     sizeof(ngx_stream_trojan_udp_batch_t));
+        if (ctx->udp_batch == NULL) {
+            return NGX_ERROR;
+        }
+    }
+#endif
     return NGX_OK;
 }
 
@@ -6122,6 +6174,11 @@ ngx_stream_trojan_select_outbound(ngx_stream_trojan_ctx_t *ctx,
 static void
 ngx_stream_trojan_reset_socks5_udp(ngx_stream_trojan_ctx_t *ctx)
 {
+#if (NGX_LINUX)
+    if (ctx->udp_batch_connection == ctx->socks5_udp) {
+        ngx_stream_trojan_clear_udp_batch(ctx);
+    }
+#endif
     if (ctx->socks5_udp) {
         ngx_close_connection(ctx->socks5_udp);
         ctx->socks5_udp = NULL;
@@ -11524,6 +11581,157 @@ ngx_stream_trojan_send_udp_iov(ngx_stream_trojan_ctx_t *ctx,
     return NGX_OK;
 }
 
+#if (NGX_LINUX)
+static void
+ngx_stream_trojan_clear_udp_batch(ngx_stream_trojan_ctx_t *ctx)
+{
+    ctx->udp_batch_connection = NULL;
+    ctx->udp_batch_count = 0;
+    ctx->udp_batch_pos = 0;
+    ctx->udp_batch_full = 0;
+}
+
+
+static void
+ngx_stream_trojan_post_udp_batch(ngx_stream_trojan_ctx_t *ctx)
+{
+    ngx_connection_t  *uc;
+
+    uc = ctx->udp_batch_connection;
+
+    if (ctx->udp_batch_count != 0 && uc != NULL && uc->read != NULL) {
+        ngx_post_event(uc->read, &ngx_posted_next_events);
+    }
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_recv_udp_batch(ngx_stream_trojan_ctx_t *ctx,
+    ngx_connection_t *uc, size_t buffer_size, ngx_uint_t vlen)
+{
+    int              n;
+    ngx_uint_t       i;
+    struct iovec    *iov;
+    struct mmsghdr  *msg;
+
+    for (i = 0; i < vlen; i++) {
+        msg = &ctx->udp_batch->messages[i];
+        iov = &ctx->udp_batch->iov[i * 2 + 1];
+
+        ngx_memzero(msg, sizeof(struct mmsghdr));
+        iov->iov_base = ctx->udp_batch->payloads[i];
+        iov->iov_len = buffer_size;
+        msg->msg_hdr.msg_name = &ctx->udp_batch->sockaddrs[i];
+        msg->msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
+        msg->msg_hdr.msg_iov = iov;
+        msg->msg_hdr.msg_iovlen = 1;
+    }
+
+    n = recvmmsg(uc->fd, ctx->udp_batch->messages, (unsigned int) vlen,
+                 0, NULL);
+
+    if (n == -1) {
+        return ngx_socket_errno == NGX_EAGAIN ? NGX_AGAIN : NGX_ERROR;
+    }
+
+    if (n == 0) {
+        return NGX_AGAIN;
+    }
+
+    ctx->udp_batch_connection = uc;
+    ctx->udp_batch_count = (ngx_uint_t) n;
+    ctx->udp_batch_pos = 0;
+    ctx->udp_batch_full = (ngx_uint_t) n == vlen;
+    ngx_stream_trojan_refresh_udp_timeout(ctx);
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_stream_trojan_prepare_udp_batch_send(ngx_stream_trojan_ctx_t *ctx,
+    ngx_uint_t index, u_char *header, size_t header_len, u_char *payload,
+    size_t payload_len, struct sockaddr *sockaddr, socklen_t socklen)
+{
+    struct iovec    *iov;
+    struct mmsghdr  *msg;
+
+    msg = &ctx->udp_batch->messages[index];
+    iov = &ctx->udp_batch->iov[index * 2];
+
+    ngx_memzero(msg, sizeof(struct mmsghdr));
+    msg->msg_hdr.msg_name = sockaddr;
+    msg->msg_hdr.msg_namelen = socklen;
+
+    if (header_len != 0) {
+        iov[0].iov_base = header;
+        iov[0].iov_len = header_len;
+        iov[1].iov_base = payload;
+        iov[1].iov_len = payload_len;
+        msg->msg_hdr.msg_iov = iov;
+        msg->msg_hdr.msg_iovlen = payload_len == 0 ? 1 : 2;
+        return;
+    }
+
+    iov[1].iov_base = payload;
+    iov[1].iov_len = payload_len;
+    msg->msg_hdr.msg_iov = &iov[1];
+    msg->msg_hdr.msg_iovlen = 1;
+}
+
+
+static ngx_int_t
+ngx_stream_trojan_send_udp_batch(ngx_stream_trojan_ctx_t *ctx,
+    ngx_connection_t *uc, ngx_uint_t count, const char *message,
+    const char *short_message)
+{
+    int              n;
+    size_t           expected;
+    ngx_uint_t       i, j;
+    struct iovec    *iov;
+    struct mmsghdr  *msg;
+
+    if (count == 0) {
+        return NGX_OK;
+    }
+
+    n = sendmmsg(uc->fd, ctx->udp_batch->messages, (unsigned int) count, 0);
+
+    if (n == -1) {
+        ngx_err_t err = ngx_socket_errno;
+        if (err == NGX_EAGAIN) {
+            return NGX_OK;
+        }
+
+        ngx_stream_trojan_log_udp_error(
+            ctx, ctx->session->connection->log, err, message);
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < (ngx_uint_t) n; i++) {
+        msg = &ctx->udp_batch->messages[i];
+        iov = msg->msg_hdr.msg_iov;
+        expected = 0;
+
+        for (j = 0; j < msg->msg_hdr.msg_iovlen; j++) {
+            expected += iov[j].iov_len;
+        }
+
+        if (msg->msg_len != expected) {
+            ngx_stream_trojan_log_udp_error(
+                ctx, ctx->session->connection->log, 0, short_message);
+            return NGX_ERROR;
+        }
+    }
+
+    if (n != 0) {
+        ngx_stream_trojan_refresh_udp_timeout(ctx);
+    }
+
+    return NGX_OK;
+}
+#endif
+
 
 static ngx_int_t
 ngx_stream_trojan_send_socks5_udp_frame(ngx_stream_trojan_ctx_t *ctx,
@@ -11842,6 +12050,7 @@ ngx_stream_trojan_flush_udp_client(ngx_stream_trojan_ctx_t *ctx)
 static void
 ngx_stream_trojan_udp_client_write_handler(ngx_event_t *ev)
 {
+    ngx_int_t                 rc;
     ngx_connection_t         *c;
     ngx_stream_session_t     *s;
     ngx_stream_trojan_ctx_t  *ctx;
@@ -11867,9 +12076,17 @@ ngx_stream_trojan_udp_client_write_handler(ngx_event_t *ev)
         }
     }
 
-    if (ngx_stream_trojan_flush_udp_client(ctx) == NGX_ERROR) {
+    rc = ngx_stream_trojan_flush_udp_client(ctx);
+    if (rc == NGX_ERROR) {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_OK);
+        return;
     }
+
+#if (NGX_LINUX)
+    if (rc == NGX_OK) {
+        ngx_stream_trojan_post_udp_batch(ctx);
+    }
+#endif
 }
 
 
@@ -12247,6 +12464,165 @@ ngx_stream_trojan_postconfiguration(ngx_conf_t *cf)
 static void
 ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
 {
+#if (NGX_LINUX)
+    ssize_t                    n;
+    size_t                     written, packets, bytes;
+    ngx_int_t                  rc;
+    ngx_uint_t                 batch_full, index, send_count;
+    ngx_connection_t          *uc, *c;
+    ngx_stream_trojan_ctx_t   *ctx;
+    ngx_stream_trojan_addr_t   addr;
+    struct sockaddr_storage   *ss;
+    struct mmsghdr            *msg;
+    u_char                    *header, *payload;
+    socklen_t                  socklen;
+
+    uc = ev->data;
+    ctx = uc->data;
+
+    if (ctx == NULL) {
+        ngx_close_connection(uc);
+        return;
+    }
+
+    c = ctx->session->connection;
+    packets = 0;
+    bytes = 0;
+    send_count = 0;
+
+    for ( ;; ) {
+        if (ngx_stream_trojan_flush_udp_client(ctx) != NGX_OK) {
+            return;
+        }
+
+        if (ctx->udp_batch_count != 0
+            && ctx->udp_batch_connection != uc)
+        {
+            ngx_stream_trojan_post_udp_batch(ctx);
+            ngx_stream_trojan_post_udp_read_if_ready(uc);
+            return;
+        }
+
+        if (packets >= NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT
+            || bytes >= NGX_STREAM_TROJAN_UDP_MAX_BYTES_PER_EVENT)
+        {
+            break;
+        }
+
+        if (ctx->udp_batch_count == 0) {
+            rc = ngx_stream_trojan_recv_udp_batch(
+                ctx, uc, NGX_STREAM_TROJAN_DEFAULT_UDP_PAYLOAD_SIZE,
+                NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT - packets);
+            if (rc == NGX_AGAIN) {
+                break;
+            }
+
+            if (rc != NGX_OK) {
+                ngx_stream_trojan_log_udp_error(
+                    ctx, c->log, ngx_socket_errno, "recvmmsg() failed");
+                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                return;
+            }
+        }
+
+        if (ctx->udp_batch_pos >= ctx->udp_batch_count) {
+            break;
+        }
+
+        index = ctx->udp_batch_pos++;
+        msg = &ctx->udp_batch->messages[index];
+        n = (ssize_t) msg->msg_len;
+        payload = ctx->udp_batch->payloads[index];
+        ss = &ctx->udp_batch->sockaddrs[index];
+        socklen = msg->msg_hdr.msg_namelen;
+
+        packets++;
+        bytes += (size_t) n;
+
+        if (ngx_stream_trojan_sockaddr_to_addr((struct sockaddr *) ss,
+                                               socklen, &addr)
+            != NGX_OK)
+        {
+            continue;
+        }
+
+        if (ctx->inbound_socks5) {
+            if (!ctx->socks5_udp_client_set || ctx->socks5_in_udp == NULL) {
+                continue;
+            }
+
+            header = ctx->udp_batch->headers[send_count];
+            if (ngx_stream_trojan_socks5_build_udp_header(
+                    &addr, header,
+                    NGX_STREAM_TROJAN_SOCKS5_UDP_HEADER_SIZE, &written)
+                != 0)
+            {
+                continue;
+            }
+
+            ngx_stream_trojan_prepare_udp_batch_send(
+                ctx, send_count, header, written, payload, (size_t) n,
+                (struct sockaddr *) &ctx->socks5_udp_client,
+                ctx->socks5_udp_client_socklen);
+            send_count++;
+            continue;
+        }
+
+        if (ngx_stream_trojan_build_udp_header(
+                &addr, (uint16_t) n, ctx->udp_out,
+                NGX_STREAM_TROJAN_UDP_BUFFER_SIZE, &written)
+            != 0)
+        {
+            continue;
+        }
+
+        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_out, written,
+                                               payload, (size_t) n)
+            != NGX_OK)
+        {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        rc = ngx_stream_trojan_flush_udp_client(ctx);
+        if (rc == NGX_ERROR) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            return;
+        }
+
+        if (rc == NGX_AGAIN) {
+            return;
+        }
+    }
+
+    if (ngx_stream_trojan_send_udp_batch(
+            ctx, ctx->socks5_in_udp, send_count,
+            "sendmmsg() socks5 udp client failed",
+            "short UDP sendmmsg() to socks5 udp client")
+        != NGX_OK)
+    {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        return;
+    }
+
+    if (ctx->udp_batch_count != 0) {
+        if (ctx->udp_batch_pos < ctx->udp_batch_count) {
+            ngx_stream_trojan_post_udp_batch(ctx);
+
+        } else {
+            batch_full = ctx->udp_batch_full;
+            ngx_stream_trojan_clear_udp_batch(ctx);
+
+            if (batch_full) {
+                ngx_stream_trojan_post_udp_read_if_ready(uc);
+            }
+        }
+    }
+
+    if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+    }
+#else
     ssize_t                    n;
     size_t                     written, packets, bytes;
     ngx_connection_t          *uc, *c;
@@ -12368,12 +12744,161 @@ ngx_stream_trojan_udp_read_handler(ngx_event_t *ev)
     if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
     }
+#endif
 }
 
 
 static void
 ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
 {
+#if (NGX_LINUX)
+    ssize_t                         n;
+    size_t                          written, packets, bytes;
+    ngx_int_t                       rc;
+    ngx_uint_t                      batch_full, index, send_count;
+    ngx_connection_t               *uc, *c;
+    ngx_stream_trojan_ctx_t        *ctx;
+    ngx_stream_trojan_udp_frame_t   frame;
+    struct mmsghdr                 *msg;
+    u_char                         *payload;
+
+    uc = ev->data;
+    ctx = uc->data;
+
+    if (ctx == NULL) {
+        ngx_close_connection(uc);
+        return;
+    }
+
+    c = ctx->session->connection;
+    packets = 0;
+    bytes = 0;
+    send_count = 0;
+
+    for ( ;; ) {
+        if (ngx_stream_trojan_flush_udp_client(ctx) != NGX_OK) {
+            return;
+        }
+
+        if (ctx->udp_batch_count != 0
+            && ctx->udp_batch_connection != uc)
+        {
+            ngx_stream_trojan_post_udp_batch(ctx);
+            ngx_stream_trojan_post_udp_read_if_ready(uc);
+            return;
+        }
+
+        if (packets >= NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT
+            || bytes >= NGX_STREAM_TROJAN_UDP_MAX_BYTES_PER_EVENT)
+        {
+            break;
+        }
+
+        if (ctx->udp_batch_count == 0) {
+            rc = ngx_stream_trojan_recv_udp_batch(
+                ctx, uc, NGX_STREAM_TROJAN_SOCKS5_UDP_BUFFER_SIZE,
+                NGX_STREAM_TROJAN_UDP_MAX_PACKETS_PER_EVENT - packets);
+            if (rc == NGX_AGAIN) {
+                break;
+            }
+
+            if (rc != NGX_OK) {
+                ngx_stream_trojan_log_udp_error(
+                    ctx, c->log, ngx_socket_errno,
+                    "recvmmsg() from socks5 udp relay failed");
+                ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+                return;
+            }
+        }
+
+        if (ctx->udp_batch_pos >= ctx->udp_batch_count) {
+            break;
+        }
+
+        index = ctx->udp_batch_pos++;
+        msg = &ctx->udp_batch->messages[index];
+        n = (ssize_t) msg->msg_len;
+        payload = ctx->udp_batch->payloads[index];
+
+        packets++;
+        bytes += (size_t) n;
+
+        if (ngx_stream_trojan_socks5_parse_udp_packet(payload, (size_t) n,
+                                                      &frame)
+            != 0)
+        {
+            continue;
+        }
+
+        if (ctx->inbound_socks5) {
+            if (!ctx->socks5_udp_client_set || ctx->socks5_in_udp == NULL) {
+                continue;
+            }
+
+            ngx_stream_trojan_prepare_udp_batch_send(
+                ctx, send_count, NULL, 0, payload, (size_t) n,
+                (struct sockaddr *) &ctx->socks5_udp_client,
+                ctx->socks5_udp_client_socklen);
+            send_count++;
+            continue;
+        }
+
+        if (ngx_stream_trojan_build_udp_header(
+                &frame.addr, frame.payload_len, ctx->udp_payload,
+                NGX_STREAM_TROJAN_DEFAULT_UDP_PAYLOAD_SIZE, &written)
+            != 0)
+        {
+            continue;
+        }
+
+        if (ngx_stream_trojan_queue_udp_client(ctx, ctx->udp_payload, written,
+                                               frame.payload,
+                                               frame.payload_len)
+            != NGX_OK)
+        {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+            return;
+        }
+
+        rc = ngx_stream_trojan_flush_udp_client(ctx);
+        if (rc == NGX_ERROR) {
+            ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+            return;
+        }
+
+        if (rc == NGX_AGAIN) {
+            return;
+        }
+    }
+
+    if (ngx_stream_trojan_send_udp_batch(
+            ctx, ctx->socks5_in_udp, send_count,
+            "sendmmsg() socks5 udp client failed",
+            "short UDP sendmmsg() to socks5 udp client")
+        != NGX_OK)
+    {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_BAD_GATEWAY);
+        return;
+    }
+
+    if (ctx->udp_batch_count != 0) {
+        if (ctx->udp_batch_pos < ctx->udp_batch_count) {
+            ngx_stream_trojan_post_udp_batch(ctx);
+
+        } else {
+            batch_full = ctx->udp_batch_full;
+            ngx_stream_trojan_clear_udp_batch(ctx);
+
+            if (batch_full) {
+                ngx_stream_trojan_post_udp_read_if_ready(uc);
+            }
+        }
+    }
+
+    if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
+        ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
+    }
+#else
     ssize_t                         n;
     size_t                          written, packets, bytes;
     ngx_connection_t               *uc, *c;
@@ -12479,6 +13004,7 @@ ngx_stream_trojan_socks5_udp_read_handler(ngx_event_t *ev)
     if (ngx_handle_read_event(uc->read, 0) != NGX_OK) {
         ngx_stream_trojan_finalize(ctx, NGX_STREAM_INTERNAL_SERVER_ERROR);
     }
+#endif
 }
 
 
