@@ -11713,7 +11713,7 @@ ngx_stream_trojan_send_udp_batch(ngx_stream_trojan_ctx_t *ctx,
         iov = msg->msg_hdr.msg_iov;
         expected = 0;
 
-        for (j = 0; j < msg->msg_hdr.msg_iovlen; j++) {
+        for (j = 0; j < (ngx_uint_t) msg->msg_hdr.msg_iovlen; j++) {
             expected += iov[j].iov_len;
         }
 
